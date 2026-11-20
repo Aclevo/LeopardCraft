@@ -23,6 +23,8 @@ the material shelf and the full-width timeline. The status bar reads `Frame 0 ·
 
 ## Quick start
 
+Prebuilt Linux, macOS and Windows binaries for 0.1.0 are on the [releases page](https://github.com/Aclevo/LeopardCraft/releases/tag/v0.1.0); the steps below build from source.
+
 ```bash
 cargo run -p leopardcraft
 ```
