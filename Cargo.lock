@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "lc-anim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "lc-core",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "lc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "serde",
@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "lc-geom"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "lc-core",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "lc-io"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "lc-core",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "lc-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "image",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "lc-scene"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "lc-anim",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "lc-shading"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "image",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "lc-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "eframe",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "leopardcraft"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "lc-anim",

@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and attach assets to (for example v0.1.0)"
+        description: "Existing tag to build and attach assets to (for example v0.1.1)"
         required: true
         type: string
+
+# This workflow signs releases, so every action is pinned to a full commit SHA
+# instead of a movable major tag. The trailing comment records which release
+# the SHA came from; bump both together.
 
 permissions:
   contents: write
@@ -53,7 +57,7 @@ jobs:
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           echo "building $tag for ${{ matrix.slug }}"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -65,9 +69,11 @@ jobs:
             libxkbcommon-dev libwayland-dev libx11-xcb-dev libxrandr-dev \
             libxi-dev libxcursor-dev libvulkan-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           key: release-${{ matrix.slug }}
 
@@ -81,7 +87,7 @@ jobs:
           "./target/release/${{ matrix.bin }}" --version
           "./target/release/${{ matrix.bin }}" --headless selftest
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binary-${{ matrix.slug }}
           path: target/release/${{ matrix.bin }}
@@ -106,12 +112,12 @@ jobs:
           fi
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
 
-      # Deliberately not pinned to the tag: the packaging script, desktop entry
-      # and icon come from the branch the workflow runs on, so an older tag can
-      # be repackaged with the current formats.
-      - uses: actions/checkout@v4
+      # Deliberately not checked out at the release tag: the packaging script,
+      # desktop entry and icon come from the branch the workflow runs on, so an
+      # older tag can be repackaged with the current formats.
+      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: binary-${{ matrix.slug }}
           path: bin
@@ -145,7 +151,7 @@ jobs:
           fi
           ls -l dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: assets-${{ matrix.slug }}
           path: dist/*
@@ -172,7 +178,7 @@ jobs:
           fi
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: assets-*
           path: assets
@@ -186,7 +192,11 @@ jobs:
           find . -maxdepth 1 -type f ! -name 'SHA256SUMS' -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: sigstore/cosign-installer@v3
+      # Installer pinned by SHA, cosign itself pinned to the release that
+      # produced the v0.1.0 bundle format this job signs and verifies.
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+        with:
+          cosign-release: "v2.5.2"
 
       - name: Sign SHA256SUMS (keyless)
         shell: bash
