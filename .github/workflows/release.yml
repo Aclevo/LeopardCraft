@@ -23,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
+      matrix: &matrix
         include:
           - os: ubuntu-latest
             slug: linux-x86_64
@@ -77,32 +77,80 @@ jobs:
           "./target/release/${{ matrix.bin }}" --version
           "./target/release/${{ matrix.bin }}" --headless selftest
 
-      - name: Package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.slug }}
+          path: target/release/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: package ${{ matrix.slug }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: *matrix
+    steps:
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${{ github.ref_name }}"
+          fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
+      # Deliberately not pinned to the tag: the packaging script, desktop entry
+      # and icon come from the branch the workflow runs on, so an older tag can
+      # be repackaged with the current formats.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.slug }}
+          path: bin
+
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg rpm squashfs-tools file
+
+      - name: Build platform downloads
         shell: bash
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
-          name="leopardcraft-${version}-${{ matrix.slug }}"
-          mkdir -p "stage/${name}" dist
-          cp "target/release/${{ matrix.bin }}" "stage/${name}/"
+          slug="${{ matrix.slug }}"
+          bin="bin/${{ matrix.bin }}"
+          name="leopardcraft-${version}-${slug}"
+          chmod +x "$bin"
+          mkdir -p dist "stage/${name}"
+          cp "$bin" "stage/${name}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "stage/${name}/"
           if [ "${{ matrix.ext }}" = "zip" ]; then
             7z a -tzip "dist/${name}.zip" "stage/${name}" > /dev/null
           else
             tar -czf "dist/${name}.tar.gz" -C stage "${name}"
           fi
+          if [ "${slug}" = "linux-x86_64" ]; then
+            bash packaging/linux/package.sh "${version}" "$bin" dist
+          fi
           ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.slug }}
+          name: assets-${{ matrix.slug }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: attach assets to the release
-    needs: build
+    needs: package
     runs-on: ubuntu-latest
     steps:
       - name: Resolve release tag
