@@ -124,3 +124,22 @@ fi
 VERSION="${version}" ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
     "${tool}" "${appdir}" "${outdir}/${name}.AppImage" > /dev/null
 echo "built ${outdir}/${name}.AppImage"
+
+# --- Verify the packages with their own tooling ---------------------------
+dpkg-deb --info "${outdir}/${name}.deb" > /dev/null
+if ! dpkg-deb --contents "${outdir}/${name}.deb" | grep -q 'usr/bin/leopardcraft$'; then
+    echo "error: ${name}.deb is missing usr/bin/leopardcraft" >&2
+    exit 1
+fi
+
+rpm -qip "${outdir}/${name}.rpm" > /dev/null
+if ! rpm -qlp "${outdir}/${name}.rpm" | grep -qx '/usr/bin/leopardcraft'; then
+    echo "error: ${name}.rpm is missing /usr/bin/leopardcraft" >&2
+    exit 1
+fi
+rpm -qlp "${outdir}/${name}.rpm"
+
+chmod +x "${outdir}/${name}.AppImage"
+APPIMAGE_EXTRACT_AND_RUN=1 "${outdir}/${name}.AppImage" --version
+
+echo "verified ${name}.deb, ${name}.rpm and ${name}.AppImage"
