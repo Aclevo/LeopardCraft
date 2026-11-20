@@ -1,0 +1,137 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach assets to (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.slug }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            slug: linux-x86_64
+            bin: leopardcraft
+            ext: tar.gz
+          - os: macos-latest
+            slug: macos-aarch64
+            bin: leopardcraft
+            ext: tar.gz
+          - os: windows-latest
+            slug: windows-x86_64
+            bin: leopardcraft.exe
+            ext: zip
+    steps:
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${{ github.ref_name }}"
+          fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "building $tag for ${{ matrix.slug }}"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Window and GPU development libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-xcb-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.slug }}
+
+      - name: Build release binary
+        run: cargo build --release --locked -p leopardcraft
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          "./target/release/${{ matrix.bin }}" --version
+          "./target/release/${{ matrix.bin }}" --headless selftest
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          name="leopardcraft-${version}-${{ matrix.slug }}"
+          mkdir -p "stage/${name}" dist
+          cp "target/release/${{ matrix.bin }}" "stage/${name}/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "stage/${name}/"
+          if [ "${{ matrix.ext }}" = "zip" ]; then
+            7z a -tzip "dist/${name}.zip" "stage/${name}" > /dev/null
+          else
+            tar -czf "dist/${name}.tar.gz" -C stage "${name}"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: attach assets to the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="${{ github.ref_name }}"
+          fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          ls -l assets
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" assets/* --repo "$GITHUB_REPOSITORY" \
+              --title "LeopardCraft ${tag#v}" --generate-notes
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url,assets \
+            -q '"release: \(.url)", (.assets[] | "  \(.name)  \(.size) bytes")'
