@@ -1,0 +1,20 @@
+[package]
+name = "leopardcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "leopardcraft"
+path = "src/main.rs"
+
+[dependencies]
+lc-core = { path = "../crates/lc-core" }
+lc-geom = { path = "../crates/lc-geom" }
+lc-scene = { path = "../crates/lc-scene" }
+lc-shading = { path = "../crates/lc-shading" }
+lc-anim = { path = "../crates/lc-anim" }
+lc-render = { path = "../crates/lc-render" }
+lc-io = { path = "../crates/lc-io" }
+lc-ui = { path = "../crates/lc-ui" }
+eframe.workspace = true

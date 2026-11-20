@@ -1,0 +1,15 @@
+# Rust build output
+/target
+
+# Renders, exports and scenes written by the CLI and the editor
+/render*.png
+/render*.exr
+/export.*
+*.lcscene
+
+# OS
+.DS_Store
+
+# Freebuff project markers and downloaded chat attachments
+/.freebuff/
+/.cloud-attachments/

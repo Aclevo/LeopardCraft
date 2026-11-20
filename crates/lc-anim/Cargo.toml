@@ -1,0 +1,10 @@
+[package]
+name = "lc-anim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lc-core = { path = "../lc-core" }
+glam.workspace = true
+serde.workspace = true
