@@ -126,18 +126,22 @@ VERSION="${version}" ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
 echo "built ${outdir}/${name}.AppImage"
 
 # --- Verify the packages with their own tooling ---------------------------
+# Listings go to files: piping them into `grep -q` would close the pipe early
+# and, with pipefail, fail the package tool itself.
 dpkg-deb --info "${outdir}/${name}.deb" > /dev/null
-if ! dpkg-deb --contents "${outdir}/${name}.deb" | grep -q 'usr/bin/leopardcraft$'; then
+dpkg-deb --contents "${outdir}/${name}.deb" > "${work}/deb.list"
+if ! grep -q 'usr/bin/leopardcraft$' "${work}/deb.list"; then
     echo "error: ${name}.deb is missing usr/bin/leopardcraft" >&2
     exit 1
 fi
 
 rpm -qip "${outdir}/${name}.rpm" > /dev/null
-if ! rpm -qlp "${outdir}/${name}.rpm" | grep -qx '/usr/bin/leopardcraft'; then
+rpm -qlp "${outdir}/${name}.rpm" > "${work}/rpm.list"
+if ! grep -qx '/usr/bin/leopardcraft' "${work}/rpm.list"; then
     echo "error: ${name}.rpm is missing /usr/bin/leopardcraft" >&2
     exit 1
 fi
-rpm -qlp "${outdir}/${name}.rpm"
+cat "${work}/rpm.list"
 
 chmod +x "${outdir}/${name}.AppImage"
 APPIMAGE_EXTRACT_AND_RUN=1 "${outdir}/${name}.AppImage" --version
