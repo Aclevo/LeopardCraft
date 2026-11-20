@@ -33,6 +33,10 @@ jobs:
             slug: macos-aarch64
             bin: leopardcraft
             ext: tar.gz
+          - os: macos-15-intel
+            slug: macos-x86_64
+            bin: leopardcraft
+            ext: tar.gz
           - os: windows-latest
             slug: windows-x86_64
             bin: leopardcraft.exe
@@ -152,6 +156,11 @@ jobs:
     name: attach assets to the release
     needs: package
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Keyless Sigstore signing: the workflow exchanges this token for a
+      # short-lived signing certificate tied to this repository and ref.
+      id-token: write
     steps:
       - name: Resolve release tag
         shell: bash
@@ -176,6 +185,30 @@ jobs:
           cd assets
           find . -maxdepth 1 -type f ! -name 'SHA256SUMS' -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS
           cat SHA256SUMS
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign SHA256SUMS (keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle assets/SHA256SUMS.sigstore.json \
+            assets/SHA256SUMS
+
+      - name: Verify the signature we just made
+        shell: bash
+        env:
+          IDENTITY: '^https://github\.com/Aclevo/LeopardCraft/\.github/workflows/release\.yml@refs/(heads|tags)/.+$'
+        run: |
+          set -euo pipefail
+          cosign verify-blob assets/SHA256SUMS \
+            --bundle assets/SHA256SUMS.sigstore.json \
+            --certificate-identity-regexp "${IDENTITY}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          jq -r '.verificationMaterial.certificate.rawBytes' assets/SHA256SUMS.sigstore.json \
+            | base64 -d \
+            | openssl x509 -inform der -noout -subject -ext subjectAltName
 
       - name: Upload to the release
         env:
