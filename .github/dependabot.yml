@@ -1,0 +1,18 @@
+# Dependabot keeps the commit-SHA pins in .github/workflows/release.yml from
+# going stale silently. When the pinned commit belongs to a release tag,
+# Dependabot rewrites the "# vX.Y.Z" comment along with the SHA, so review both
+# lines together in each pull request.
+#
+# One pin is not tag-based: dtolnay/rust-toolchain is pinned to a commit on its
+# "stable" branch, so Dependabot resolves it against a branch instead of a
+# release and the "# stable" comment is not a version it can compare. Check that
+# entry against the stable branch by hand rather than trusting the bump.
+#
+# Entries can only be scoped to a directory, not to a single workflow file, so
+# this also covers ci.yml.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
