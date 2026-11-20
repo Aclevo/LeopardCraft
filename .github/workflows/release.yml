@@ -206,9 +206,15 @@ jobs:
             --bundle assets/SHA256SUMS.sigstore.json \
             --certificate-identity-regexp "${IDENTITY}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
-          jq -r '.verificationMaterial.certificate.rawBytes' assets/SHA256SUMS.sigstore.json \
-            | base64 -d \
-            | openssl x509 -inform der -noout -subject -ext subjectAltName
+          # Show who the certificate was issued to. Cosmetic only: the check
+          # above is what has to pass, and bundle layouts vary between cosign
+          # releases, so a missing field must not fail the release.
+          cert=$(jq -r '.verificationMaterial.certificate.rawBytes? // .verificationMaterial.x509CertificateChain.certificates[0].rawBytes? // empty' \
+            assets/SHA256SUMS.sigstore.json)
+          if [ -n "${cert}" ]; then
+            printf '%s' "${cert}" | base64 -d \
+              | openssl x509 -inform der -noout -subject | tee /dev/stderr
+          fi
 
       - name: Upload to the release
         env:
