@@ -1,6 +1,11 @@
 //! The LeopardCraft editor: Cheetah-style fixed workspace, viewport,
 //! inspectors, material graph, UV view, timeline and background renderer.
 
+use self::lifecycle::{
+    is_native_scene, AutosaveOutcome, DocumentLifecycle, GuardChoice, GuardResult, PendingAction,
+    SaveKind, StartupOutcome,
+};
+use self::recovery::RecoveryStore;
 use crate::icons::{self, Icon};
 use crate::theme;
 use crate::viewport::{FrameData, Vertex, ViewportRenderer};
@@ -26,12 +31,21 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "lifecycle.rs"]
+mod lifecycle;
+#[path = "lifecycle_harness.rs"]
+mod lifecycle_harness;
 #[path = "panels.rs"]
 mod panels;
 #[path = "panels_more.rs"]
 mod panels_more;
+#[path = "recovery.rs"]
+mod recovery;
 #[path = "shell.rs"]
 mod shell;
+#[cfg(test)]
+#[path = "warning_surface_tests.rs"]
+mod warning_surface_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EditorView {
@@ -170,6 +184,8 @@ impl Default for OrbitCamera {
 }
 
 const WORKSPACE_STORAGE_KEY: &str = "leopardcraft.workspace.v1";
+/// Recovery snapshots are written at most this often while the scene is dirty.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Layout and view choices that should return when the editor is reopened.
 /// Scene contents themselves remain in the user's `.lcscene` file.
@@ -389,6 +405,19 @@ enum RenderMessage {
     Cancelled,
 }
 
+/// Run the non-interactive document-lifecycle harness. This is only invoked
+/// explicitly by `--headless lifecycle` and the integration test; normal
+/// editor startup never enters it.
+pub fn run_lifecycle_selftest() -> Result<(), String> {
+    lifecycle_harness::run()
+}
+
+fn reconcile_native_scene(path: &Path) {
+    if is_native_scene(path) {
+        let _ = lc_scene::recover_interrupted_save(path);
+    }
+}
+
 pub struct LeopardApp {
     doc: Document,
     history: History,
@@ -413,8 +442,9 @@ pub struct LeopardApp {
     show_helpers: bool,
     viewport: ViewportRenderer,
     texture_cache: TextureCache,
-    file_path: Option<PathBuf>,
     dialog: Option<FileDialog>,
+    lifecycle: DocumentLifecycle,
+    allow_close: bool,
     status: String,
     show_about: bool,
     hierarchy_filter: String,
@@ -451,6 +481,9 @@ impl LeopardApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::install(&cc.egui_ctx);
         let doc = Document::demo();
+        let recovery = RecoveryStore::system();
+        let mut lifecycle = DocumentLifecycle::new(recovery, AUTOSAVE_INTERVAL);
+        let startup = lifecycle.startup(&doc);
         let fps = doc.settings.fps.max(1.0);
         let mut app = Self {
             playback: Playback {
@@ -482,8 +515,9 @@ impl LeopardApp {
             show_helpers: true,
             viewport: ViewportRenderer::new(cc.wgpu_render_state.clone()),
             texture_cache: TextureCache::default(),
-            file_path: None,
             dialog: None,
+            lifecycle,
+            allow_close: false,
             status: "Ready — demo studio loaded".into(),
             show_about: false,
             hierarchy_filter: String::new(),
@@ -520,6 +554,21 @@ impl LeopardApp {
             {
                 app.apply_workspace_state(state);
             }
+        }
+        match startup {
+            StartupOutcome::Recoverable => {
+                let origin = app
+                    .lifecycle
+                    .recovery_prompt()
+                    .and_then(|recovered| recovered.origin.as_ref())
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "an untitled scene".into());
+                app.status = format!("Found unsaved work for {origin} from a previous session");
+            }
+            StartupOutcome::Unreadable(error) => {
+                app.status = format!("Discarded unreadable recovery snapshot: {error}");
+            }
+            StartupOutcome::Clean => {}
         }
         app
     }
@@ -602,7 +651,7 @@ impl LeopardApp {
         });
         self.doc = doc;
         self.history.clear();
-        self.file_path = path;
+        self.lifecycle.loaded(&self.doc, path);
         self.pending_transform = None;
         self.pending_shape = None;
         self.pending_material = None;
@@ -820,21 +869,31 @@ impl LeopardApp {
 
     fn new_scene(&mut self) {
         self.load_scene(Document::demo(), None);
+        self.lifecycle.discard_recovery();
         self.status = "New scene from studio template".into();
     }
 
-    fn open_file(&mut self, path: PathBuf) {
-        match lc_io::import(&path) {
+    fn open_file(&mut self, path: PathBuf) -> bool {
+        reconcile_native_scene(&path);
+        let opened = match lc_io::import(&path) {
             Ok(doc) => {
                 let name = path.display().to_string();
                 self.load_scene(doc, Some(path));
+                self.lifecycle.discard_recovery();
                 self.status = format!("Opened {name}");
+                true
             }
-            Err(e) => self.status = format!("Open failed: {e}"),
-        }
+            Err(e) => {
+                self.status = format!("Open failed: {e}");
+                false
+            }
+        };
+        self.drain_scene_warnings();
+        opened
     }
 
     fn import_file(&mut self, path: PathBuf) {
+        reconcile_native_scene(&path);
         match lc_io::import(&path) {
             Ok(mut doc) => {
                 doc.sanitize();
@@ -856,37 +915,175 @@ impl LeopardApp {
             }
             Err(e) => self.status = format!("Import failed: {e}"),
         }
+        self.drain_scene_warnings();
     }
 
-    fn save_file(&mut self, path: PathBuf) {
-        match lc_io::export(&path, &self.doc) {
-            Ok(()) => {
-                if path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("lcscene"))
-                    .unwrap_or(false)
-                {
-                    self.file_path = Some(path.clone());
-                }
+    fn save_file(&mut self, path: PathBuf) -> Result<Option<PendingAction>, ()> {
+        let result = match self.lifecycle.save_and_take_action(&self.doc, path.clone()) {
+            Ok((SaveKind::Native, action)) => {
                 self.status = format!("Saved {}", path.display());
+                Ok(action)
             }
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Ok((SaveKind::Export, action)) => {
+                self.status = format!("Exported {}", path.display());
+                Ok(action)
+            }
+            Err(error) => {
+                self.status = format!("Save failed: {error}");
+                Err(())
+            }
+        };
+        self.drain_scene_warnings();
+        result
+    }
+
+    fn apply_file_dialog(&mut self, ctx: &egui::Context, mode: FileMode, text: String) {
+        match mode {
+            FileMode::SaveAs => match self.lifecycle.save_as_path(&text) {
+                Ok(path) => match self.save_file(path) {
+                    Ok(Some(action)) => self.execute_action(ctx, action),
+                    Ok(None) | Err(()) => {}
+                },
+                Err(message) => self.status = message,
+            },
+            FileMode::Open => {
+                let Some(path) = self.dialog_path(&text) else {
+                    return;
+                };
+                self.request_action(ctx, PendingAction::OpenPath(path));
+            }
+            FileMode::Import => {
+                let Some(path) = self.dialog_path(&text) else {
+                    return;
+                };
+                self.import_file(path);
+            }
+            FileMode::Export => {
+                let Some(path) = self.dialog_path(&text) else {
+                    return;
+                };
+                let _ = self.save_file(path);
+            }
         }
     }
 
-    fn apply_file_dialog(&mut self, mode: FileMode, text: String) {
-        let path = if text.trim().is_empty() {
+    fn dialog_path(&mut self, text: &str) -> Option<PathBuf> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
             self.status = "No file path entered".into();
-            return;
+            None
         } else {
-            PathBuf::from(text.trim())
-        };
-        match mode {
-            FileMode::Open => self.open_file(path),
-            FileMode::Import => self.import_file(path),
-            FileMode::SaveAs | FileMode::Export => self.save_file(path),
+            Some(PathBuf::from(trimmed))
         }
+    }
+
+    pub(super) fn save_or_prompt(&mut self, ctx: &egui::Context) {
+        if self.lifecycle.needs_save_as() {
+            self.dialog = Some(FileDialog {
+                mode: FileMode::SaveAs,
+                path: self.save_as_default(),
+            });
+        } else {
+            let path = self
+                .lifecycle
+                .path()
+                .expect("a native document has a path")
+                .to_path_buf();
+            match self.save_file(path) {
+                Ok(Some(action)) => self.execute_action(ctx, action),
+                Ok(None) | Err(()) => {}
+            }
+        }
+    }
+
+    fn save_as_default(&self) -> String {
+        self.lifecycle
+            .path()
+            .map(|path| path.with_extension("lcscene").display().to_string())
+            .unwrap_or_else(|| "scene.lcscene".into())
+    }
+
+    fn drain_scene_warnings(&mut self) {
+        self.report_scene_warnings(lc_scene::take_warnings());
+    }
+
+    /// Show non-fatal scene recovery or directory-flush warnings in the editor.
+    pub fn report_scene_warnings(&mut self, warnings: Vec<String>) {
+        if warnings.is_empty() {
+            return;
+        }
+        let stamp = self.started_at.elapsed().as_secs_f32();
+        for warning in &warnings {
+            self.console
+                .push_back(format!("[{stamp:6.1}s] warning: {warning}"));
+        }
+        while self.console.len() > 250 {
+            self.console.pop_front();
+        }
+        let summary = if warnings.len() == 1 {
+            format!("Scene warning: {}", warnings[0])
+        } else {
+            format!("{} scene warnings — see Console", warnings.len())
+        };
+        self.status = if self.status.is_empty() {
+            summary
+        } else {
+            format!("{} — {summary}", self.status)
+        };
+    }
+
+    fn document_name(&self) -> String {
+        self.lifecycle
+            .path()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    fn request_action(&mut self, ctx: &egui::Context, action: PendingAction) {
+        match self.lifecycle.request(&self.doc, action) {
+            GuardResult::Run(action) => self.execute_action(ctx, action),
+            GuardResult::Confirm => {}
+            GuardResult::Save | GuardResult::Cancelled => {}
+        }
+    }
+
+    fn execute_action(&mut self, ctx: &egui::Context, action: PendingAction) {
+        match action {
+            PendingAction::NewScene => self.new_scene(),
+            PendingAction::OpenScene => {
+                self.dialog = Some(FileDialog {
+                    mode: FileMode::Open,
+                    path: self
+                        .lifecycle
+                        .path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "scene.lcscene".into()),
+                });
+            }
+            PendingAction::OpenPath(path) => {
+                self.open_file(path);
+            }
+            PendingAction::Quit => {
+                self.lifecycle.finish_quit();
+                self.allow_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn autosave_tick(&mut self, ctx: &egui::Context) {
+        match self.lifecycle.autosave_tick(&self.doc) {
+            AutosaveOutcome::Idle | AutosaveOutcome::Clean | AutosaveOutcome::Saved => {}
+            AutosaveOutcome::Failed(error) => {
+                self.status = format!("Autosave failed: {error}");
+            }
+        }
+        self.drain_scene_warnings();
+        // Autosave needs a wake-up even when the user is idle and no input
+        // events would otherwise trigger another frame.
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 
     fn push_render_job(&mut self, job: RenderJob) {
@@ -990,9 +1187,9 @@ impl LeopardApp {
         let time = self.playback.time;
         let settings = self.doc.settings.render.clone();
         let base_dir = self
-            .file_path
-            .as_ref()
-            .and_then(|p| p.parent())
+            .lifecycle
+            .path()
+            .and_then(|path| path.parent())
             .unwrap_or(Path::new("."))
             .to_path_buf();
         let output = if self.render_path.trim().is_empty() {
@@ -1837,6 +2034,11 @@ impl eframe::App for LeopardApp {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        self.lifecycle.refresh_dirty(&self.doc, false);
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_action(&ctx, PendingAction::Quit);
+        }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         if self.playback.playing {
             self.playback.advance(dt);
@@ -1872,9 +2074,12 @@ impl eframe::App for LeopardApp {
 
         self.poll_render(&ctx);
         self.log_status();
+        self.autosave_tick(&ctx);
         self.shell(root);
 
         self.show_file_dialog(&ctx);
+        self.show_recovery_dialog(&ctx);
+        self.show_guard_dialog(&ctx);
         self.show_about(&ctx);
         self.update_window_title(&ctx);
 
@@ -1939,9 +2144,128 @@ impl LeopardApp {
         if apply {
             let path = dialog.path.clone();
             self.dialog = None;
-            self.apply_file_dialog(mode, path);
+            self.apply_file_dialog(ctx, mode, path);
         } else if !open {
             self.dialog = None;
+            if matches!(mode, FileMode::SaveAs) {
+                self.lifecycle.after_save_cancelled();
+            }
+        }
+    }
+
+    fn show_guard_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.lifecycle.pending_action() else {
+            return;
+        };
+        self.lifecycle.refresh_dirty(&self.doc, true);
+        if !self.lifecycle.is_dirty() {
+            self.lifecycle.clear_guard();
+            self.execute_action(ctx, action);
+            return;
+        }
+        let document_name = self.document_name();
+        let prompt = action.prompt();
+        let mut choice = None;
+        egui::Window::new("Unsaved Changes")
+            .id(egui::Id::new("unsaved_changes_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.label(format!("“{document_name}” has unsaved changes."));
+                ui.label(
+                    egui::RichText::new(format!("Save before {prompt}?"))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        choice = Some(GuardChoice::Save);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        choice = Some(GuardChoice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(GuardChoice::Cancel);
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            choice = Some(GuardChoice::Cancel);
+        }
+        match choice {
+            Some(GuardChoice::Save) => {
+                self.lifecycle.choose(GuardChoice::Save);
+                self.save_or_prompt(ctx);
+            }
+            Some(GuardChoice::Discard) => {
+                if let GuardResult::Run(action) = self.lifecycle.choose(GuardChoice::Discard) {
+                    self.lifecycle.discard_snapshot();
+                    self.execute_action(ctx, action);
+                }
+            }
+            Some(GuardChoice::Cancel) => {
+                self.lifecycle.choose(GuardChoice::Cancel);
+                self.status = "Cancelled".into();
+            }
+            None => {}
+        }
+    }
+
+    fn show_recovery_dialog(&mut self, ctx: &egui::Context) {
+        let Some(recovered) = self.lifecycle.recovery_prompt() else {
+            return;
+        };
+        let origin = recovered
+            .origin
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "an untitled scene".into());
+        let age = recovered
+            .saved_at
+            .map(format_age)
+            .unwrap_or_else(|| "an unknown time".into());
+        let mut choice = None;
+        egui::Window::new("Recover Unsaved Work")
+            .id(egui::Id::new("recovery_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.label(format!("LeopardCraft found unsaved work for {origin}."));
+                ui.label(
+                    egui::RichText::new(format!("Snapshot written {age}."))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Recover").clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Discard").clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+        match choice {
+            Some(true) => {
+                let Some(recovered) = self.lifecycle.take_recovery() else {
+                    return;
+                };
+                let origin = recovered.origin.clone();
+                self.load_scene(recovered.document, origin.clone());
+                self.lifecycle.mark_recovered(origin);
+                self.status = "Recovered unsaved scene from the previous session".into();
+            }
+            Some(false) => {
+                self.lifecycle.discard_recovery();
+                self.status = "Discarded recovered scene".into();
+            }
+            None => {}
         }
     }
 
@@ -1969,6 +2293,30 @@ impl LeopardApp {
                 ui.label(egui::RichText::new("MIT OR Apache-2.0").small().weak());
             });
         self.show_about = open;
+    }
+}
+
+fn format_age(when: SystemTime) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(when)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    if seconds < 60 {
+        "less than a minute ago".into()
+    } else if seconds < 3600 {
+        let minutes = seconds / 60;
+        if minutes == 1 {
+            "1 minute ago".into()
+        } else {
+            format!("{minutes} minutes ago")
+        }
+    } else {
+        let hours = seconds / 3600;
+        if hours == 1 {
+            "1 hour ago".into()
+        } else {
+            format!("{hours} hours ago")
+        }
     }
 }
 
@@ -3064,5 +3412,57 @@ mod workspace_persistence_tests {
             .expect("workspace state containing removed pane fields should deserialize");
         assert_eq!(restored.inspector_tab, super::InspectorTab::Material);
         assert_eq!(restored.browser_tab, super::BrowserTab::Objects);
+    }
+}
+
+#[cfg(test)]
+mod scene_open_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn native_scene_open_reports_staging_cleanup_warning() {
+        let dir = std::env::temp_dir().join(format!(
+            "leopardcraft-ui-open-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scene.lcscene");
+        let stale_file = dir.join(format!(".scene.lcscene.tmp-{}-1", std::process::id()));
+        std::fs::write(&stale_file, b"partial save").unwrap();
+        let _ = lc_scene::take_warnings();
+
+        reconcile_native_scene(&path);
+        assert!(!stale_file.exists());
+        assert!(lc_scene::take_warnings().is_empty());
+
+        let stale = dir.join(format!(".scene.lcscene.tmp-{}-2", std::process::id()));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("blocker"), b"keep").unwrap();
+        let _ = lc_scene::take_warnings();
+
+        reconcile_native_scene(&path);
+        let warnings = lc_scene::take_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("failed to reconcile")),
+            "expected a scene-open recovery warning, got {warnings:?}"
+        );
+        assert!(stale.is_dir());
+
+        let obj = dir.join("model.obj");
+        std::fs::write(&obj, b"not a scene").unwrap();
+        let obj_stale = dir.join(format!(".model.obj.tmp-{}-3", std::process::id()));
+        std::fs::write(&obj_stale, b"OBJ recovery is handled elsewhere").unwrap();
+        reconcile_native_scene(&obj);
+        assert!(lc_scene::take_warnings().is_empty());
+        assert!(obj.exists());
+        assert!(
+            obj_stale.exists(),
+            "opening an OBJ must not run scene staging cleanup"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

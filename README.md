@@ -85,6 +85,34 @@ Manager window.
 - **Render Manager** — capped job history with thumbnails and info, live
   progress, cancellation, and PNG/EXR export from background CPU path tracing.
 
+### Document safety
+
+- The title bar marks unsaved changes with `*`.
+- New, Open and Quit ask before discarding unsaved work; the window close button
+  follows the same path.
+- Saves and exports are atomic: a flushed temporary file in the target
+  directory replaces the target, so an interrupted write cannot truncate an
+  existing scene or export.
+- Native `.lcscene` saves use that atomic replace without a backup file. After
+  the rename, the parent directory is flushed so the new entry is durable;
+  platforms without directory syncing degrade to a no-op. A crash can leave
+  only a hidden temporary sibling; the next save, opening the scene from any
+  directory, or app launch in the scene's directory removes it. Recovery and
+  directory-flush failures are warnings shown in the status bar and Console,
+  and do not block startup, opening or saving.
+- OBJ/MTL pairs commit transactionally. If a crash leaves transaction siblings
+  behind, the next export to that pair — or app launch in the export directory
+  or the opened scene's directory — restores the previous pair or keeps the
+  fully installed pair, then removes the temporary and backup files.
+- A failed write — empty target, missing directory, or I/O error — keeps the
+  document dirty, returns any pending close/open confirmation, reports the
+  error, and leaves no partial target or temporary file behind.
+- While a scene has unsaved changes the editor writes a recovery snapshot every
+  15 seconds to `$XDG_STATE_HOME/leopardcraft` (default
+  `~/.local/state/leopardcraft`); `LEOPARDCRAFT_RECOVERY_DIR` overrides the
+  location. The next launch offers to recover the snapshot. Saves, explicit
+  discards and clean exits remove it.
+
 ### Mesh editing
 
 Select a mesh, open **Properties / Tags → Mesh Editing** and press **Enter Mesh
@@ -138,6 +166,10 @@ leopardcraft --headless export --scene scene.lcscene --out model.glb
 
 # Built-in deterministic smoke test
 leopardcraft --headless selftest
+
+# Non-interactive document lifecycle harness (dirty close/quit, Save As,
+# write-failure recovery, timed autosave, snapshot recovery)
+leopardcraft --headless lifecycle
 ```
 
 Without `--scene` the CLI renders or exports the built-in studio. Render options

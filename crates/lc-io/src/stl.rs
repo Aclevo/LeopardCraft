@@ -46,8 +46,7 @@ pub fn export(path: impl AsRef<Path>, doc: &Document, format: StlFormat) -> Resu
                 }
                 bytes.extend_from_slice(&0u16.to_le_bytes());
             }
-            std::fs::write(path, bytes)
-                .map_err(|e| format!("failed to write {}: {e}", path.display()))
+            crate::common::write_atomic(path, &bytes)
         }
         StlFormat::Ascii => {
             let mut out = String::from("solid leopardcraft\n");
@@ -64,8 +63,7 @@ pub fn export(path: impl AsRef<Path>, doc: &Document, format: StlFormat) -> Resu
                 writeln!(out, "  endfacet").ok();
             }
             writeln!(out, "endsolid leopardcraft").ok();
-            std::fs::write(path, out)
-                .map_err(|e| format!("failed to write {}: {e}", path.display()))
+            crate::common::write_atomic(path, out.as_bytes())
         }
     }
 }

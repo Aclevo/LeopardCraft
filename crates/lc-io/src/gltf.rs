@@ -40,8 +40,7 @@ pub fn export_glb(path: impl AsRef<Path>, doc: &Document) -> Result<(), String> 
     out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
     out.extend_from_slice(&CHUNK_BIN.to_le_bytes());
     out.extend_from_slice(&bin);
-    std::fs::write(path.as_ref(), out)
-        .map_err(|e| format!("failed to write {}: {e}", path.as_ref().display()))
+    crate::common::write_atomic(path.as_ref(), &out)
 }
 
 pub fn export_gltf(path: impl AsRef<Path>, doc: &Document) -> Result<(), String> {
@@ -54,8 +53,7 @@ pub fn export_gltf(path: impl AsRef<Path>, doc: &Document) -> Result<(), String>
     }
     let text = serde_json::to_string_pretty(&json_value)
         .map_err(|e| format!("failed to serialise glTF JSON: {e}"))?;
-    std::fs::write(path.as_ref(), text)
-        .map_err(|e| format!("failed to write {}: {e}", path.as_ref().display()))
+    crate::common::write_atomic(path.as_ref(), text.as_bytes())
 }
 
 pub fn import_glb(path: impl AsRef<Path>) -> Result<Document, String> {

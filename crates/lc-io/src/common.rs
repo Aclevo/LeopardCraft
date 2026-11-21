@@ -3,6 +3,40 @@
 use lc_geom::Mesh;
 use lc_scene::{Document, GeometrySource, NodeId, NodeKind};
 use lc_shading::{Material, ShaderNodeKind, ShaderValue, ShadingContext, Surface, TextureCache};
+use std::io::Write as _;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Write an export through a sibling temporary file and rename it into place.
+/// A failed or interrupted write leaves any existing target untouched and
+/// removes the temporary file.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid output path {}", path.display()))?;
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    };
+    match write() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(format!("failed to write {}: {error}", path.display()))
+        }
+    }
+}
 
 pub fn add_mesh_node(
     doc: &mut Document,

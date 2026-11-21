@@ -168,6 +168,35 @@ mod tests {
     }
 
     #[test]
+    fn failed_export_does_not_leave_partial_or_temporary_files() {
+        let doc = box_document();
+        let dir = temp_dir();
+        for name in [
+            "blocked.lcscene",
+            "blocked.glb",
+            "blocked.gltf",
+            "blocked.obj",
+            "blocked.stl",
+        ] {
+            let target = dir.join(name);
+            std::fs::create_dir(&target).unwrap();
+            assert!(export(&target, &doc).is_err(), "{name} export should fail");
+            assert!(target.is_dir(), "{name} target was replaced");
+            let leftovers: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|entry| entry.starts_with(&format!(".{name}.tmp-")))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "{name} left temporary files: {leftovers:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn malformed_imports_are_errors_not_panics() {
         let dir = temp_dir();
         let bad_obj = dir.join("bad.obj");

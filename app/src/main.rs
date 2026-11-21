@@ -8,8 +8,13 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let startup_warnings = match args.first() {
+        None => recover_startup_artifacts(None),
+        Some(path) if !path.starts_with('-') => recover_startup_artifacts(Some(Path::new(path))),
+        Some(_) => Vec::new(),
+    };
     let result = if args.is_empty() {
-        launch_gui(None, None)
+        launch_gui(None, None, startup_warnings)
     } else if args[0] == "--help" || args[0] == "-h" {
         print_help();
         Ok(())
@@ -23,7 +28,7 @@ fn main() {
     } else {
         let path = PathBuf::from(&args[0]);
         match lc_io::import(&path) {
-            Ok(doc) => launch_gui(Some(doc), Some(path)),
+            Ok(doc) => launch_gui(Some(doc), Some(path), startup_warnings),
             Err(e) => Err(e),
         }
     };
@@ -31,6 +36,46 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+fn recover_startup_artifacts(scene: Option<&Path>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut dirs = vec![PathBuf::from(".")];
+    if let Some(parent) = scene.and_then(Path::parent) {
+        if !parent.as_os_str().is_empty() && parent != Path::new(".") {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    for dir in dirs {
+        match lc_io::obj::recover_interrupted_exports(&dir) {
+            Ok(0) => {}
+            Ok(count) => eprintln!(
+                "Recovered {count} interrupted OBJ/MTL export(s) in {}",
+                dir.display()
+            ),
+            Err(error) => eprintln!(
+                "warning: failed to recover interrupted OBJ/MTL exports in {}: {error}",
+                dir.display()
+            ),
+        }
+        match lc_scene::recover_interrupted_saves(&dir) {
+            Ok(0) => {}
+            Ok(count) => eprintln!(
+                "Recovered {count} interrupted scene save(s) in {}",
+                dir.display()
+            ),
+            Err(error) => {
+                let message = format!(
+                    "failed to recover interrupted scene saves in {}: {error}",
+                    dir.display()
+                );
+                eprintln!("warning: {message}");
+                warnings.push(message);
+            }
+        }
+    }
+    warnings.extend(lc_scene::take_warnings());
+    warnings
 }
 
 fn print_help() {
@@ -41,7 +86,8 @@ fn print_help() {
            leopardcraft [scene.lcscene]        launch the editor\n\
            leopardcraft --headless render [options]\n\
            leopardcraft --headless export [options]\n\
-           leopardcraft --headless selftest\n\n\
+           leopardcraft --headless selftest\n\
+           leopardcraft --headless lifecycle\n\n\
          Render options:\n\
            --scene <path>      scene file (default: built-in studio)\n\
            --out <path>        output .png or .exr (default: render.png)\n\
@@ -72,6 +118,7 @@ fn run_headless(args: &[String]) -> Result<(), String> {
         "render" => headless_render(&args[1..]),
         "export" => headless_export(&args[1..]),
         "selftest" => headless_selftest(&args[1..]),
+        "lifecycle" => lc_ui::run_lifecycle_selftest(),
         "help" => {
             print_help();
             Ok(())
@@ -242,7 +289,11 @@ fn headless_selftest(_args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn launch_gui(initial: Option<Document>, path: Option<PathBuf>) -> Result<(), String> {
+fn launch_gui(
+    initial: Option<Document>,
+    path: Option<PathBuf>,
+    startup_warnings: Vec<String>,
+) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
@@ -259,6 +310,7 @@ fn launch_gui(initial: Option<Document>, path: Option<PathBuf>) -> Result<(), St
             if let Some(doc) = initial {
                 app.load_scene(doc, path);
             }
+            app.report_scene_warnings(startup_warnings);
             Ok(Box::new(app))
         }),
     )

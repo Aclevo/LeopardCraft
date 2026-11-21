@@ -19,7 +19,10 @@ pub use eval::{
     aim_at, EvaluatedCamera, EvaluatedGeometry, EvaluatedKind, EvaluatedLight, EvaluatedNode,
     EvaluatedScene,
 };
-pub use format::{from_json, load_native, save_native, to_json};
+pub use format::{
+    from_json, load_native, recover_interrupted_save, recover_interrupted_saves, save_native,
+    take_warnings, to_json,
+};
 pub use geometry::{CsgOperation, GeometrySource, Modifier, ModifierInput, Primitive};
 pub use light::{Light, LightKind};
 pub use scene::{Node, NodeId, NodeKind, NodeProps, Scene, Skin, Subtree, Tag};

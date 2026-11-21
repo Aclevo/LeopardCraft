@@ -6,4 +6,4 @@ pub mod icons;
 pub mod theme;
 pub mod viewport;
 
-pub use app::LeopardApp;
+pub use app::{run_lifecycle_selftest, LeopardApp};

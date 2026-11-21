@@ -385,7 +385,7 @@ impl LeopardApp {
                 self.show_render_manager = true;
             }
             if icons::icon_button(ui, Icon::Save, "Save scene", true).clicked() {
-                self.save_or_prompt();
+                self.save_or_prompt(ui.ctx());
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -416,20 +416,13 @@ impl LeopardApp {
             ui.menu_button("File", |ui| {
                 ui.set_min_width(190.0);
                 if ui.button("New Studio Scene").clicked() {
-                    self.new_scene();
+                    self.request_action(ui.ctx(), PendingAction::NewScene);
                 }
                 if ui.button("Open…").clicked() {
-                    self.dialog = Some(FileDialog {
-                        mode: FileMode::Open,
-                        path: self
-                            .file_path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "scene.lcscene".into()),
-                    });
+                    self.request_action(ui.ctx(), PendingAction::OpenScene);
                 }
                 if ui.button("Save").clicked() {
-                    self.save_or_prompt();
+                    self.save_or_prompt(ui.ctx());
                 }
                 if ui.button("Save As…").clicked() {
                     self.dialog = Some(FileDialog {
@@ -452,7 +445,7 @@ impl LeopardApp {
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_action(ui.ctx(), PendingAction::Quit);
                 }
             });
             ui.menu_button("Edit", |ui| {
@@ -825,10 +818,10 @@ impl LeopardApp {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let name = self
-                    .file_path
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
+                    .lifecycle
+                    .path()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
                     .unwrap_or("Untitled");
                 ui.label(egui::RichText::new(name).size(10.0).color(theme::TEXT_WEAK));
             });
@@ -878,27 +871,12 @@ impl LeopardApp {
     }
 
     pub(super) fn update_window_title(&mut self, ctx: &egui::Context) {
-        let name = self
-            .file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("Untitled");
-        let title = format!("{name} — LeopardCraft");
+        let name = self.document_name();
+        let marker = if self.lifecycle.is_dirty() { "*" } else { "" };
+        let title = format!("{name}{marker} — LeopardCraft");
         if self.last_title != title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
-        }
-    }
-
-    fn save_or_prompt(&mut self) {
-        if let Some(path) = self.file_path.clone() {
-            self.save_file(path);
-        } else {
-            self.dialog = Some(FileDialog {
-                mode: FileMode::SaveAs,
-                path: "scene.lcscene".into(),
-            });
         }
     }
 
