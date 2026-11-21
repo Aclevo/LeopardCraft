@@ -16,6 +16,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # One pull request per week for all actions, so a broken bump is the whole
+    # diff and easy to revert.
+    groups:
+      actions:
+        patterns: ["*"]
 
   # The root manifest is the workspace manifest, so this one entry covers every
   # member crate and updates the single shared Cargo.lock.
@@ -23,3 +28,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Read the grouped Cargo bump for breaking changes: the crates move
+    # together, so CI has to pass on the combination, not crate by crate.
+    groups:
+      cargo:
+        patterns: ["*"]
