@@ -16,3 +16,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # The root manifest is the workspace manifest, so this one entry covers every
+  # member crate and updates the single shared Cargo.lock.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
