@@ -158,7 +158,7 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
 
     // Edge points.
     let mut edge_point_index = Vec::with_capacity(n_edges);
-    for (_ei, (a, b, faces)) in edges.iter().enumerate() {
+    for (a, b, faces) in &edges {
         let pa = mesh.positions[*a as usize];
         let pb = mesh.positions[*b as usize];
         let pos = if faces.len() < 2 {

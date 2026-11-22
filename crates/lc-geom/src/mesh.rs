@@ -455,7 +455,7 @@ impl Mesh {
         let mut used: HashMap<(u32, u32), bool> = boundary.iter().map(|e| (*e, false)).collect();
         let starts: Vec<u32> = boundary.iter().map(|e| e.0).collect();
         for start in starts {
-            if next.get(&start).map_or(true, |v| v.is_empty()) {
+            if next.get(&start).is_none_or(|v| v.is_empty()) {
                 continue;
             }
             let mut loop_pts = Vec::new();

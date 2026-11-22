@@ -86,7 +86,7 @@ struct GltfBuild {
 
 impl GltfBuild {
     fn align(&mut self) {
-        while self.binary.len() % 4 != 0 {
+        while !self.binary.len().is_multiple_of(4) {
             self.binary.push(0);
         }
     }
@@ -112,11 +112,7 @@ impl GltfBuild {
             "target": target,
         }));
         let accessor_index = self.accessors.len();
-        let count = if components == 0 {
-            0
-        } else {
-            values.len() / components
-        };
+        let count = values.len().checked_div(components).unwrap_or(0);
         let mut accessor = json!({
             "bufferView": view_index,
             "byteOffset": 0,
@@ -127,7 +123,7 @@ impl GltfBuild {
         if bounds && components == 3 && !values.is_empty() {
             let mut min = [f32::INFINITY; 3];
             let mut max = [f32::NEG_INFINITY; 3];
-            for chunk in values.chunks_exact(3) {
+            for chunk in values.as_chunks::<3>().0 {
                 for i in 0..3 {
                     min[i] = min[i].min(chunk[i]);
                     max[i] = max[i].max(chunk[i]);
@@ -339,9 +335,9 @@ fn material_json(
             "roughnessFactor": surface.roughness.clamp(0.04, 1.0),
         },
         "emissiveFactor": [
-            surface.emission.x.max(0.0).min(1.0),
-            surface.emission.y.max(0.0).min(1.0),
-            surface.emission.z.max(0.0).min(1.0),
+            surface.emission.x.clamp(0.0, 1.0),
+            surface.emission.y.clamp(0.0, 1.0),
+            surface.emission.z.clamp(0.0, 1.0),
         ],
     });
     if surface.alpha < 0.999 {
@@ -568,7 +564,7 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
                         s
                     });
                 let point_base = mesh.positions.len() as u32;
-                for chunk in positions.chunks_exact(3) {
+                for chunk in positions.as_chunks::<3>().0 {
                     mesh.positions.push(Vec3::new(chunk[0], chunk[1], chunk[2]));
                 }
                 let has_uv = uvs.len() >= (positions.len() / 3) * 2;
@@ -647,7 +643,6 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
     }
     for root in scene_roots {
         import_node(
-            &gltf,
             &nodes,
             &imported_meshes,
             root,
@@ -665,7 +660,6 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
 }
 
 fn import_node(
-    gltf: &Value,
     nodes: &[Value],
     meshes: &[ImportedMesh],
     index: usize,
@@ -715,7 +709,6 @@ fn import_node(
     if let Some(children) = value.get("children").and_then(|c| c.as_array()) {
         for child in children.iter().filter_map(|c| c.as_u64()) {
             import_node(
-                gltf,
                 nodes,
                 meshes,
                 child as usize,

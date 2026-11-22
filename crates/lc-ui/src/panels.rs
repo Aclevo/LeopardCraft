@@ -10,7 +10,7 @@ impl LeopardApp {
     // -----------------------------------------------------------------------
 
     pub(super) fn ui_properties(&mut self, ui: &mut egui::Ui) {
-        let Some(id) = self.selected else {
+        let Some(id) = self.selection.primary() else {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("Select an object in the viewport or object browser")
@@ -20,7 +20,7 @@ impl LeopardApp {
             return;
         };
         let Some(original) = self.doc.scene.get(id).cloned() else {
-            self.selected = None;
+            self.selection.clear();
             return;
         };
         let mut node = original.clone();
@@ -80,6 +80,17 @@ impl LeopardApp {
                         .small()
                         .weak(),
                 );
+                if self.selection.len() > 1 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} objects selected · editing {}",
+                            self.selection.len(),
+                            node.name
+                        ))
+                        .small()
+                        .color(theme::ACCENT),
+                    );
+                }
                 ui.separator();
 
                 theme::section(ui, "visibility", "Visibility", |ui| {
@@ -125,7 +136,11 @@ impl LeopardApp {
                                         parent_changed = true;
                                     }
                                     for (nid, name) in &node_list {
-                                        if *nid == id || self.doc.scene.is_ancestor(id, *nid) {
+                                        if self.selection.contains(*nid)
+                                            || self.selection.ids().iter().any(|selected| {
+                                                self.doc.scene.is_ancestor(*selected, *nid)
+                                            })
+                                        {
                                             continue;
                                         }
                                         if ui
@@ -576,76 +591,47 @@ impl LeopardApp {
 
                 if node.is_mesh() {
                     theme::section(ui, "skinning", "Skinning", |ui| {
-                        let evaluated = self.evaluate();
-                        let vertex_count = evaluated
-                            .node(id)
-                            .and_then(|n| n.mesh())
-                            .map(|m| m.positions.len())
-                            .unwrap_or(0);
-                        let joints: Vec<(NodeId, String, Mat4)> = node_list
-                            .iter()
-                            .filter_map(|(joint_id, name)| {
-                                if !matches!(
-                                    self.doc.scene.get(*joint_id).map(|n| &n.kind),
-                                    Some(NodeKind::Joint { .. })
-                                ) {
-                                    return None;
-                                }
-                                let world = evaluated.node(*joint_id)?.world;
-                                Some((*joint_id, name.clone(), world))
-                            })
-                            .collect();
+                        let target = self.skin_target();
+                        let vertex_count = target.as_ref().map(|t| t.vertex_count).unwrap_or(0);
+                        let joint_count = target.as_ref().map(|t| t.joint_count).unwrap_or(0);
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} mesh vertices · {} joint objects",
-                                vertex_count,
-                                joints.len()
+                                "{vertex_count} mesh vertices · {joint_count} joint objects"
                             ))
                             .small()
                             .weak(),
                         );
-                        let bind = |node: &mut Node, joints: &[(NodeId, String, Mat4)]| {
-                            if joints.is_empty() || vertex_count == 0 {
-                                return;
-                            }
-                            let mut skin = Skin::new(
-                                joints.iter().map(|(joint_id, _, _)| *joint_id).collect(),
-                                joints.iter().map(|(_, _, world)| world.inverse()).collect(),
-                            );
-                            skin.bind_all_to_first(vertex_count);
-                            node.skin = Some(skin);
-                        };
-                        let mut unbind = false;
-                        let skin_info = node
+                        let bind_ready = target
+                            .as_ref()
+                            .map(|target| skin_binding_ready(&node, target))
+                            .unwrap_or(false);
+                        if let Some((joints, weights)) = node
                             .skin
                             .as_ref()
-                            .map(|skin| (skin.joints.len(), skin.vertex_count()));
-                        if let Some((joint_count, weighted_vertices)) = skin_info {
-                            ui.label(format!(
-                                "{} joints · {} weighted vertices",
-                                joint_count, weighted_vertices
-                            ));
+                            .map(|skin| (skin.joints.len(), skin.vertex_count()))
+                        {
+                            ui.label(format!("{joints} joints · {weights} weighted vertices"));
+                            if ui
+                                .add_enabled(bind_ready, egui::Button::new("Rebind to all joints"))
+                                .clicked()
+                            {
+                                self.bind_skin_to_all_joints();
+                            }
                             if ui
                                 .add_enabled(
-                                    !joints.is_empty() && vertex_count > 0,
-                                    egui::Button::new("Rebind to all joints"),
+                                    skin_unbind_ready(&node),
+                                    egui::Button::new("Unbind skin"),
                                 )
                                 .clicked()
                             {
-                                bind(&mut node, &joints);
-                            }
-                            if ui.button("Unbind skin").clicked() {
-                                unbind = true;
+                                self.unbind_skin_from_primary();
                             }
                         } else {
                             if ui
-                                .add_enabled(
-                                    !joints.is_empty() && vertex_count > 0,
-                                    egui::Button::new("Bind to all joints"),
-                                )
+                                .add_enabled(bind_ready, egui::Button::new("Bind to all joints"))
                                 .clicked()
                             {
-                                bind(&mut node, &joints);
+                                self.bind_skin_to_all_joints();
                             }
                             ui.label(
                                 egui::RichText::new(
@@ -655,9 +641,6 @@ impl LeopardApp {
                                 .small()
                                 .weak(),
                             );
-                        }
-                        if unbind {
-                            node.skin = None;
                         }
                     });
                 }
@@ -677,6 +660,7 @@ impl LeopardApp {
                         .cloned()
                         .collect();
                     let mut remove = None;
+                    let mut add_modifier: Option<Modifier> = None;
                     for (i, modifier) in node.modifiers.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(modifier.label());
@@ -728,16 +712,17 @@ impl LeopardApp {
                                 }
                                 _ => {}
                             }
-                            if theme::close_icon(ui, 16.0)
-                                .on_hover_text("Remove modifier")
-                                .clicked()
+                            if self.modifier_remove_ready(i)
+                                && theme::close_icon(ui, 16.0)
+                                    .on_hover_text("Remove modifier")
+                                    .clicked()
                             {
                                 remove = Some(i);
                             }
                         });
                     }
                     if let Some(i) = remove {
-                        node.modifiers.remove(i);
+                        self.remove_modifier_from_primary(i);
                     }
                     ui.menu_button("Add Modifier", |ui| {
                         for modifier in Modifier::defaults() {
@@ -745,12 +730,19 @@ impl LeopardApp {
                             if modifier_is_boolean(&modifier) {
                                 continue;
                             }
-                            if ui.button(label).clicked() {
-                                node.modifiers.push(modifier);
+                            let ready = self.modifier_ready(&modifier);
+                            if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
+                                add_modifier = Some(modifier);
                             }
                         }
                     });
-                    if !boolean_candidates.is_empty() {
+                    let boolean_menu_ready = boolean_candidates.iter().any(|(operand, _)| {
+                        self.modifier_ready(&Modifier::Boolean {
+                            operand: *operand,
+                            operation: lc_scene::CsgOperation::Subtract,
+                        })
+                    });
+                    if boolean_menu_ready {
                         ui.menu_button("Add Boolean", |ui| {
                             for (operand_id, name) in &boolean_candidates {
                                 for operation in [
@@ -758,18 +750,30 @@ impl LeopardApp {
                                     lc_scene::CsgOperation::Union,
                                     lc_scene::CsgOperation::Intersect,
                                 ] {
+                                    let modifier = Modifier::Boolean {
+                                        operand: *operand_id,
+                                        operation,
+                                    };
+                                    let ready = self.modifier_ready(&modifier);
                                     if ui
-                                        .button(format!("{} {}", operation.label(), name))
+                                        .add_enabled(
+                                            ready,
+                                            egui::Button::new(format!(
+                                                "{} {}",
+                                                operation.label(),
+                                                name
+                                            )),
+                                        )
                                         .clicked()
                                     {
-                                        node.modifiers.push(Modifier::Boolean {
-                                            operand: *operand_id,
-                                            operation,
-                                        });
+                                        add_modifier = Some(modifier);
                                     }
                                 }
                             }
                         });
+                    }
+                    if let Some(modifier) = add_modifier {
+                        self.add_modifier_to_primary(modifier);
                     }
                 });
 
@@ -787,7 +791,7 @@ impl LeopardApp {
                         });
                     }
                     if let Some(i) = remove {
-                        node.tags.remove(i);
+                        node.remove_tag(i);
                     }
                     ui.menu_button("Add Tag", |ui| {
                         let target = node_list
@@ -852,7 +856,9 @@ impl LeopardApp {
             });
 
         if parent_changed {
-            if let Some(cmd) = ReparentCmd::new(&self.doc, id, parent) {
+            if self.selection.len() > 1 {
+                self.reparent_selection(parent);
+            } else if let Some(cmd) = ReparentCmd::new(&self.doc, id, parent) {
                 self.history.execute(&mut self.doc, Box::new(cmd));
                 self.status = "Reparented object".into();
             }
@@ -889,8 +895,13 @@ impl LeopardApp {
                 if ui.button("Exit Mesh Edit").clicked() {
                     action = Some(MeshAction::Exit);
                 }
-            } else if ui.button("Enter Mesh Edit").clicked() {
-                action = Some(MeshAction::Enter);
+            } else {
+                let enter_ready = self.mesh_mode_ready();
+                let enter = ui.add_enabled(enter_ready, egui::Button::new("Enter Mesh Edit"));
+                record_menu_item_state("panel:Enter Mesh Edit", &enter, enter_ready);
+                if enter.clicked() {
+                    action = Some(MeshAction::Enter);
+                }
             }
             if mesh.is_none() {
                 ui.label(
@@ -922,16 +933,27 @@ impl LeopardApp {
                     .clicked()
                     && self.mesh_select_mode != mode
                 {
-                    self.mesh_select_mode = mode;
-                    self.mesh_selected.clear();
+                    self.set_mesh_mode(mode);
                 }
             }
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button("All").clicked() {
+            if ui
+                .add_enabled(
+                    self.mesh_component_selection_ready(),
+                    egui::Button::new("All"),
+                )
+                .clicked()
+            {
                 action = Some(MeshAction::SelectAll);
             }
-            if ui.button("None").clicked() {
+            if ui
+                .add_enabled(
+                    self.mesh_component_selection_ready(),
+                    egui::Button::new("None"),
+                )
+                .clicked()
+            {
                 action = Some(MeshAction::SelectNone);
             }
             ui.label(
@@ -1006,32 +1028,32 @@ impl LeopardApp {
                     .speed(0.01)
                     .prefix(format!("{label} ")),
             );
-            if ui.button("Apply Transform").clicked() {
+            let transform_ready = self.mesh_transform_ready();
+            let transform_button =
+                ui.add_enabled(transform_ready, egui::Button::new("Apply Transform"));
+            record_menu_item_state("panel:Apply Transform", &transform_button, transform_ready);
+            if transform_button.clicked() {
                 action = Some(MeshAction::Transform);
             }
         });
 
         ui.separator();
         ui.label("Topology tools");
-        let face_tools =
-            self.mesh_select_mode == MeshSelectMode::Polygons && !self.mesh_selected.is_empty();
+        let face_tools = self.mesh_topology_ready(MeshSelectMode::Polygons, 1);
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(face_tools, egui::Button::new("Extrude"))
-                .clicked()
-            {
+            let extrude = ui.add_enabled(face_tools, egui::Button::new("Extrude"));
+            record_menu_item_state("panel:Extrude", &extrude, face_tools);
+            if extrude.clicked() {
                 action = Some(MeshAction::Extrude);
             }
-            if ui
-                .add_enabled(face_tools, egui::Button::new("Inset"))
-                .clicked()
-            {
+            let inset = ui.add_enabled(face_tools, egui::Button::new("Inset"));
+            record_menu_item_state("panel:Inset", &inset, face_tools);
+            if inset.clicked() {
                 action = Some(MeshAction::Inset);
             }
-            if ui
-                .add_enabled(face_tools, egui::Button::new("Bevel"))
-                .clicked()
-            {
+            let bevel = ui.add_enabled(face_tools, egui::Button::new("Bevel"));
+            record_menu_item_state("panel:Bevel", &bevel, face_tools);
+            if bevel.clicked() {
                 action = Some(MeshAction::Bevel);
             }
             ui.checkbox(&mut self.mesh_extrude_individual, "Individual");
@@ -1054,25 +1076,24 @@ impl LeopardApp {
                     .speed(0.01)
                     .prefix("Offset "),
             );
-            if ui.button("Cut").clicked() {
+            let ring_ready = self.mesh_ring_cut_ready();
+            let cut = ui.add_enabled(ring_ready, egui::Button::new("Cut"));
+            record_menu_item_state("panel:Ring Cut", &cut, ring_ready);
+            if cut.clicked() {
                 action = Some(MeshAction::RingCut);
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let can_weld =
-                self.mesh_select_mode == MeshSelectMode::Points && self.mesh_selected.len() >= 2;
-            if ui
-                .add_enabled(can_weld, egui::Button::new("Weld Selected Points"))
-                .clicked()
-            {
+            let weld_ready = self.mesh_weld_ready();
+            let weld = ui.add_enabled(weld_ready, egui::Button::new("Weld Selected Points"));
+            record_menu_item_state("panel:Weld Points", &weld, weld_ready);
+            if weld.clicked() {
                 action = Some(MeshAction::Weld);
             }
-            let can_bridge =
-                self.mesh_select_mode == MeshSelectMode::Edges && !self.mesh_selected.is_empty();
-            if ui
-                .add_enabled(can_bridge, egui::Button::new("Bridge Selected Loops"))
-                .clicked()
-            {
+            let bridge_ready = self.mesh_bridge_ready();
+            let bridge = ui.add_enabled(bridge_ready, egui::Button::new("Bridge Selected Loops"));
+            record_menu_item_state("panel:Bridge Loops", &bridge, bridge_ready);
+            if bridge.clicked() {
                 action = Some(MeshAction::Bridge);
             }
         });
@@ -1085,10 +1106,13 @@ impl LeopardApp {
                 .unwrap_or_else(|| "selected material".into());
             ui.horizontal_wrapped(|ui| {
                 ui.label("Polygon material");
-                if ui
-                    .button(format!("Assign {material_name} to selection"))
-                    .clicked()
-                {
+                let assign_ready = self.mesh_assign_material_ready();
+                let assign = ui.add_enabled(
+                    assign_ready,
+                    egui::Button::new(format!("Assign {material_name} to selection")),
+                );
+                record_menu_item_state("panel:Assign Material", &assign, assign_ready);
+                if assign.clicked() {
                     action = Some(MeshAction::AssignMaterial);
                 }
             });
@@ -1307,7 +1331,14 @@ impl LeopardApp {
         rows
     }
 
-    fn ui_objects(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn ui_objects(&mut self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        {
+            self.object_row_rects.clear();
+            self.object_row_highlights.clear();
+            self.object_row_icons.clear();
+            self.object_row_flags.clear();
+        }
         let rows = self.object_rows();
         if rows.is_empty() {
             theme::empty(ui, "No matching objects");
@@ -1321,15 +1352,39 @@ impl LeopardApp {
         let mut toggle_collapsed = None;
         let mut duplicate = None;
         let mut delete = None;
+        let mut group = false;
+        let mut reparent_to: Option<(NodeId, Option<NodeId>)> = None;
+        let modifiers = ui.input(|i| i.modifiers);
+        let reparent_candidates: Vec<(NodeId, String)> = rows
+            .iter()
+            .filter(|row| !row.is_modifier)
+            .filter(|row| {
+                !self.selection.contains(row.id)
+                    && !self
+                        .selection
+                        .ids()
+                        .iter()
+                        .any(|selected| self.doc.scene.is_ancestor(*selected, row.id))
+            })
+            .map(|row| (row.id, row.name.clone()))
+            .collect();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (index, row) in rows.iter().enumerate() {
-                    let selected = self.selected == Some(row.id) && !row.is_modifier;
+                    let selected = self.selection.contains(row.id) && !row.is_modifier;
+                    #[cfg(test)]
+                    if !row.is_modifier {
+                        self.object_row_highlights.push((row.id, selected));
+                    }
                     let (rect, response) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width().max(40.0), 19.0),
                         Sense::click(),
                     );
+                    #[cfg(test)]
+                    if !row.is_modifier {
+                        self.object_row_rects.push((row.id, rect));
+                    }
                     let painter = ui.painter_at(rect);
                     if selected {
                         painter.rect_filled(rect, 0.0, theme::SELECTION);
@@ -1373,6 +1428,27 @@ impl LeopardApp {
                         ));
                     }
                     let dot = Pos2::new(left + 16.0, rect.center().y);
+                    #[cfg(test)]
+                    if !row.is_modifier {
+                        self.object_row_icons.push((
+                            row.id,
+                            Rect::from_center_size(dot, Vec2::splat(14.0)),
+                            Rect::from_center_size(
+                                Pos2::new(rect.right() - 30.0, rect.center().y),
+                                Vec2::splat(14.0),
+                            ),
+                            Rect::from_center_size(
+                                Pos2::new(rect.right() - 12.0, rect.center().y),
+                                Vec2::splat(14.0),
+                            ),
+                        ));
+                        self.object_row_flags.push((
+                            row.id,
+                            row.visible,
+                            row.renderable,
+                            row.locked,
+                        ));
+                    }
                     if row.is_modifier {
                         painter.line_segment(
                             [
@@ -1519,27 +1595,65 @@ impl LeopardApp {
                         }
                     }
                     if response.double_clicked() {
-                        select = Some(row.id);
+                        select = Some((row.id, false));
                         frame = true;
                     } else if response.clicked() && !handled {
-                        select = Some(row.id);
+                        select = Some((row.id, modifiers.shift || modifiers.command));
                     }
                     if selected && self.reveal_selected_in_browser {
                         response.scroll_to_me(Some(egui::Align::Center));
                         self.reveal_selected_in_browser = false;
                     }
                     response.context_menu(|ui| {
-                        if ui.button("Select").clicked() {
-                            select = Some(row.id);
+                        if recorded_button(ui, "ctx:Select", "Select").clicked() {
+                            select = Some((row.id, false));
                         }
-                        if ui.button("Duplicate").clicked() {
+                        if self.selection.len() > 1 && self.selection.contains(row.id) {
+                            if recorded_button(ui, "ctx:Group Selection", "Group Selection")
+                                .clicked()
+                            {
+                                group = true;
+                            }
+                            if recorded_button(ui, "ctx:Unparent Selection", "Unparent Selection")
+                                .clicked()
+                            {
+                                reparent_to = Some((row.id, None));
+                            }
+                            recorded_submenu(
+                                ui,
+                                "ctx:Reparent Selection to...",
+                                "Reparent Selection to…",
+                                |ui| {
+                                    for (nid, name) in &reparent_candidates {
+                                        if recorded_button(
+                                            ui,
+                                            &format!("ctx:Reparent:{name}"),
+                                            name,
+                                        )
+                                        .clicked()
+                                        {
+                                            reparent_to = Some((row.id, Some(*nid)));
+                                        }
+                                    }
+                                    if recorded_button(ui, "ctx:Reparent:Scene Root", "Scene Root")
+                                        .clicked()
+                                    {
+                                        reparent_to = Some((row.id, None));
+                                    }
+                                },
+                            );
+                            ui.separator();
+                        }
+                        if recorded_button(ui, "ctx:Duplicate", "Duplicate").clicked() {
                             duplicate = Some(row.id);
                         }
-                        if ui.button("Delete").clicked() {
+                        if recorded_button(ui, "ctx:Delete", "Delete").clicked() {
                             delete = Some(row.id);
                         }
-                        if ui.button("Frame Selected").clicked() {
-                            select = Some(row.id);
+                        if recorded_button(ui, "ctx:Frame Selected", "Frame Selected").clicked() {
+                            if !self.selection.contains(row.id) {
+                                select = Some((row.id, false));
+                            }
                             frame = true;
                         }
                     });
@@ -1561,63 +1675,77 @@ impl LeopardApp {
                 self.collapsed.insert(id);
             }
         }
-        if let Some(id) = toggle_visible {
-            if let Some(node) = self.doc.scene.get(id).cloned() {
-                let before = NodeProps::of(&node);
-                let mut after = before.clone();
-                after.visible = !before.visible;
-                self.history.execute(
-                    &mut self.doc,
-                    Box::new(SetNodePropsCmd { id, before, after }),
-                );
+        let targets_for = |app: &Self, id: NodeId| -> Vec<NodeId> {
+            if app.selection.contains(id) {
+                app.selection.ids().to_vec()
+            } else {
+                vec![id]
             }
+        };
+        if let Some(id) = toggle_visible {
+            let targets = targets_for(self, id);
+            let value = !self
+                .doc
+                .scene
+                .get(id)
+                .map(|node| node.visible)
+                .unwrap_or(true);
+            self.set_nodes_flag(&targets, NodeFlag::Visible, value);
         }
         if let Some(id) = toggle_renderable {
-            if let Some(node) = self.doc.scene.get(id).cloned() {
-                let before = NodeProps::of(&node);
-                let mut after = before.clone();
-                after.renderable = !before.renderable;
-                self.history.execute(
-                    &mut self.doc,
-                    Box::new(SetNodePropsCmd { id, before, after }),
-                );
-            }
+            let targets = targets_for(self, id);
+            let value = !self
+                .doc
+                .scene
+                .get(id)
+                .map(|node| node.renderable)
+                .unwrap_or(true);
+            self.set_nodes_flag(&targets, NodeFlag::Renderable, value);
         }
         if let Some(id) = toggle_locked {
-            if let Some(node) = self.doc.scene.get(id).cloned() {
-                let before = NodeProps::of(&node);
-                let mut after = before.clone();
-                after.locked = !before.locked;
-                self.history.execute(
-                    &mut self.doc,
-                    Box::new(SetNodePropsCmd { id, before, after }),
-                );
-            }
+            let targets = targets_for(self, id);
+            let value = !self
+                .doc
+                .scene
+                .get(id)
+                .map(|node| node.locked)
+                .unwrap_or(false);
+            self.set_nodes_flag(&targets, NodeFlag::Locked, value);
         }
-        if let Some(id) = select {
-            self.selected = Some(id);
-            self.mesh_edit = false;
-            self.mesh_selected.clear();
-            self.sync_selection_material();
-            self.status = format!(
-                "Selected {}",
-                self.doc
-                    .scene
-                    .get(id)
-                    .map(|node| node.name.clone())
-                    .unwrap_or_default()
-            );
-            if frame {
-                self.frame_selected();
+        if let Some((id, additive)) = select {
+            if additive {
+                self.selection.toggle(id);
+            } else {
+                self.selection.select_one(id);
             }
+            self.mesh_edit = false;
+            self.clear_mesh_component_selection();
+            self.sync_selection_material();
+            self.status = self.selection_status();
+        }
+        if frame {
+            self.frame_selected();
         }
         if let Some(id) = duplicate {
-            self.selected = Some(id);
+            if !self.selection.contains(id) {
+                self.selection.select_one(id);
+            }
             self.duplicate_selected();
         }
         if let Some(id) = delete {
-            self.selected = Some(id);
+            if !self.selection.contains(id) {
+                self.selection.select_one(id);
+            }
             self.delete_selected();
+        }
+        if group {
+            self.group_selection();
+        }
+        if let Some((row, parent)) = reparent_to {
+            if !self.selection.contains(row) {
+                self.selection.select_one(row);
+            }
+            self.reparent_selection(parent);
         }
     }
 
@@ -1709,7 +1837,7 @@ impl LeopardApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (id, name, keys, first, last) in &takes {
-                    let selected = self.selected == Some(*id);
+                    let selected = self.selection.contains(*id);
                     let (rect, response) = ui
                         .allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
                     let painter = ui.painter_at(rect);
@@ -1742,7 +1870,7 @@ impl LeopardApp {
                         },
                     );
                     if response.clicked() {
-                        self.selected = Some(*id);
+                        self.selection.select_one(*id);
                         self.inspector_tab = InspectorTab::Object;
                         self.mesh_edit = false;
                         self.sync_selection_material();

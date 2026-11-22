@@ -28,6 +28,7 @@ pub use light::{Light, LightKind};
 pub use scene::{Node, NodeId, NodeKind, NodeProps, Scene, Skin, Subtree, Tag};
 pub use undo::{
     AddMaterialCmd, AddNodeCmd, Command, DeleteNodeCmd, History, RemoveMaterialCmd, RenameNodeCmd,
-    ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetMaterialCmd, SetNodePropsCmd,
-    SetSettingsCmd, SetShapeCmd, SetTransformCmd, Shape,
+    ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetAnimationsCmd, SetMaterialCmd,
+    SetNodePropsCmd, SetNodesPropsCmd, SetSettingsCmd, SetShapeCmd, SetShapesCmd,
+    SetTagAnimationCmd, SetTransformCmd, SetTransformsCmd, Shape,
 };

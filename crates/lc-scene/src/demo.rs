@@ -324,10 +324,8 @@ impl Document {
         if let Some(m) = self.materials.iter().find(|m| m.name == name) {
             return m.id;
         }
-        let id = self
-            .materials
-            .add(lc_shading::Material::pbr(0, name, base, 0.5, 0.0));
-        id
+        self.materials
+            .add(lc_shading::Material::pbr(0, name, base, 0.5, 0.0))
     }
 
     /// Set a Principled input on a material by index (helper for demos/tests).

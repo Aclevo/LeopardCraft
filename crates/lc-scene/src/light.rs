@@ -3,18 +3,18 @@
 use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LightKind {
+    #[default]
     Directional,
-    Point { radius: f32 },
-    Area { width: f32, height: f32 },
-}
-
-impl Default for LightKind {
-    fn default() -> Self {
-        Self::Directional
-    }
+    Point {
+        radius: f32,
+    },
+    Area {
+        width: f32,
+        height: f32,
+    },
 }
 
 impl LightKind {

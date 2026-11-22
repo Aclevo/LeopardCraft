@@ -446,13 +446,13 @@ impl Document {
                             );
                         }
                     }
-                    crate::Tag::MaterialOverride { material } => {
-                        if self.materials.get(*material).is_none() {
-                            push(
-                                &mut errors,
-                                format!("node {id} tag references missing material {material}"),
-                            );
-                        }
+                    crate::Tag::MaterialOverride { material }
+                        if self.materials.get(*material).is_none() =>
+                    {
+                        push(
+                            &mut errors,
+                            format!("node {id} tag references missing material {material}"),
+                        );
                     }
                     _ => {}
                 }
@@ -533,7 +533,7 @@ impl Document {
         }
 
         // Cycle detection and reachability.
-        for (&id, _) in nodes {
+        for &id in nodes.keys() {
             let mut seen = HashSet::new();
             let mut current = Some(id);
             while let Some(c) = current {
@@ -607,17 +607,33 @@ impl Document {
             }
             node.material_slots
                 .retain(|_, m| valid_materials.contains(m));
-            node.tags.retain(|tag| match tag {
-                crate::Tag::LookAt { target, .. }
-                | crate::Tag::CopyLocation { source: target, .. } => node_ids.contains(target),
-                crate::Tag::MaterialOverride { material } => valid_materials.contains(material),
-                _ => true,
-            });
+            let old_tags = std::mem::take(&mut node.tags);
+            let old_tag_animations = std::mem::take(&mut node.tag_animations);
+            for (old_index, tag) in old_tags.into_iter().enumerate() {
+                let valid = match &tag {
+                    crate::Tag::LookAt { target, .. }
+                    | crate::Tag::CopyLocation { source: target, .. } => node_ids.contains(target),
+                    crate::Tag::MaterialOverride { material } => valid_materials.contains(material),
+                    _ => true,
+                };
+                if valid {
+                    if let Some(clip) = old_tag_animations.get(&(old_index as u32)) {
+                        node.tag_animations
+                            .insert(node.tags.len() as u32, clip.clone());
+                    }
+                    node.tags.push(tag);
+                }
+            }
             node.modifiers.retain(|m| match m {
                 crate::Modifier::Boolean { operand, .. } => node_ids.contains(operand),
                 _ => true,
             });
             sanitize_animation(&mut node.animation);
+            node.tag_animations
+                .retain(|index, _| (*index as usize) < node.tags.len());
+            for clip in node.tag_animations.values_mut() {
+                sanitize_animation(clip);
+            }
             if let NodeKind::Mesh {
                 geometry: crate::GeometrySource::Editable { mesh, .. },
             } = &mut node.kind
@@ -647,13 +663,10 @@ impl Document {
         for (&id, node) in &scene.nodes {
             match node.parent {
                 Some(p) => {
-                    if !scene.nodes.contains_key(&p) {
-                        consistent = false;
-                    } else if !scene
+                    if !scene
                         .nodes
                         .get(&p)
-                        .map(|n| n.children.contains(&id))
-                        .unwrap_or(false)
+                        .is_some_and(|n| n.children.contains(&id))
                     {
                         consistent = false;
                     }

@@ -3,17 +3,12 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplineKind {
     Linear,
+    #[default]
     Bezier,
     Smooth,
-}
-
-impl Default for SplineKind {
-    fn default() -> Self {
-        Self::Bezier
-    }
 }
 
 /// Control point with relative Bezier handles.

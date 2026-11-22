@@ -217,6 +217,10 @@ pub struct Node {
     pub tags: Vec<Tag>,
     #[serde(default)]
     pub animation: AnimationClip,
+    /// Per-tag clips keyed by tag index. Tag scope channels live here so two
+    /// Copy Location tags on one object animate independently.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tag_animations: BTreeMap<u32, AnimationClip>,
     #[serde(default)]
     pub modifiers: Vec<Modifier>,
     #[serde(default)]
@@ -241,6 +245,7 @@ impl Node {
             material_slots: BTreeMap::new(),
             tags: Vec::new(),
             animation: AnimationClip::default(),
+            tag_animations: BTreeMap::new(),
             modifiers: Vec::new(),
             skin: None,
             locked: false,
@@ -260,6 +265,25 @@ impl Node {
     pub fn with_tag(mut self, tag: Tag) -> Self {
         self.tags.push(tag);
         self
+    }
+
+    /// Remove a tag and shift the per-tag clips that followed it so animation
+    /// keeps pointing at the same tag.
+    pub fn remove_tag(&mut self, index: usize) -> Option<Tag> {
+        if index >= self.tags.len() {
+            return None;
+        }
+        let removed = self.tags.remove(index);
+        let mut remapped = BTreeMap::new();
+        for (key, clip) in std::mem::take(&mut self.tag_animations) {
+            if key < index as u32 {
+                remapped.insert(key, clip);
+            } else if key > index as u32 {
+                remapped.insert(key - 1, clip);
+            }
+        }
+        self.tag_animations = remapped;
+        Some(removed)
     }
 
     pub fn mesh(id: NodeId, name: impl Into<String>, geometry: GeometrySource) -> Self {
@@ -752,6 +776,10 @@ impl Scene {
                 h.write_str(&n.name);
                 h.write_u64(n.parent.unwrap_or(0));
                 h.write_u64(n.animation.signature());
+                for (tag_index, clip) in &n.tag_animations {
+                    h.write_u32(*tag_index);
+                    h.write_u64(clip.signature());
+                }
             }
         }
         h.finish()

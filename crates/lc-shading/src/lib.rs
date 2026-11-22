@@ -15,6 +15,7 @@ pub use graph::{
 pub use texture::{Texture2D, TextureCache};
 
 use glam::Vec2;
+use lc_anim::{AnimProperty, AnimationClip};
 use lc_core::StableHasher;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -34,6 +35,9 @@ pub struct Material {
     pub double_sided: bool,
     #[serde(default = "default_true")]
     pub casts_shadow: bool,
+    /// Material-scope animation (roughness, metallic).
+    #[serde(default)]
+    pub animation: AnimationClip,
 }
 
 impl Material {
@@ -70,6 +74,7 @@ impl Material {
             graph,
             double_sided: true,
             casts_shadow: true,
+            animation: AnimationClip::default(),
         }
     }
 
@@ -91,7 +96,20 @@ impl Material {
     }
 
     pub fn evaluate(&self, ctx: &ShadingContext) -> Surface {
-        self.graph.evaluate(ctx)
+        self.evaluate_at(ctx, ctx.time)
+    }
+
+    /// Evaluate the material at an explicit time so material-scope animation
+    /// applies consistently in previews and offline renders.
+    pub fn evaluate_at(&self, ctx: &ShadingContext, time: f32) -> Surface {
+        let mut surface = self.graph.evaluate(ctx);
+        if let Some(value) = self.animation.sample(AnimProperty::MaterialRoughness, time) {
+            surface.roughness = value.clamp(0.0, 1.0);
+        }
+        if let Some(value) = self.animation.sample(AnimProperty::MaterialMetallic, time) {
+            surface.metallic = value.clamp(0.0, 1.0);
+        }
+        surface
     }
 
     /// A representative base colour, used by the real-time viewport and
@@ -124,11 +142,54 @@ impl Material {
         self.evaluate(&ctx).roughness
     }
 
+    pub fn preview_metallic(&self, textures: &TextureCache) -> f32 {
+        let ctx = ShadingContext {
+            uv: Vec2::new(0.37, 0.61),
+            position: glam::Vec3::ZERO,
+            normal: glam::Vec3::Y,
+            tangent: glam::Vec3::X,
+            view_dir: glam::Vec3::Z,
+            time: 0.0,
+            textures,
+        };
+        self.evaluate(&ctx).metallic
+    }
+
+    /// Graph roughness without any animation applied. Recording a new key must
+    /// capture the authored graph value, not the currently evaluated key.
+    pub fn base_roughness(&self, textures: &TextureCache) -> f32 {
+        let ctx = ShadingContext {
+            uv: Vec2::new(0.37, 0.61),
+            position: glam::Vec3::ZERO,
+            normal: glam::Vec3::Y,
+            tangent: glam::Vec3::X,
+            view_dir: glam::Vec3::Z,
+            time: 0.0,
+            textures,
+        };
+        self.graph.evaluate(&ctx).roughness
+    }
+
+    /// Graph metallic without any animation applied.
+    pub fn base_metallic(&self, textures: &TextureCache) -> f32 {
+        let ctx = ShadingContext {
+            uv: Vec2::new(0.37, 0.61),
+            position: glam::Vec3::ZERO,
+            normal: glam::Vec3::Y,
+            tangent: glam::Vec3::X,
+            view_dir: glam::Vec3::Z,
+            time: 0.0,
+            textures,
+        };
+        self.graph.evaluate(&ctx).metallic
+    }
+
     pub fn signature(&self) -> u64 {
         let mut h = StableHasher::new();
         h.write_u32(self.id);
         h.write_str(&self.name);
         h.write_u64(self.graph.signature());
+        h.write_u64(self.animation.signature());
         h.finish()
     }
 }
@@ -325,6 +386,27 @@ mod tests {
         let s = glass.evaluate(&ctx);
         assert!(s.transmission > 0.99);
         assert!((s.ior - 1.45).abs() < 1e-4);
+    }
+
+    #[test]
+    fn animated_material_scalars_apply_at_time() {
+        let mut material = Material::pbr(7, "Animated", glam::Vec3::splat(0.5), 0.2, 0.1);
+        material.animation.set_key(
+            lc_anim::AnimProperty::MaterialRoughness,
+            0.0,
+            0.2,
+            lc_anim::Interpolation::Linear,
+        );
+        material.animation.set_key(
+            lc_anim::AnimProperty::MaterialRoughness,
+            1.0,
+            0.8,
+            lc_anim::Interpolation::Linear,
+        );
+        let cache = TextureCache::default();
+        let ctx = ShadingContext::new(&cache);
+        assert!((material.evaluate_at(&ctx, 0.5).roughness - 0.5).abs() < 1e-4);
+        assert!((material.evaluate_at(&ctx, 0.5).metallic - 0.1).abs() < 1e-4);
     }
 
     #[test]

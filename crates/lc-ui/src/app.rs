@@ -6,24 +6,30 @@ use self::lifecycle::{
     SaveKind, StartupOutcome,
 };
 use self::recovery::RecoveryStore;
+use self::selection::Selection;
 use crate::icons::{self, Icon};
 use crate::theme;
 use crate::viewport::{FrameData, Vertex, ViewportRenderer};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use glam::{Mat4, Quat, Vec2 as V2, Vec3};
-use lc_anim::{AnimProperty, Interpolation, Playback};
+use lc_anim::{
+    AnimChannel, AnimProperty, AnimationClip, ChannelAppliesTo, ChannelKind, Interpolation,
+    Playback,
+};
 use lc_core::{look_at_quat, ray_triangle, Pcg32, Transform};
 use lc_geom::Mesh;
 use lc_render::{PathTracer, RenderScene};
 use lc_scene::{
-    AddNodeCmd, Camera, DeleteNodeCmd, Document, Environment, EvaluatedScene, GeometrySource,
-    History, Light, LightKind, Modifier, Node, NodeId, NodeKind, NodeProps, Primitive,
-    ProjectionMode, RenameNodeCmd, ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd,
-    SetMaterialCmd, SetNodePropsCmd, SetShapeCmd, SetTransformCmd, Shape, Skin, Tag,
+    AddNodeCmd, Camera, Command, Document, Environment, EvaluatedScene, GeometrySource, History,
+    Light, LightKind, Modifier, Node, NodeId, NodeKind, NodeProps, Primitive, ProjectionMode,
+    RenameNodeCmd, ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetAnimationsCmd,
+    SetMaterialCmd, SetNodePropsCmd, SetNodesPropsCmd, SetShapeCmd, SetShapesCmd,
+    SetTagAnimationCmd, SetTransformsCmd, Shape, Skin, Tag,
 };
 use lc_shading::{Material, MaterialId, ShaderNodeKind, ShaderValue, TextureCache};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,28 +47,145 @@ mod panels;
 mod panels_more;
 #[path = "recovery.rs"]
 mod recovery;
+#[path = "selection.rs"]
+mod selection;
+#[cfg(test)]
+#[path = "selection_tests.rs"]
+mod selection_tests;
 #[path = "shell.rs"]
 mod shell;
 #[cfg(test)]
 #[path = "warning_surface_tests.rs"]
 mod warning_surface_tests;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(test)]
+mod ui_test_support {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug)]
+    pub(super) struct MenuHit {
+        pub key: String,
+        pub rect: Rect,
+        pub enabled: bool,
+    }
+
+    thread_local! {
+        static MENU_HITS: RefCell<Vec<MenuHit>> = const { RefCell::new(Vec::new()) };
+        static VIEWPORT_HITS: RefCell<(Vec<NodeId>, Vec<NodeId>)> =
+            const { RefCell::new((Vec::new(), Vec::new())) };
+    }
+
+    pub(super) fn clear_menu_hits() {
+        MENU_HITS.with(|hits| hits.borrow_mut().clear());
+    }
+
+    pub(super) fn record_menu_hit(key: &str, response: &egui::Response, enabled: bool) {
+        MENU_HITS.with(|hits| {
+            hits.borrow_mut().push(MenuHit {
+                key: key.to_owned(),
+                rect: response.rect,
+                enabled,
+            });
+        });
+    }
+
+    pub(super) fn menu_hit(key: &str) -> Option<(Rect, bool)> {
+        MENU_HITS.with(|hits| {
+            hits.borrow()
+                .iter()
+                .find(|hit| hit.key == key)
+                .map(|hit| (hit.rect, hit.enabled))
+        })
+    }
+
+    pub(super) fn record_viewport(visible: Vec<NodeId>, selected: Vec<NodeId>) {
+        VIEWPORT_HITS.with(|hits| *hits.borrow_mut() = (visible, selected));
+    }
+
+    pub(super) fn viewport_hits() -> (Vec<NodeId>, Vec<NodeId>) {
+        VIEWPORT_HITS.with(|hits| hits.borrow().clone())
+    }
+}
+
+#[cfg(test)]
+fn record_menu_item(key: &str, response: &egui::Response) {
+    ui_test_support::record_menu_hit(key, response, response.enabled());
+}
+
+#[cfg(not(test))]
+fn record_menu_item(_key: &str, _response: &egui::Response) {}
+
+#[cfg(test)]
+fn record_menu_item_state(key: &str, response: &egui::Response, enabled: bool) {
+    ui_test_support::record_menu_hit(key, response, enabled);
+}
+
+#[cfg(not(test))]
+fn record_menu_item_state(_key: &str, _response: &egui::Response, _enabled: bool) {}
+
+fn recorded_button(ui: &mut egui::Ui, key: &str, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    let response = ui.button(text.as_str());
+    record_menu_item(key, &response);
+    response
+}
+
+fn recorded_button_enabled(
+    ui: &mut egui::Ui,
+    key: &str,
+    enabled: bool,
+    text: impl Into<String>,
+) -> egui::Response {
+    let text = text.into();
+    let response = ui.add_enabled(enabled, egui::Button::new(text.as_str()));
+    record_menu_item(key, &response);
+    response
+}
+
+fn recorded_selectable(
+    ui: &mut egui::Ui,
+    key: &str,
+    selected: bool,
+    text: impl Into<String>,
+) -> egui::Response {
+    let text = text.into();
+    let response = ui.selectable_label(selected, text.as_str());
+    record_menu_item(key, &response);
+    response
+}
+
+fn recorded_submenu<R>(
+    ui: &mut egui::Ui,
+    key: &str,
+    text: impl Into<String>,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    let text = text.into();
+    let response = ui.menu_button(text.as_str(), add_contents);
+    record_menu_item(key, &response.response);
+    response
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EditorView {
+    #[default]
     Scene3d,
     Uv,
     Nodes,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InspectorTab {
+    #[default]
     Object,
     Material,
     Render,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrowserTab {
+    #[default]
     Objects,
     Takes,
     Layers,
@@ -90,8 +213,9 @@ fn alt_navigation(modifiers: egui::Modifiers, button: egui::PointerButton) -> Op
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum ShadingMode {
+    #[default]
     Shaded,
     Wireframe,
     ShadedWireframe,
@@ -107,16 +231,42 @@ impl ShadingMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum GizmoMode {
     Off,
+    #[default]
     Translate,
     Rotate,
     Scale,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MeshSelectMode {
+pub(super) enum NodeFlag {
+    Visible,
+    Renderable,
+    Locked,
+}
+
+impl NodeFlag {
+    fn get(self, props: &NodeProps) -> bool {
+        match self {
+            Self::Visible => props.visible,
+            Self::Renderable => props.renderable,
+            Self::Locked => props.locked,
+        }
+    }
+
+    fn set(self, props: &mut NodeProps, value: bool) {
+        match self {
+            Self::Visible => props.visible = value,
+            Self::Renderable => props.renderable = value,
+            Self::Locked => props.locked = value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshSelectMode {
     Points,
     Edges,
     Polygons,
@@ -204,37 +354,11 @@ struct WorkspaceState {
     hierarchy_filter: String,
     view_label: String,
     orbit: OrbitCamera,
+    /// Kept so workspaces written by older builds still restore their object.
+    #[serde(default)]
     selected_name: Option<String>,
-}
-
-impl Default for InspectorTab {
-    fn default() -> Self {
-        Self::Object
-    }
-}
-
-impl Default for BrowserTab {
-    fn default() -> Self {
-        Self::Objects
-    }
-}
-
-impl Default for EditorView {
-    fn default() -> Self {
-        Self::Scene3d
-    }
-}
-
-impl Default for ShadingMode {
-    fn default() -> Self {
-        Self::Shaded
-    }
-}
-
-impl Default for GizmoMode {
-    fn default() -> Self {
-        Self::Translate
-    }
+    #[serde(default)]
+    selected_names: Vec<String>,
 }
 
 impl Default for WorkspaceState {
@@ -253,6 +377,7 @@ impl Default for WorkspaceState {
             view_label: "Viewport".into(),
             orbit: OrbitCamera::default(),
             selected_name: None,
+            selected_names: Vec::new(),
         }
     }
 }
@@ -306,16 +431,27 @@ impl OrbitCamera {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GizmoDrag {
-    node: NodeId,
+    /// Top-level selected nodes and their transforms when the drag began.
+    nodes: Vec<(NodeId, Transform)>,
+    /// Shared world-space pivot used by translate, rotate and scale.
+    pivot: Vec3,
     mode: GizmoMode,
     axis: usize,
     start_pointer: Pos2,
     screen_dir: Vec2,
     screen_len: f32,
     world_dir: Vec3,
-    start_transform: Transform,
+}
+
+/// An in-progress viewport marquee. `base` is restored when the drag is
+/// additive (Shift or Cmd/Ctrl) and the marquee misses every object.
+struct BoxSelect {
+    start: Pos2,
+    current: Pos2,
+    base: Vec<NodeId>,
+    additive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +554,107 @@ fn reconcile_native_scene(path: &Path) {
     }
 }
 
+/// Tolerance used to identify one F-curve key by its track and time.
+const KEY_TIME_EPSILON: f32 = 1e-3;
+
+/// Which kind of channel track a curve key belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CurveTrackId {
+    Scalar(AnimProperty),
+    Rotation,
+}
+
+/// The object, tag or material whose animation the F-curve editor is editing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AnimTarget {
+    Object(NodeId),
+    Tag(NodeId, usize),
+    Material(MaterialId),
+}
+
+/// One row in the registry-driven F-curve editor. Quaternion channels use
+/// `property: None`; every other row addresses one scalar component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CurveRow {
+    pub(super) channel: AnimChannel,
+    pub(super) property: Option<AnimProperty>,
+}
+
+/// A single F-curve key identified by its target, track and time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SelectedKey {
+    target: AnimTarget,
+    track: CurveTrackId,
+    time: f32,
+}
+
+/// In-flight horizontal key drag in the F-curve editor. `originals` is the
+/// whole selection at drag start so multi-key drags preserve spacing.
+#[derive(Clone, Debug)]
+pub(super) struct CurveKeyDrag {
+    key: SelectedKey,
+    original_time: f32,
+    current_time: f32,
+    original_selection: Vec<SelectedKey>,
+}
+
+/// In-flight marquee over the curve canvas.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CurveBoxSelect {
+    pub(super) start: Pos2,
+    pub(super) current: Pos2,
+    pub(super) additive: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CurveKeyValue {
+    Scalar(f32),
+    Rotation(Quat),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CurveClipboardKey {
+    track: CurveTrackId,
+    offset: f32,
+    value: CurveKeyValue,
+    interpolation: Interpolation,
+}
+
+/// A paste's document edit plus the key selections before and after it. This
+/// rides on the same History entry as the clip edit, so undo and redo restore
+/// both the document and the visible F-curve selection.
+struct PasteCurveKeysCmd {
+    inner: Box<dyn Command>,
+    target: AnimTarget,
+    before_selection: Vec<SelectedKey>,
+    after_selection: Vec<SelectedKey>,
+}
+
+impl Command for PasteCurveKeysCmd {
+    fn label(&self) -> String {
+        self.inner.label()
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        self.inner.apply(doc);
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        self.inner.undo(doc);
+    }
+
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
+    }
+}
+
+/// Keys copied from the F-curve editor. Offsets are relative to the earliest
+/// copied key, so paste starts at the playhead and preserves spacing.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CurveClipboard {
+    keys: Vec<CurveClipboardKey>,
+}
+
 pub struct LeopardApp {
     doc: Document,
     history: History,
@@ -429,10 +666,22 @@ pub struct LeopardApp {
     render_info_open: bool,
     view_label: String,
     last_title: String,
-    selected: Option<NodeId>,
+    selection: Selection,
     selected_material: Option<MaterialId>,
     selected_shader_node: Option<u32>,
     selected_uv: Option<usize>,
+    /// Explicit F-curve target. `None` follows the primary object.
+    anim_target: Option<AnimTarget>,
+    /// Selected F-curve keys, on whichever target owns them.
+    selected_keys: Vec<SelectedKey>,
+    curve_key_drag: Option<CurveKeyDrag>,
+    curve_box_select: Option<CurveBoxSelect>,
+    curve_clipboard: CurveClipboard,
+    /// Registry channel selected in the F-curve row list, for keying.
+    selected_curve_channel: Option<(AnimTarget, AnimChannel)>,
+    /// A native clipboard paste was handled and its V-key release still needs
+    /// to be swallowed so the same chord is not pasted twice.
+    native_paste_pending: bool,
     playback: Playback,
     orbit: OrbitCamera,
     shading: ShadingMode,
@@ -459,13 +708,18 @@ pub struct LeopardApp {
     last_status: String,
     collapsed: HashSet<NodeId>,
     started_at: Instant,
-    pending_transform: Option<(NodeId, Transform)>,
+    pending_transform: Option<Vec<(NodeId, Transform)>>,
     pending_shape: Option<(NodeId, Shape)>,
     pending_material: Option<(MaterialId, Material)>,
     gizmo_drag: Option<GizmoDrag>,
+    box_select: Option<BoxSelect>,
     mesh_edit: bool,
     mesh_select_mode: MeshSelectMode,
     mesh_selected: Vec<u32>,
+    /// Component selection for every mesh taking part in a multi-mesh edit.
+    /// `mesh_selected` remains the primary mesh's selection for the viewport
+    /// overlay and the component transform controls.
+    mesh_components: BTreeMap<NodeId, Vec<u32>>,
     mesh_transform: MeshTransformMode,
     mesh_space: MeshTransformSpace,
     mesh_axis: usize,
@@ -475,6 +729,18 @@ pub struct LeopardApp {
     mesh_extrude_individual: bool,
     last_viewport_rect: Rect,
     last_viewport_size: Vec2,
+    /// Actual row rectangles and highlight decisions from the last Object
+    /// Browser frame, so input tests can click the same widgets a user sees.
+    #[cfg(test)]
+    object_row_rects: Vec<(NodeId, Rect)>,
+    #[cfg(test)]
+    object_row_highlights: Vec<(NodeId, bool)>,
+    /// Eye, render and lock hit rectangles for each object-browser row.
+    #[cfg(test)]
+    object_row_icons: Vec<(NodeId, Rect, Rect, Rect)>,
+    /// Visible, renderable and locked flags reflected by each browser row.
+    #[cfg(test)]
+    object_row_flags: Vec<(NodeId, bool, bool, bool)>,
 }
 
 impl LeopardApp {
@@ -485,6 +751,10 @@ impl LeopardApp {
         let mut lifecycle = DocumentLifecycle::new(recovery, AUTOSAVE_INTERVAL);
         let startup = lifecycle.startup(&doc);
         let fps = doc.settings.fps.max(1.0);
+        let mut selection = Selection::default();
+        if let Some(id) = doc.scene.find_by_name("Cube") {
+            selection.select_one(id);
+        }
         let mut app = Self {
             playback: Playback {
                 start: doc.settings.frame_start / fps,
@@ -493,10 +763,17 @@ impl LeopardApp {
                 looping: true,
                 ..Default::default()
             },
-            selected: doc.scene.find_by_name("Cube"),
+            selection,
             selected_material: Some(0),
             selected_shader_node: None,
             selected_uv: None,
+            anim_target: None,
+            selected_keys: Vec::new(),
+            curve_key_drag: None,
+            curve_box_select: None,
+            curve_clipboard: CurveClipboard::default(),
+            selected_curve_channel: None,
+            native_paste_pending: false,
             doc,
             history: History::new(200),
             editor_view: EditorView::Scene3d,
@@ -536,9 +813,11 @@ impl LeopardApp {
             pending_shape: None,
             pending_material: None,
             gizmo_drag: None,
+            box_select: None,
             mesh_edit: false,
             mesh_select_mode: MeshSelectMode::Polygons,
             mesh_selected: Vec::new(),
+            mesh_components: BTreeMap::new(),
             mesh_transform: MeshTransformMode::Move,
             mesh_space: MeshTransformSpace::World,
             mesh_axis: 1,
@@ -548,6 +827,14 @@ impl LeopardApp {
             mesh_extrude_individual: false,
             last_viewport_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
             last_viewport_size: Vec2::splat(100.0),
+            #[cfg(test)]
+            object_row_rects: Vec::new(),
+            #[cfg(test)]
+            object_row_highlights: Vec::new(),
+            #[cfg(test)]
+            object_row_icons: Vec::new(),
+            #[cfg(test)]
+            object_row_flags: Vec::new(),
         };
         if let Some(storage) = cc.storage {
             if let Some(state) = eframe::get_value::<WorkspaceState>(storage, WORKSPACE_STORAGE_KEY)
@@ -588,9 +875,17 @@ impl LeopardApp {
             view_label: self.view_label.clone(),
             orbit: self.orbit,
             selected_name: self
-                .selected
+                .selection
+                .primary()
                 .and_then(|id| self.doc.scene.get(id))
                 .map(|node| node.name.clone()),
+            selected_names: self
+                .selection
+                .ids()
+                .iter()
+                .filter_map(|id| self.doc.scene.get(*id))
+                .map(|node| node.name.clone())
+                .collect(),
         }
     }
 
@@ -628,10 +923,16 @@ impl LeopardApp {
                 fov: orbit.fov.clamp(10.0, 120.0),
             };
         }
-        self.selected = state
-            .selected_name
-            .as_deref()
-            .and_then(|name| self.doc.scene.find_by_name(name));
+        let names: Vec<String> = if state.selected_names.is_empty() {
+            state.selected_name.into_iter().collect()
+        } else {
+            state.selected_names
+        };
+        let ids: Vec<NodeId> = names
+            .iter()
+            .filter_map(|name| self.doc.scene.find_by_name(name))
+            .collect();
+        self.selection.set(ids);
         self.sync_selection_material();
     }
 
@@ -643,20 +944,26 @@ impl LeopardApp {
         self.playback.start = doc.settings.frame_start / self.playback.fps;
         self.playback.end = doc.settings.frame_end / self.playback.fps;
         self.playback.time = self.playback.start;
-        self.selected = doc.scene.find_by_name("Cube").or_else(|| {
+        let initial = doc.scene.find_by_name("Cube").or_else(|| {
             doc.scene
                 .depth_first()
                 .into_iter()
                 .find(|id| doc.scene.get(*id).map(|n| n.is_mesh()).unwrap_or(false))
         });
         self.doc = doc;
+        self.selection.clear();
+        if let Some(id) = initial {
+            self.selection.select_one(id);
+        }
         self.history.clear();
         self.lifecycle.loaded(&self.doc, path);
         self.pending_transform = None;
         self.pending_shape = None;
         self.pending_material = None;
+        self.gizmo_drag = None;
+        self.box_select = None;
         self.mesh_edit = false;
-        self.mesh_selected.clear();
+        self.clear_mesh_component_selection();
         self.collapsed.clear();
         self.hierarchy_filter.clear();
         self.browser_tab = BrowserTab::Objects;
@@ -669,7 +976,7 @@ impl LeopardApp {
     }
 
     fn sync_selection_material(&mut self) {
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selection.primary() {
             if let Some(mat) = self.doc.scene.get(id).and_then(|n| n.effective_material()) {
                 self.selected_material = Some(mat);
             }
@@ -690,17 +997,27 @@ impl LeopardApp {
     }
 
     fn frame_selected(&mut self) {
-        let Some(evaluated) = self
-            .selected
-            .and_then(|id| self.evaluate().node(id).cloned())
-        else {
-            self.orbit.frame(self.scene_bounds());
-            return;
-        };
-        if let Some(mesh) = evaluated.mesh() {
-            self.orbit.frame(mesh.bounds().transformed(evaluated.world));
+        let evaluated = self.evaluate();
+        let mut bounds = lc_core::Aabb::EMPTY;
+        let mut center = Vec3::ZERO;
+        let mut count = 0usize;
+        for id in self.selection.ids() {
+            let Some(node) = evaluated.node(*id) else {
+                continue;
+            };
+            if let Some(mesh) = node.mesh() {
+                bounds = bounds.union(&mesh.bounds().transformed(node.world));
+            } else {
+                center += node.world.w_axis.truncate();
+                count += 1;
+            }
+        }
+        if bounds.is_valid() {
+            self.orbit.frame(bounds);
+        } else if count > 0 {
+            self.orbit.target = center / count as f32;
         } else {
-            self.orbit.target = evaluated.world.w_axis.truncate();
+            self.orbit.frame(self.scene_bounds());
         }
     }
 
@@ -708,9 +1025,9 @@ impl LeopardApp {
         let id = node.id;
         let cmd = AddNodeCmd::new(&self.doc, node, parent);
         self.history.execute(&mut self.doc, Box::new(cmd));
-        self.selected = Some(id);
+        self.selection.select_one(id);
         self.mesh_edit = false;
-        self.mesh_selected.clear();
+        self.clear_mesh_component_selection();
         self.browser_tab = BrowserTab::Objects;
         self.reveal_selected_in_browser = true;
         let cleared_filter = !self.hierarchy_filter.is_empty();
@@ -738,7 +1055,7 @@ impl LeopardApp {
             primitive.label(),
         );
         self.add_node(node, None);
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selection.primary() {
             if let Some(n) = self.doc.scene.get_mut(id) {
                 n.material = Some(0);
             }
@@ -815,48 +1132,353 @@ impl LeopardApp {
     }
 
     fn delete_selected(&mut self) {
-        let Some(id) = self.selected else {
+        let roots = self.selection_roots();
+        if roots.is_empty() {
             return;
-        };
-        let cmd = DeleteNodeCmd::new(&self.doc, id);
-        self.history.execute(&mut self.doc, Box::new(cmd));
-        self.selected = None;
+        }
+        let count = roots.len();
+        let single_name = (count == 1)
+            .then(|| self.doc.scene.get(roots[0]).map(|node| node.name.clone()))
+            .flatten();
+        let before = self.doc.clone();
+        for id in roots {
+            self.doc.scene.remove_subtree(id);
+        }
+        let after = self.doc.clone();
+        self.history.execute(
+            &mut self.doc,
+            Box::new(lc_scene::ReplaceDocumentCmd {
+                label: match single_name {
+                    Some(name) => format!("Delete {name}"),
+                    None => format!("Delete {count} Objects"),
+                },
+                before,
+                after,
+            }),
+        );
+        self.selection.clear();
         self.mesh_edit = false;
-        self.mesh_selected.clear();
-        self.status = "Deleted object".into();
+        self.clear_mesh_component_selection();
+        self.status = if count == 1 {
+            "Deleted object".into()
+        } else {
+            format!("Deleted {count} objects")
+        };
     }
 
     fn duplicate_selected(&mut self) {
-        let Some(id) = self.selected else {
+        let roots = self.selection_roots();
+        if roots.is_empty() {
             return;
-        };
-        let before = self.doc.clone();
-        if let Some(new_id) = self.doc.scene.duplicate_subtree(id) {
-            let after = self.doc.clone();
-            self.history.execute(
-                &mut self.doc,
-                Box::new(lc_scene::ReplaceDocumentCmd {
-                    label: "Duplicate".into(),
-                    before,
-                    after,
-                }),
-            );
-            self.selected = Some(new_id);
-            self.status = "Duplicated subtree".into();
         }
+        let count = roots.len();
+        let before = self.doc.clone();
+        let mut copies = Vec::new();
+        for id in roots {
+            if let Some(new_id) = self.doc.scene.duplicate_subtree(id) {
+                copies.push(new_id);
+            }
+        }
+        if copies.is_empty() {
+            return;
+        }
+        let after = self.doc.clone();
+        self.history.execute(
+            &mut self.doc,
+            Box::new(lc_scene::ReplaceDocumentCmd {
+                label: if count == 1 {
+                    "Duplicate".into()
+                } else {
+                    format!("Duplicate {count} Objects")
+                },
+                before,
+                after,
+            }),
+        );
+        self.selection.set(copies);
+        self.status = if count == 1 {
+            "Duplicated subtree".into()
+        } else {
+            format!("Duplicated {count} objects")
+        };
+    }
+
+    /// Selected nodes without any selected ancestor. Moving a parent already
+    /// moves its children, and deleting or duplicating a parent covers them.
+    fn selection_roots(&self) -> Vec<NodeId> {
+        let selected: HashSet<NodeId> = self.selection.ids().iter().copied().collect();
+        if selected.is_empty() {
+            return Vec::new();
+        }
+        self.doc
+            .scene
+            .depth_first()
+            .into_iter()
+            .filter(|id| selected.contains(id))
+            .filter(|id| {
+                !self
+                    .doc
+                    .scene
+                    .parent_chain(*id)
+                    .iter()
+                    .any(|parent| selected.contains(parent))
+            })
+            .collect()
+    }
+
+    /// Roots that accept a gizmo transform. Locked objects stay selected but
+    /// are not edited by the shared pivot.
+    fn selection_transform_roots(&self) -> Vec<NodeId> {
+        self.selection_roots()
+            .into_iter()
+            .filter(|id| {
+                self.doc
+                    .scene
+                    .get(*id)
+                    .map(|node| !node.locked)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn selection_pivot(&self, evaluated: &EvaluatedScene) -> Option<Vec3> {
+        let roots = self.selection_transform_roots();
+        let mut sum = Vec3::ZERO;
+        let mut count = 0usize;
+        for id in roots {
+            if let Some(node) = evaluated.node(id) {
+                sum += node.world.w_axis.truncate();
+                count += 1;
+            }
+        }
+        (count > 0).then_some(sum / count as f32)
+    }
+
+    pub(super) fn selection_flag_ready(&self, flag: NodeFlag, value: bool) -> bool {
+        self.selection.ids().iter().any(|id| {
+            self.doc
+                .scene
+                .get(*id)
+                .map(|node| flag.get(&NodeProps::of(node)) != value)
+                .unwrap_or(false)
+        })
+    }
+
+    fn set_selection_flag(&mut self, flag: NodeFlag, value: bool) {
+        if !self.selection_flag_ready(flag, value) {
+            self.status = "Selected objects already have that setting".into();
+            return;
+        }
+        let ids: Vec<NodeId> = self.selection.ids().to_vec();
+        self.set_nodes_flag(&ids, flag, value);
+    }
+
+    fn set_nodes_flag(&mut self, ids: &[NodeId], flag: NodeFlag, value: bool) {
+        let mut edits = Vec::new();
+        for id in ids {
+            let Some(node) = self.doc.scene.get(*id) else {
+                continue;
+            };
+            let before = NodeProps::of(node);
+            if flag.get(&before) == value {
+                continue;
+            }
+            let mut after = before.clone();
+            flag.set(&mut after, value);
+            edits.push((*id, before, after));
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let count = edits.len();
+        self.history
+            .execute(&mut self.doc, Box::new(SetNodesPropsCmd { edits }));
+        let label = match flag {
+            NodeFlag::Visible => "visibility",
+            NodeFlag::Renderable => "render flag",
+            NodeFlag::Locked => "lock",
+        };
+        self.status = if count == 1 {
+            format!("Changed {label}")
+        } else {
+            format!("Changed {label} on {count} objects")
+        };
+    }
+
+    /// Group the selected roots under a new Null at their shared pivot while
+    /// preserving every object's world transform.
+    fn group_selection(&mut self) {
+        let roots = self.selection_roots();
+        if roots.is_empty() {
+            return;
+        }
+        let pivot = self.selection_pivot(&self.evaluate()).unwrap_or(Vec3::ZERO);
+        let parents: HashSet<Option<NodeId>> = roots
+            .iter()
+            .map(|id| self.doc.scene.get(*id).and_then(|node| node.parent))
+            .collect();
+        let group_parent = if parents.len() == 1 {
+            parents.into_iter().next().flatten()
+        } else {
+            None
+        };
+        let parent_world = group_parent
+            .map(|parent| self.doc.scene.world_matrix_plain(parent))
+            .unwrap_or(Mat4::IDENTITY);
+        let before = self.doc.clone();
+        let mut group = self.doc.create_node(NodeKind::Null, "Group");
+        let (scale, rotation, translation) = (parent_world.inverse()
+            * Mat4::from_translation(pivot))
+        .to_scale_rotation_translation();
+        group.transform = Transform::new(translation, rotation, scale);
+        let group_id = group.id;
+        if let Err(error) = self.doc.scene.insert_node(group, group_parent, None) {
+            self.doc = before;
+            self.status = format!("Group failed: {error}");
+            return;
+        }
+        let group_inverse = self.doc.scene.world_matrix_plain(group_id).inverse();
+        for id in &roots {
+            let old_world = self.doc.scene.world_matrix_plain(*id);
+            if let Err(error) = self.doc.scene.reparent(*id, Some(group_id), None) {
+                self.doc = before;
+                self.status = format!("Group failed: {error}");
+                return;
+            }
+            let (scale, rotation, translation) =
+                (group_inverse * old_world).to_scale_rotation_translation();
+            if let Some(node) = self.doc.scene.get_mut(*id) {
+                node.transform = Transform::new(translation, rotation, scale);
+            }
+        }
+        let after = self.doc.clone();
+        self.history.execute(
+            &mut self.doc,
+            Box::new(ReplaceDocumentCmd {
+                label: format!("Group {} Objects", roots.len()),
+                before,
+                after,
+            }),
+        );
+        self.selection.select_one(group_id);
+        self.mesh_edit = false;
+        self.clear_mesh_component_selection();
+        self.status = format!("Grouped {} objects", roots.len());
+    }
+
+    /// Reparent selected roots under `new_parent` (or the scene root) while
+    /// preserving their world transforms.
+    fn reparent_selection(&mut self, new_parent: Option<NodeId>) -> bool {
+        let roots = self.selection_roots();
+        if roots.is_empty() {
+            return false;
+        }
+        if let Some(parent) = new_parent {
+            if roots
+                .iter()
+                .any(|id| *id == parent || self.doc.scene.is_ancestor(*id, parent))
+            {
+                self.status = "Cannot parent an object to itself or its descendant".into();
+                return false;
+            }
+        }
+        let before = self.doc.clone();
+        for id in &roots {
+            let old_world = self.doc.scene.world_matrix_plain(*id);
+            if let Err(error) = self.doc.scene.reparent(*id, new_parent, None) {
+                self.doc = before;
+                self.status = format!("Reparent failed: {error}");
+                return false;
+            }
+            let parent_world = new_parent
+                .map(|parent| self.doc.scene.world_matrix_plain(parent))
+                .unwrap_or(Mat4::IDENTITY);
+            let (scale, rotation, translation) =
+                (parent_world.inverse() * old_world).to_scale_rotation_translation();
+            if let Some(node) = self.doc.scene.get_mut(*id) {
+                node.transform = Transform::new(translation, rotation, scale);
+            }
+        }
+        let after = self.doc.clone();
+        self.history.execute(
+            &mut self.doc,
+            Box::new(ReplaceDocumentCmd {
+                label: if roots.len() == 1 {
+                    "Reparent".into()
+                } else {
+                    format!("Reparent {} Objects", roots.len())
+                },
+                before,
+                after,
+            }),
+        );
+        self.status = if roots.len() == 1 {
+            "Reparented object".into()
+        } else {
+            format!("Reparented {} objects", roots.len())
+        };
+        true
     }
 
     fn undo(&mut self) {
         if let Some(label) = self.history.undo(&mut self.doc) {
+            let restored = self
+                .history
+                .redo_top()
+                .and_then(|command| command.as_any())
+                .and_then(|state| state.downcast_ref::<PasteCurveKeysCmd>())
+                .map(|paste| (paste.target, paste.before_selection.clone()));
+            if let Some((target, selection)) = restored {
+                self.restore_paste_state(target, selection);
+            }
             self.status = format!("Undo: {label}");
+            self.selection.retain_existing(&self.doc.scene);
             self.invalidate_pending();
         }
     }
 
     fn redo(&mut self) {
         if let Some(label) = self.history.redo(&mut self.doc) {
+            let restored = self
+                .history
+                .undo_top()
+                .and_then(|command| command.as_any())
+                .and_then(|state| state.downcast_ref::<PasteCurveKeysCmd>())
+                .map(|paste| (paste.target, paste.after_selection.clone()));
+            if let Some((target, selection)) = restored {
+                self.restore_paste_state(target, selection);
+            }
             self.status = format!("Redo: {label}");
+            self.selection.retain_existing(&self.doc.scene);
             self.invalidate_pending();
+        }
+    }
+
+    /// Restore the F-curve target and its key selection for a paste command.
+    /// A target that has disappeared since the paste is skipped; the document
+    /// edit and any selection whose target still exists remain safe.
+    fn restore_paste_state(&mut self, target: AnimTarget, selection: Vec<SelectedKey>) {
+        if self.set_anim_target(target) {
+            match target {
+                AnimTarget::Object(id) => {
+                    self.selection.select_one(id);
+                    self.sync_selection_material();
+                }
+                AnimTarget::Tag(node, _) => {
+                    self.selection.select_one(node);
+                    self.sync_selection_material();
+                }
+                AnimTarget::Material(_) => {}
+            }
+            self.selected_keys = selection;
+        } else {
+            let valid: Vec<SelectedKey> = selection
+                .into_iter()
+                .filter(|key| self.target_is_valid(key.target))
+                .collect();
+            if !valid.is_empty() {
+                self.selected_keys = valid;
+            }
         }
     }
 
@@ -907,7 +1529,7 @@ impl LeopardApp {
                         after,
                     }),
                 );
-                self.selected = self.doc.scene.roots.first().copied();
+                self.selection.set(self.doc.scene.roots.first().copied());
                 self.playback.start = self.doc.settings.frame_start;
                 self.playback.end = self.doc.settings.frame_end;
                 self.playback.fps = self.doc.settings.fps;
@@ -940,10 +1562,11 @@ impl LeopardApp {
     fn apply_file_dialog(&mut self, ctx: &egui::Context, mode: FileMode, text: String) {
         match mode {
             FileMode::SaveAs => match self.lifecycle.save_as_path(&text) {
-                Ok(path) => match self.save_file(path) {
-                    Ok(Some(action)) => self.execute_action(ctx, action),
-                    Ok(None) | Err(()) => {}
-                },
+                Ok(path) => {
+                    if let Ok(Some(action)) = self.save_file(path) {
+                        self.execute_action(ctx, action);
+                    }
+                }
                 Err(message) => self.status = message,
             },
             FileMode::Open => {
@@ -989,9 +1612,8 @@ impl LeopardApp {
                 .path()
                 .expect("a native document has a path")
                 .to_path_buf();
-            match self.save_file(path) {
-                Ok(Some(action)) => self.execute_action(ctx, action),
-                Ok(None) | Err(()) => {}
+            if let Ok(Some(action)) = self.save_file(path) {
+                self.execute_action(ctx, action);
             }
         }
     }
@@ -1113,7 +1735,7 @@ impl LeopardApp {
             .as_ref()
             .map(|active| active.rx.try_recv());
         match polled {
-            None => return,
+            None => {}
             Some(Ok(RenderMessage::Progress { done, total })) => {
                 if let Some(active) = self.active_render.as_mut() {
                     active.done = done;
@@ -1222,7 +1844,7 @@ impl LeopardApp {
                 let rgba = tracer
                     .rgba8(settings.exposure, settings.transparent_background)
                     .into_iter()
-                    .flat_map(|p| p)
+                    .flatten()
                     .collect();
                 Ok(RenderResult {
                     width: settings.width,
@@ -1312,14 +1934,17 @@ impl LeopardApp {
     }
 
     fn commit_pending(&mut self) {
-        if let Some((id, before)) = self.pending_transform.take() {
-            if let Some(after) = self.doc.scene.get(id).map(|n| n.transform) {
-                if after != before {
-                    self.history.execute(
-                        &mut self.doc,
-                        Box::new(SetTransformCmd { id, before, after }),
-                    );
-                }
+        if let Some(before) = self.pending_transform.take() {
+            let edits: Vec<(NodeId, Transform, Transform)> = before
+                .into_iter()
+                .filter_map(|(id, before)| {
+                    let after = self.doc.scene.get(id)?.transform;
+                    (after != before).then_some((id, before, after))
+                })
+                .collect();
+            if !edits.is_empty() {
+                self.history
+                    .execute(&mut self.doc, Box::new(SetTransformsCmd { edits }));
             }
         }
         if let Some((id, before)) = self.pending_shape.take() {
@@ -1342,6 +1967,175 @@ impl LeopardApp {
                 }
             }
         }
+    }
+
+    /// Whether the inspector's modifier stack can meaningfully add this
+    /// modifier to the primary object. The handler that pushes it calls the
+    /// same predicate.
+    fn modifier_ready(&self, modifier: &Modifier) -> bool {
+        let Some(node) = self
+            .selection
+            .primary()
+            .and_then(|id| self.doc.scene.get(id))
+        else {
+            return false;
+        };
+        if !modifier_applies_to(node, modifier) {
+            return false;
+        }
+        if let Modifier::Boolean { operand, .. } = modifier {
+            return *operand != node.id
+                && self
+                    .doc
+                    .scene
+                    .get(*operand)
+                    .map(|operand| operand.is_mesh())
+                    .unwrap_or(false);
+        }
+        true
+    }
+
+    fn add_modifier_to_primary(&mut self, modifier: Modifier) -> bool {
+        let Some(id) = self.selection.primary() else {
+            self.status = "Select an object before adding a modifier".into();
+            return false;
+        };
+        if !self.modifier_ready(&modifier) {
+            self.status = format!("{} needs a compatible object", modifier.label());
+            return false;
+        }
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        let before = Shape::of(node);
+        let mut after = before.clone();
+        let label = modifier.label();
+        after.modifiers.push(modifier);
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
+        self.status = format!("Added {label}");
+        true
+    }
+
+    fn modifier_remove_ready(&self, index: usize) -> bool {
+        self.selection
+            .primary()
+            .and_then(|id| self.doc.scene.get(id))
+            .map(|node| index < node.modifiers.len())
+            .unwrap_or(false)
+    }
+
+    fn remove_modifier_from_primary(&mut self, index: usize) -> bool {
+        let Some(id) = self.selection.primary() else {
+            return false;
+        };
+        if !self.modifier_remove_ready(index) {
+            self.status = "That modifier no longer exists".into();
+            return false;
+        }
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        let before = Shape::of(node);
+        let mut after = before.clone();
+        let label = after.modifiers.remove(index).label();
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
+        self.status = format!("Removed {label}");
+        true
+    }
+
+    /// The skin this object would receive from binding every mesh vertex to the
+    /// first joint. `None` when there is no mesh, no joint or no vertex.
+    fn skin_target(&self) -> Option<SkinTarget> {
+        let id = self.selection.primary()?;
+        let node = self.doc.scene.get(id)?;
+        if !node.is_mesh() {
+            return None;
+        }
+        let evaluated = self.evaluate();
+        let vertex_count = evaluated
+            .node(id)
+            .and_then(|node| node.mesh())
+            .map(|mesh| mesh.positions.len())
+            .unwrap_or(0);
+        let joints: Vec<(NodeId, Mat4)> = self
+            .doc
+            .scene
+            .depth_first()
+            .into_iter()
+            .filter_map(|joint_id| {
+                if !matches!(
+                    self.doc.scene.get(joint_id).map(|node| &node.kind),
+                    Some(NodeKind::Joint { .. })
+                ) {
+                    return None;
+                }
+                let world = evaluated.node(joint_id)?.world;
+                Some((joint_id, world))
+            })
+            .collect();
+        let skin = (vertex_count > 0 && !joints.is_empty()).then(|| {
+            let mut skin = Skin::new(
+                joints.iter().map(|(joint_id, _)| *joint_id).collect(),
+                joints.iter().map(|(_, world)| world.inverse()).collect(),
+            );
+            skin.bind_all_to_first(vertex_count);
+            skin
+        });
+        Some(SkinTarget {
+            vertex_count,
+            joint_count: joints.len(),
+            skin,
+        })
+    }
+
+    fn bind_skin_to_all_joints(&mut self) -> bool {
+        let Some(id) = self.selection.primary() else {
+            return false;
+        };
+        let Some(target) = self.skin_target() else {
+            self.status = "Select a mesh to bind".into();
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        let Some(skin) = skin_binding_candidate(node, &target) else {
+            self.status = if target.skin.is_some() {
+                "Skin is already bound to the current joints".into()
+            } else {
+                "Add a Joint object and a non-empty mesh first".into()
+            };
+            return false;
+        };
+        let before = Shape::of(node);
+        let mut after = before.clone();
+        after.skin = Some(skin.clone());
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
+        self.status = "Bound skin to all joints".into();
+        true
+    }
+
+    fn unbind_skin_from_primary(&mut self) -> bool {
+        let Some(id) = self.selection.primary() else {
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        if !skin_unbind_ready(node) {
+            self.status = "This object has no skin to unbind".into();
+            return false;
+        }
+        let before = Shape::of(node);
+        let mut after = before.clone();
+        after.skin = None;
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
+        self.status = "Unbound skin".into();
+        true
     }
 
     fn apply_node_edits(&mut self, id: NodeId, original: &Node, edited: &Node) {
@@ -1381,8 +2175,9 @@ impl LeopardApp {
             }
         }
         if edited.transform != original.transform {
-            if self.pending_transform.is_none() {
-                self.pending_transform = Some((id, current.transform));
+            let pending = self.pending_transform.get_or_insert_with(Vec::new);
+            if !pending.iter().any(|(pending_id, _)| *pending_id == id) {
+                pending.push((id, current.transform));
             }
             if let Some(node) = self.doc.scene.get_mut(id) {
                 node.transform = edited.transform;
@@ -1391,28 +2186,243 @@ impl LeopardApp {
         self.sync_selection_material();
     }
 
-    fn set_shape_now(&mut self, id: NodeId, kind: NodeKind) {
-        let Some(node) = self.doc.scene.get(id) else {
-            return;
-        };
-        let before = Shape::of(node);
-        let mut after = before.clone();
-        after.kind = kind;
-        if before.kind != after.kind {
-            self.history
-                .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
-        }
-    }
-
     pub(super) fn selected_is_mesh(&self) -> bool {
-        self.selected
+        self.selection
+            .primary()
             .and_then(|id| self.doc.scene.get(id))
             .map(|node| node.is_mesh())
             .unwrap_or(false)
     }
 
+    /// Component mode needs a mesh-only object selection: every selected
+    /// object must be a mesh, and primitives are eligible because entering
+    /// component mode can convert them in one batch.
+    pub(super) fn mesh_mode_ready(&self) -> bool {
+        !self.selection.is_empty()
+            && self.selection.ids().iter().all(|id| {
+                self.doc
+                    .scene
+                    .get(*id)
+                    .map(|node| node.is_mesh())
+                    .unwrap_or(false)
+            })
+    }
+
+    fn selected_meshes_editable(&self) -> bool {
+        !self.selection.is_empty()
+            && self.selection.ids().iter().all(|id| {
+                matches!(
+                    self.doc.scene.get(*id).map(|node| &node.kind),
+                    Some(NodeKind::Mesh {
+                        geometry: GeometrySource::Editable { .. }
+                    })
+                )
+            })
+    }
+
+    pub(super) fn mesh_component_selection_ready(&self) -> bool {
+        self.mesh_edit && self.selected_meshes_editable()
+    }
+
+    /// True when every selected mesh is editable, in the required component
+    /// mode, and has at least `minimum` selected components. This is the single
+    /// acceptance rule for every component tool: menu enablement and the
+    /// handlers both go through it.
+    pub(super) fn mesh_topology_ready(&self, mode: MeshSelectMode, minimum: usize) -> bool {
+        self.mesh_component_selection_ready()
+            && self.mesh_select_mode == mode
+            && self
+                .selection
+                .ids()
+                .iter()
+                .all(|id| self.mesh_components_for(*id).len() >= minimum)
+    }
+
+    fn editable_mesh(&self, id: NodeId) -> Option<&Mesh> {
+        match self.doc.scene.get(id).map(|node| &node.kind) {
+            Some(NodeKind::Mesh {
+                geometry: GeometrySource::Editable { mesh, .. },
+            }) => Some(mesh),
+            _ => None,
+        }
+    }
+
+    /// Weld needs two distinct, in-range points on every selected mesh.
+    pub(super) fn mesh_weld_ready(&self) -> bool {
+        self.mesh_component_selection_ready()
+            && self.mesh_select_mode == MeshSelectMode::Points
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        selected_valid_points(mesh, self.mesh_components_for(*id)).len() >= 2
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Ring Cut is a through-plane cut: it must cross geometry on every
+    /// selected mesh, otherwise the handler would report "no change".
+    pub(super) fn mesh_ring_cut_ready(&self) -> bool {
+        self.mesh_component_selection_ready()
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| ring_cut_would_split(mesh, self.mesh_axis, self.mesh_offset))
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Component transforms need at least one affected point that the current
+    /// mode, axis and value would actually move on every selected mesh.
+    pub(super) fn mesh_transform_ready(&self) -> bool {
+        self.mesh_component_selection_ready()
+            && self.selection.ids().iter().all(|id| {
+                let Some(mesh) = self.editable_mesh(*id) else {
+                    return false;
+                };
+                let affected: HashSet<u32> = mesh_affected_points(
+                    mesh,
+                    self.mesh_select_mode,
+                    self.mesh_components_for(*id),
+                )
+                .into_iter()
+                .collect();
+                if affected.is_empty() {
+                    return false;
+                }
+                let rotation = self
+                    .doc
+                    .scene
+                    .world_matrix_plain(*id)
+                    .to_scale_rotation_translation()
+                    .1;
+                let local_axis =
+                    mesh_transform_axis(mesh, &affected, self.mesh_space, self.mesh_axis, rotation);
+                mesh_transform_would_change(
+                    mesh,
+                    &affected,
+                    self.mesh_transform,
+                    local_axis,
+                    self.mesh_value,
+                )
+            })
+    }
+
+    /// Material assignment needs a material and selected polygons on every
+    /// selected mesh so one undo cannot leave part of the selection untouched.
+    pub(super) fn mesh_assign_material_ready(&self) -> bool {
+        self.mesh_component_selection_ready()
+            && self.mesh_select_mode == MeshSelectMode::Polygons
+            && self.selected_material_id().is_some()
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        self.mesh_components_for(*id)
+                            .iter()
+                            .any(|index| mesh.polygons.get(*index as usize).is_some())
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    fn selected_material_id(&self) -> Option<MaterialId> {
+        self.selected_material
+            .filter(|id| self.doc.materials.get(*id).is_some())
+    }
+
+    /// Bridge Loops needs every selected mesh to carry exactly two clean
+    /// closed edge loops of equal length. This one check backs both the menu
+    /// button and the handler.
+    pub(super) fn mesh_bridge_ready(&self) -> bool {
+        self.mesh_bridge_failure().is_none()
+    }
+
+    fn mesh_bridge_failure(&self) -> Option<String> {
+        if !self.mesh_topology_ready(MeshSelectMode::Edges, 1) {
+            return Some(self.mesh_tool_refusal(MeshSelectMode::Edges, 1, "bridge"));
+        }
+        for id in self.selection.ids() {
+            if let Err(error) = self.check_bridge_loops(*id) {
+                let target = if self.selection.len() == 1 {
+                    String::new()
+                } else {
+                    let name = self
+                        .doc
+                        .scene
+                        .get(*id)
+                        .map(|node| node.name.clone())
+                        .unwrap_or_default();
+                    format!(" on \"{name}\"")
+                };
+                return Some(format!(
+                    "Bridge Loops needs exactly two closed edge loops of equal length{target}: {error}"
+                ));
+            }
+        }
+        None
+    }
+
+    fn check_bridge_loops(&self, id: NodeId) -> Result<(), String> {
+        let mesh = self.editable_mesh(id).ok_or("not an editable mesh")?;
+        selected_bridge_loops(mesh, self.mesh_components_for(id)).map(|_| ())
+    }
+
+    fn mesh_components_for(&self, id: NodeId) -> &[u32] {
+        self.mesh_components
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn clear_mesh_component_selection(&mut self) {
+        self.mesh_selected.clear();
+        self.mesh_components.clear();
+    }
+
+    /// Direct UV editing manipulates the primary mesh only and needs at least
+    /// one UV point to pick and drag.
+    pub(super) fn uv_point_edit_ready(&self) -> bool {
+        self.selected_editable_mesh()
+            .map(|(_, mesh)| !mesh.uvs.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn set_uv_point(&mut self, id: NodeId, index: usize, uv: V2) -> bool {
+        let Some((primary, _)) = self.selected_editable_mesh() else {
+            self.status = "UV editing requires an editable mesh".into();
+            return false;
+        };
+        if !self.uv_point_edit_ready() || primary != id {
+            self.status = "Select the editable mesh that owns the UV point".into();
+            return false;
+        }
+        let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
+            return false;
+        };
+        let Some(node) = self.doc.scene.get_mut(id) else {
+            return false;
+        };
+        let NodeKind::Mesh { geometry } = &mut node.kind else {
+            return false;
+        };
+        let GeometrySource::Editable { mesh, .. } = geometry else {
+            return false;
+        };
+        let Some(point) = mesh.uvs.get_mut(index) else {
+            self.status = "That UV point no longer exists".into();
+            return false;
+        };
+        if *point != uv {
+            *point = uv;
+            if self.pending_shape.is_none() {
+                self.pending_shape = Some((id, before));
+            }
+        }
+        self.selected_uv = Some(index);
+        true
+    }
+
     fn selected_editable_mesh(&self) -> Option<(NodeId, Mesh)> {
-        let id = self.selected?;
+        let id = self.selection.primary()?;
         let node = self.doc.scene.get(id)?;
         match &node.kind {
             NodeKind::Mesh {
@@ -1422,292 +2432,487 @@ impl LeopardApp {
         }
     }
 
-    fn make_selected_editable(&mut self) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        let Some(node) = self.doc.scene.get(id) else {
-            return;
-        };
-        let mut kind = node.kind.clone();
-        if let NodeKind::Mesh { geometry } = &mut kind {
-            if geometry.make_editable() {
-                self.set_shape_now(id, kind);
-                self.status = "Converted primitive to editable mesh".into();
+    pub(super) fn selection_has_mesh(&self) -> bool {
+        self.selection.ids().iter().any(|id| {
+            self.doc
+                .scene
+                .get(*id)
+                .map(|node| node.is_mesh())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Any selected mesh that still needs converting to an editable mesh.
+    pub(super) fn selection_convert_ready(&self) -> bool {
+        self.selection.ids().iter().any(|id| {
+            matches!(
+                self.doc.scene.get(*id).map(|node| &node.kind),
+                Some(NodeKind::Mesh { geometry }) if !matches!(geometry, GeometrySource::Editable { .. })
+            )
+        })
+    }
+
+    fn boolean_operand(&self) -> Option<NodeId> {
+        let selected: HashSet<NodeId> = self.selection.ids().iter().copied().collect();
+        self.doc.scene.depth_first().into_iter().find(|id| {
+            !selected.contains(id)
+                && self
+                    .doc
+                    .scene
+                    .get(*id)
+                    .map(|node| node.is_mesh())
+                    .unwrap_or(false)
+        })
+    }
+
+    pub(super) fn boolean_ready(&self) -> bool {
+        self.selection_has_mesh() && self.boolean_operand().is_some()
+    }
+
+    /// UV projection can only touch editable meshes. Require every selected
+    /// mesh to be editable so a multi-selection action never silently skips a
+    /// selected primitive; non-mesh objects are ignored.
+    pub(super) fn selection_uv_ready(&self) -> bool {
+        let mut has_mesh = false;
+        for id in self.selection.ids() {
+            let Some(node) = self.doc.scene.get(*id) else {
+                continue;
+            };
+            if !node.is_mesh() {
+                continue;
+            }
+            has_mesh = true;
+            if !matches!(
+                node.kind,
+                NodeKind::Mesh {
+                    geometry: GeometrySource::Editable { .. }
+                }
+            ) {
+                return false;
             }
         }
+        has_mesh
+    }
+
+    fn make_selected_editable(&mut self) {
+        if !self.selection_convert_ready() {
+            self.status = if self.selection_has_mesh() {
+                "Selected meshes are already editable".into()
+            } else {
+                "Select a mesh object first".into()
+            };
+            return;
+        }
+        let mut edits = Vec::new();
+        for id in self.selection.ids() {
+            let Some(node) = self.doc.scene.get(*id) else {
+                continue;
+            };
+            let before = Shape::of(node);
+            let mut after = before.clone();
+            if let NodeKind::Mesh { geometry } = &mut after.kind {
+                geometry.make_editable();
+            }
+            if before.kind != after.kind {
+                edits.push((*id, before, after));
+            }
+        }
+        let count = edits.len();
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapesCmd { edits }));
+        self.status = if count == 1 {
+            "Converted primitive to editable mesh".into()
+        } else {
+            format!("Converted {count} primitives to editable meshes")
+        };
     }
 
     fn apply_uv_op(&mut self, op: UvOp) {
-        let Some((id, mut mesh)) = self.selected_editable_mesh() else {
+        if !self.selection_uv_ready() {
+            self.status = if self.selection_has_mesh() {
+                "Convert all selected meshes to editable first".into()
+            } else {
+                "Select an editable mesh first".into()
+            };
+            return;
+        }
+        let mut edits = Vec::new();
+        for id in self.selection.ids() {
+            let Some(node) = self.doc.scene.get(*id) else {
+                continue;
+            };
+            let before = Shape::of(node);
+            let NodeKind::Mesh { geometry } = &before.kind else {
+                continue;
+            };
+            let GeometrySource::Editable { mesh, .. } = geometry else {
+                continue;
+            };
+            let mut mesh = mesh.clone();
+            match op {
+                UvOp::Planar => lc_geom::planar_projection(&mut mesh, 1, 1.0),
+                UvOp::Box => lc_geom::box_projection(&mut mesh, 1.0),
+                UvOp::Cylindrical => lc_geom::cylindrical_projection(&mut mesh, 1.0, 1.0),
+                UvOp::Spherical => lc_geom::spherical_projection(&mut mesh, 1.0),
+                UvOp::Unwrap => lc_geom::automatic_unwrap(&mut mesh, 45.0, 0.01),
+                UvOp::Relax => lc_geom::relax_uvs(&mut mesh, 8, 0.5, true),
+                UvOp::Normalize => lc_geom::normalize_uvs(&mut mesh),
+            }
+            let mut after = before.clone();
+            after.kind = NodeKind::Mesh {
+                geometry: geometry.with_mesh(mesh),
+            };
+            edits.push((*id, before, after));
+        }
+        if edits.is_empty() {
             self.status = "Select an editable mesh first".into();
             return;
+        }
+        let count = edits.len();
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapesCmd { edits }));
+        self.status = if count == 1 {
+            "Updated UVs".into()
+        } else {
+            format!("Updated UVs on {count} objects")
         };
-        let before = self.doc.scene.get(id).map(Shape::of);
-        match op {
-            UvOp::Planar => lc_geom::planar_projection(&mut mesh, 1, 1.0),
-            UvOp::Box => lc_geom::box_projection(&mut mesh, 1.0),
-            UvOp::Cylindrical => lc_geom::cylindrical_projection(&mut mesh, 1.0, 1.0),
-            UvOp::Spherical => lc_geom::spherical_projection(&mut mesh, 1.0),
-            UvOp::Unwrap => lc_geom::automatic_unwrap(&mut mesh, 45.0, 0.01),
-            UvOp::Relax => lc_geom::relax_uvs(&mut mesh, 8, 0.5, true),
-            UvOp::Normalize => lc_geom::normalize_uvs(&mut mesh),
-        }
-        if let Some(before) = before {
-            let mut after = before.clone();
-            after.kind = match after.kind {
-                NodeKind::Mesh { geometry } => NodeKind::Mesh {
-                    geometry: geometry.with_mesh(mesh),
-                },
-                other => other,
-            };
-            self.history
-                .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
-            self.status = "Updated UVs".into();
-        }
     }
 
     fn perform_mesh_action(&mut self, action: MeshAction) {
         match action {
             MeshAction::Enter => {
-                if self.selected_editable_mesh().is_none() {
+                if !self.mesh_mode_ready() {
+                    self.status = if self.selection.is_empty() {
+                        "Select a mesh object to edit components".into()
+                    } else {
+                        "Component editing needs a mesh-only selection".into()
+                    };
+                    return;
+                }
+                if !self.selected_meshes_editable() {
                     self.make_selected_editable();
                 }
-                if self.selected_editable_mesh().is_some() {
+                if self.selected_meshes_editable() {
                     self.mesh_edit = true;
-                    self.mesh_selected.clear();
+                    self.clear_mesh_component_selection();
                     self.status = "Mesh edit mode — click components in the viewport".into();
-                } else if self.selected.is_some() {
+                } else if !self.selection.is_empty() {
                     self.status = "Select a mesh object first".into();
                 }
             }
             MeshAction::Exit => {
                 self.mesh_edit = false;
-                self.mesh_selected.clear();
+                self.clear_mesh_component_selection();
                 self.status = "Object mode".into();
             }
             MeshAction::SelectAll => {
-                if let Some((_, mesh)) = self.selected_editable_mesh() {
-                    self.mesh_selected = match self.mesh_select_mode {
+                if !self.mesh_component_selection_ready() {
+                    self.status = "Enter component mode with editable meshes first".into();
+                    return;
+                }
+                let ids = self.selection.ids().to_vec();
+                let mut primary = None;
+                for id in ids {
+                    let Some(node) = self.doc.scene.get(id) else {
+                        continue;
+                    };
+                    let NodeKind::Mesh {
+                        geometry: GeometrySource::Editable { mesh, .. },
+                    } = &node.kind
+                    else {
+                        continue;
+                    };
+                    let components: Vec<u32> = match self.mesh_select_mode {
                         MeshSelectMode::Points => (0..mesh.positions.len() as u32).collect(),
                         MeshSelectMode::Edges => (0..mesh.edges().len() as u32).collect(),
                         MeshSelectMode::Polygons => (0..mesh.polygons.len() as u32).collect(),
                     };
+                    if self.selection.primary() == Some(id) {
+                        primary = Some(components.clone());
+                    }
+                    self.mesh_components.insert(id, components);
                 }
+                self.mesh_selected = primary.unwrap_or_default();
             }
-            MeshAction::SelectNone => self.mesh_selected.clear(),
-            MeshAction::Transform => self.mesh_transform_selection(),
-            MeshAction::Extrude => {
-                if !self.require_mesh_selection(MeshSelectMode::Polygons, "extrude") {
+            MeshAction::SelectNone => {
+                if !self.mesh_component_selection_ready() {
+                    self.status = "Enter component mode with editable meshes first".into();
                     return;
                 }
-                let faces = self.mesh_selected.clone();
+                self.clear_mesh_component_selection();
+            }
+            MeshAction::Transform => self.mesh_transform_selection(),
+            MeshAction::Extrude => {
+                if !self.require_mesh_selection(MeshSelectMode::Polygons, 1, "extrude") {
+                    return;
+                }
                 let distance = self.mesh_value;
                 let individual = self.mesh_extrude_individual;
-                self.apply_mesh_operation("Extruded faces", move |mesh| {
-                    Ok(lc_geom::extrude_faces(mesh, &faces, distance, individual))
+                self.apply_mesh_operation("Extruded faces", move |_, mesh, faces| {
+                    Ok(lc_geom::extrude_faces(mesh, faces, distance, individual))
                 });
             }
             MeshAction::Inset => {
-                if !self.require_mesh_selection(MeshSelectMode::Polygons, "inset") {
+                if !self.require_mesh_selection(MeshSelectMode::Polygons, 1, "inset") {
                     return;
                 }
-                let faces = self.mesh_selected.clone();
                 let amount = self.mesh_value.abs().max(1e-4);
-                self.apply_mesh_operation("Inset faces", move |mesh| {
-                    Ok(lc_geom::bevel_faces(mesh, &faces, amount, 0.0))
+                self.apply_mesh_operation("Inset faces", move |_, mesh, faces| {
+                    Ok(lc_geom::bevel_faces(mesh, faces, amount, 0.0))
                 });
             }
             MeshAction::Bevel => {
-                if !self.require_mesh_selection(MeshSelectMode::Polygons, "bevel") {
+                if !self.require_mesh_selection(MeshSelectMode::Polygons, 1, "bevel") {
                     return;
                 }
-                let faces = self.mesh_selected.clone();
                 let amount = self.mesh_value.abs().max(1e-4);
                 let depth = self.mesh_depth;
-                self.apply_mesh_operation("Bevelled faces", move |mesh| {
-                    Ok(lc_geom::bevel_faces(mesh, &faces, amount, depth))
+                self.apply_mesh_operation("Bevelled faces", move |_, mesh, faces| {
+                    Ok(lc_geom::bevel_faces(mesh, faces, amount, depth))
                 });
             }
             MeshAction::RingCut => {
+                if !self.mesh_ring_cut_ready() {
+                    self.status = if self.mesh_component_selection_ready() {
+                        "Ring cut needs the cut plane to cross every selected mesh".into()
+                    } else {
+                        "Enter component mode with editable meshes first".into()
+                    };
+                    return;
+                }
                 let axis = self.mesh_axis;
                 let offset = self.mesh_offset;
-                self.apply_mesh_operation("Ring cut", move |mesh| {
+                self.apply_mesh_operation("Ring cut", move |_, mesh, _| {
                     Ok(lc_geom::ring_cut(mesh, axis, offset))
                 });
             }
             MeshAction::Weld => {
-                if !self.require_mesh_selection(MeshSelectMode::Points, "weld") {
+                if !self.mesh_weld_ready() {
+                    self.status = if !self.mesh_topology_ready(MeshSelectMode::Points, 2) {
+                        self.mesh_tool_refusal(MeshSelectMode::Points, 2, "weld")
+                    } else if self.selection.len() == 1 {
+                        "Select at least two distinct points to weld".into()
+                    } else {
+                        "Select at least two distinct points on every selected mesh to weld".into()
+                    };
                     return;
                 }
-                let points = self.mesh_selected.clone();
-                self.apply_mesh_operation("Welded points", move |mesh| {
-                    let welded = weld_selected_points(mesh, &points);
-                    if welded == *mesh {
-                        return Err("select at least two distinct points to weld".into());
-                    }
-                    Ok(welded)
+                self.apply_mesh_operation("Welded points", |_, mesh, points| {
+                    Ok(weld_selected_points(mesh, points))
                 });
             }
             MeshAction::Bridge => {
-                if !self.require_mesh_selection(MeshSelectMode::Edges, "bridge") {
+                if let Some(status) = self.mesh_bridge_failure() {
+                    self.status = status;
                     return;
                 }
-                let edges = self.mesh_selected.clone();
-                self.apply_mesh_operation("Bridged edge loops", move |mesh| {
-                    let loops = selected_edge_loops(mesh, &edges)?;
-                    if loops.len() != 2 {
-                        return Err(format!(
-                            "select two closed edge loops (found {})",
-                            loops.len()
-                        ));
-                    }
-                    lc_geom::bridge_loops(mesh, &loops[0], &loops[1])
+                self.apply_mesh_operation("Bridged edge loops", |_, mesh, edges| {
+                    let (loop_a, loop_b) = selected_bridge_loops(mesh, edges)?;
+                    lc_geom::bridge_loops(mesh, &loop_a, &loop_b)
                 });
             }
             MeshAction::AssignMaterial => self.assign_material_to_selected_faces(),
         }
     }
 
-    fn require_mesh_selection(&mut self, mode: MeshSelectMode, action: &str) -> bool {
-        if self.selected_editable_mesh().is_none() {
-            self.status = "Select an editable mesh first".into();
-            return false;
+    fn require_mesh_selection(
+        &mut self,
+        mode: MeshSelectMode,
+        minimum: usize,
+        action: &str,
+    ) -> bool {
+        if self.mesh_topology_ready(mode, minimum) {
+            return true;
+        }
+        self.status = self.mesh_tool_refusal(mode, minimum, action);
+        false
+    }
+
+    /// Explains why the shared component-tool rule rejected the selection.
+    fn mesh_tool_refusal(&self, mode: MeshSelectMode, minimum: usize, action: &str) -> String {
+        if !self.selected_meshes_editable() {
+            return if self.selection.is_empty() {
+                "Select an editable mesh first".into()
+            } else {
+                "Select only editable mesh objects first".into()
+            };
+        }
+        if !self.mesh_edit {
+            return "Enter component mode first".into();
         }
         if self.mesh_select_mode != mode {
-            self.status = format!("Switch to {} selection to {action}", mode.label());
-            return false;
+            return format!("Switch to {} selection to {action}", mode.label());
         }
-        if self.mesh_selected.is_empty() {
-            self.status = format!("Select {} first", mode.label().to_lowercase());
-            return false;
+        let label = mode.label().to_lowercase();
+        if minimum <= 1 {
+            if self.selection.len() == 1 {
+                format!("Select {label} first")
+            } else {
+                format!("Select {label} on every selected mesh first")
+            }
+        } else if self.selection.len() == 1 {
+            format!("Select at least {minimum} {label} to {action}")
+        } else {
+            format!("Select at least {minimum} {label} on every selected mesh to {action}")
         }
-        true
     }
 
     fn apply_mesh_operation(
         &mut self,
         message: &str,
-        operation: impl FnOnce(&Mesh) -> Result<Mesh, String>,
+        operation: impl Fn(NodeId, &Mesh, &[u32]) -> Result<Mesh, String>,
     ) {
-        let Some((id, mesh)) = self.selected_editable_mesh() else {
-            self.status = "Select an editable mesh first".into();
-            return;
-        };
-        let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
-            return;
-        };
-        match operation(&mesh) {
-            Ok(updated) if updated == mesh => {
-                self.status = format!("{message}: no change");
-            }
-            Ok(updated) => {
-                self.commit_mesh_edit(id, before, updated, true, message.to_string());
-            }
-            Err(error) => self.status = format!("{message} failed: {error}"),
-        }
+        self.apply_mesh_operation_selection(message, true, operation);
     }
 
-    fn commit_mesh_edit(
+    fn apply_mesh_operation_selection(
         &mut self,
-        id: NodeId,
-        before: Shape,
-        mesh: Mesh,
+        message: &str,
         clear_selection: bool,
-        message: String,
+        operation: impl Fn(NodeId, &Mesh, &[u32]) -> Result<Mesh, String>,
     ) {
-        if let Err(errors) = mesh.validate() {
-            self.status = format!("Mesh edit rejected: {}", errors.join("; "));
+        if !self.mesh_edit {
+            self.status = "Enter component mode first".into();
             return;
         }
-        let mut after = before.clone();
-        after.kind = match after.kind {
-            NodeKind::Mesh { geometry } => NodeKind::Mesh {
-                geometry: geometry.with_mesh(mesh),
-            },
-            other => other,
-        };
-        if before.kind != after.kind {
-            self.history
-                .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
+        if !self.selected_meshes_editable() {
+            self.status = if self.selection.is_empty() {
+                "Select an editable mesh first".into()
+            } else {
+                "Select only editable mesh objects first".into()
+            };
+            return;
         }
+        let mut edits = Vec::new();
+        for id in self.selection.ids().to_vec() {
+            let Some(node) = self.doc.scene.get(id) else {
+                return;
+            };
+            let before = Shape::of(node);
+            let NodeKind::Mesh {
+                geometry: GeometrySource::Editable { mesh, .. },
+            } = &node.kind
+            else {
+                return;
+            };
+            let mesh = mesh.clone();
+            let components = self.mesh_components_for(id).to_vec();
+            let updated = match operation(id, &mesh, &components) {
+                Ok(updated) if updated == mesh => {
+                    self.status = format!("{message}: no change");
+                    return;
+                }
+                Ok(updated) => updated,
+                Err(error) => {
+                    self.status = format!("{message} failed: {error}");
+                    return;
+                }
+            };
+            if let Err(errors) = updated.validate() {
+                self.status = format!("Mesh edit rejected: {}", errors.join("; "));
+                return;
+            }
+            let mut after = before.clone();
+            after.kind = match after.kind {
+                NodeKind::Mesh { geometry } => NodeKind::Mesh {
+                    geometry: geometry.with_mesh(updated),
+                },
+                other => other,
+            };
+            edits.push((id, before, after));
+        }
+        if edits.is_empty() {
+            self.status = "Select an editable mesh first".into();
+            return;
+        }
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapesCmd { edits }));
         if clear_selection {
-            self.mesh_selected.clear();
+            self.clear_mesh_component_selection();
         }
-        self.status = message;
+        self.status = message.to_string();
     }
 
     fn mesh_transform_selection(&mut self) {
-        let Some((id, mut mesh)) = self.selected_editable_mesh() else {
-            self.status = "Select an editable mesh first".into();
-            return;
-        };
-        let affected = mesh_affected_points(&mesh, self.mesh_select_mode, &self.mesh_selected);
-        if affected.is_empty() {
-            self.status = "Select mesh components to transform".into();
+        if !self.mesh_transform_ready() {
+            self.status = if self.mesh_component_selection_ready() {
+                "Select components to transform on every selected mesh".into()
+            } else {
+                "Enter component mode with editable meshes first".into()
+            };
             return;
         }
-        let affected: HashSet<u32> = affected.into_iter().collect();
-        let center = affected
-            .iter()
-            .filter_map(|p| mesh.positions.get(*p as usize).copied())
-            .sum::<Vec3>()
-            / affected.len().max(1) as f32;
-        let node_world = self.doc.scene.world_matrix_plain(id);
-        let rotation = node_world.to_scale_rotation_translation().1;
-        let local_axis = match self.mesh_space {
-            MeshTransformSpace::Local => axis_vector(self.mesh_axis),
-            MeshTransformSpace::World => {
-                (rotation.inverse() * axis_vector(self.mesh_axis)).normalize_or(Vec3::Y)
-            }
-            MeshTransformSpace::Normal => {
-                let mut normal = Vec3::ZERO;
-                for (fi, poly) in mesh.polygons.iter().enumerate() {
-                    if poly.corners.iter().any(|c| affected.contains(&c.point)) {
-                        normal += mesh.face_normal(fi);
-                    }
-                }
-                normal.normalize_or(Vec3::Y)
-            }
-        };
+        let mode = self.mesh_select_mode;
+        let space = self.mesh_space;
+        let axis = self.mesh_axis;
+        let transform = self.mesh_transform;
         let value = self.mesh_value;
-        match self.mesh_transform {
-            MeshTransformMode::Move => {
-                for &p in &affected {
-                    if let Some(position) = mesh.positions.get_mut(p as usize) {
-                        *position += local_axis * value;
-                    }
-                }
-            }
-            MeshTransformMode::Rotate => {
-                let rotation = Quat::from_axis_angle(local_axis, value.to_radians());
-                for &p in &affected {
-                    if let Some(position) = mesh.positions.get_mut(p as usize) {
-                        *position = center + rotation * (*position - center);
-                    }
-                }
-            }
-            MeshTransformMode::Scale => {
-                for &p in &affected {
-                    if let Some(position) = mesh.positions.get_mut(p as usize) {
-                        let offset = *position - center;
-                        *position = center + offset + local_axis * offset.dot(local_axis) * value;
-                    }
-                }
-            }
-        }
-        let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
-            return;
-        };
-        self.commit_mesh_edit(
-            id,
-            before,
-            mesh,
+        let rotations: HashMap<NodeId, Quat> = self
+            .selection
+            .ids()
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    self.doc
+                        .scene
+                        .world_matrix_plain(*id)
+                        .to_scale_rotation_translation()
+                        .1,
+                )
+            })
+            .collect();
+        self.apply_mesh_operation_selection(
+            &format!("Transformed selected {}", mode.label().to_lowercase()),
             false,
-            format!(
-                "Transformed selected {}",
-                self.mesh_select_mode.label().to_lowercase()
-            ),
+            move |id, mesh, components| {
+                let affected: HashSet<u32> = mesh_affected_points(mesh, mode, components)
+                    .into_iter()
+                    .collect();
+                if affected.is_empty() {
+                    return Err("select mesh components to transform".into());
+                }
+                let center = affected
+                    .iter()
+                    .filter_map(|p| mesh.positions.get(*p as usize).copied())
+                    .sum::<Vec3>()
+                    / affected.len() as f32;
+                let local_axis = mesh_transform_axis(
+                    mesh,
+                    &affected,
+                    space,
+                    axis,
+                    rotations.get(&id).copied().unwrap_or(Quat::IDENTITY),
+                );
+                let mut out = mesh.clone();
+                match transform {
+                    MeshTransformMode::Move => {
+                        for &p in &affected {
+                            if let Some(position) = out.positions.get_mut(p as usize) {
+                                *position += local_axis * value;
+                            }
+                        }
+                    }
+                    MeshTransformMode::Rotate => {
+                        let rotation = Quat::from_axis_angle(local_axis, value.to_radians());
+                        for &p in &affected {
+                            if let Some(position) = out.positions.get_mut(p as usize) {
+                                *position = center + rotation * (*position - center);
+                            }
+                        }
+                    }
+                    MeshTransformMode::Scale => {
+                        for &p in &affected {
+                            if let Some(position) = out.positions.get_mut(p as usize) {
+                                let offset = *position - center;
+                                *position =
+                                    center + offset + local_axis * offset.dot(local_axis) * value;
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            },
         );
     }
 
@@ -1721,63 +2926,83 @@ impl LeopardApp {
         } else {
             self.mesh_selected = vec![index];
         }
+        if let Some(id) = self.selection.primary() {
+            self.mesh_components.insert(id, self.mesh_selected.clone());
+        }
     }
 
     fn assign_material_to_selected_faces(&mut self) {
-        if self.mesh_select_mode != MeshSelectMode::Polygons || self.mesh_selected.is_empty() {
-            self.status = "Select polygons before assigning a material".into();
+        if !self.mesh_assign_material_ready() {
+            self.status = if !self.mesh_component_selection_ready() {
+                "Enter component mode with editable meshes first".into()
+            } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                "Switch to Polygon selection to assign a material".into()
+            } else if self.selected_material_id().is_none() {
+                "Select a material in the Materials tab first".into()
+            } else if self.selection.len() == 1 {
+                "Select polygons before assigning a material".into()
+            } else {
+                "Select polygons on every selected mesh before assigning a material".into()
+            };
             return;
         }
-        let Some(material_id) = self
-            .selected_material
-            .filter(|material| self.doc.materials.get(*material).is_some())
-        else {
-            self.status = "Select a material in the Materials tab first".into();
-            return;
-        };
-        let Some((id, mut mesh)) = self.selected_editable_mesh() else {
-            self.status = "Select an editable mesh first".into();
+        let Some(material_id) = self.selected_material_id() else {
             return;
         };
         let before = self.doc.clone();
-        let Some(node) = self.doc.scene.get_mut(id) else {
-            return;
-        };
-        let slot = node
-            .material_slots
-            .iter()
-            .find(|(_, material)| **material == material_id)
-            .map(|(slot, _)| *slot)
-            .unwrap_or_else(|| {
-                node.material_slots
-                    .keys()
-                    .next_back()
-                    .map(|slot| slot.saturating_add(1))
-                    .unwrap_or(0)
-            });
-        node.material_slots.insert(slot, material_id);
-        for index in &self.mesh_selected {
-            if let Some(poly) = mesh.polygons.get_mut(*index as usize) {
-                poly.material_slot = slot;
+        for id in self.selection.ids().to_vec() {
+            let components = self.mesh_components_for(id).to_vec();
+            let Some(node) = self.doc.scene.get_mut(id) else {
+                self.doc = before;
+                self.status = "Assign material failed: a mesh left the scene".into();
+                return;
+            };
+            let NodeKind::Mesh {
+                geometry: GeometrySource::Editable { mesh, .. },
+            } = &mut node.kind
+            else {
+                self.doc = before;
+                self.status = "Assign material failed: not an editable mesh".into();
+                return;
+            };
+            let slot = node
+                .material_slots
+                .iter()
+                .find(|(_, material)| **material == material_id)
+                .map(|(slot, _)| *slot)
+                .unwrap_or_else(|| {
+                    node.material_slots
+                        .keys()
+                        .next_back()
+                        .map(|slot| slot.saturating_add(1))
+                        .unwrap_or(0)
+                });
+            node.material_slots.insert(slot, material_id);
+            for index in components {
+                if let Some(poly) = mesh.polygons.get_mut(index as usize) {
+                    poly.material_slot = slot;
+                }
             }
         }
-        let origin = match &node.kind {
-            NodeKind::Mesh { geometry } => geometry.origin_copied(),
-            _ => None,
-        };
-        node.kind = NodeKind::Mesh {
-            geometry: GeometrySource::Editable { mesh, origin },
-        };
         let after = self.doc.clone();
+        let count = self.selection.len();
         self.history.execute(
             &mut self.doc,
             Box::new(ReplaceDocumentCmd {
-                label: "Assign polygon material".into(),
+                label: if count == 1 {
+                    "Assign polygon material".into()
+                } else {
+                    format!("Assign material on {count} Objects")
+                },
                 before,
                 after,
             }),
         );
-        self.status = format!("Assigned material {material_id} to selected polygons");
+        self.status = if count == 1 {
+            format!("Assigned material {material_id} to selected polygons")
+        } else {
+            format!("Assigned material {material_id} on {count} objects")
+        };
     }
 
     fn pick_mesh_component(
@@ -1972,48 +3197,1138 @@ impl LeopardApp {
         }
     }
 
-    fn key_transform_channels(&mut self) {
-        let Some(id) = self.selected else {
-            return;
+    /// Keys every selected object whose transform is not already keyed at the
+    /// current frame.
+    fn key_transform_edits(&self) -> Vec<(NodeId, AnimationClip, AnimationClip)> {
+        let time = self.playback.time;
+        let mut edits = Vec::new();
+        for id in self.selection.ids() {
+            let Some(node) = self.doc.scene.get(*id) else {
+                continue;
+            };
+            let before = node.animation.clone();
+            let mut after = before.clone();
+            after.record_transform(&node.transform, time, Interpolation::Bezier);
+            if after != before {
+                edits.push((*id, before, after));
+            }
+        }
+        edits
+    }
+
+    /// Whether a target still names a live entity that owns animatable data.
+    fn target_is_valid(&self, target: AnimTarget) -> bool {
+        match target {
+            AnimTarget::Object(id) => self.doc.scene.get(id).is_some(),
+            AnimTarget::Tag(node, index) => self
+                .doc
+                .scene
+                .get(node)
+                .and_then(|n| n.tags.get(index))
+                .is_some_and(|tag| Self::tag_animation_channel(tag).is_some()),
+            AnimTarget::Material(id) => self.doc.materials.get(id).is_some(),
+        }
+    }
+
+    /// Map a scene tag to the registry channel that drives it.
+    pub(super) fn tag_animation_channel(tag: &Tag) -> Option<AnimChannel> {
+        match tag {
+            Tag::CopyLocation { .. } => Some(AnimChannel::CopyLocationWeight),
+            _ => None,
+        }
+    }
+
+    /// The explicit F-curve target while it still follows the selection,
+    /// otherwise the primary object. Tag targets follow their owning object;
+    /// material targets are independent because materials have their own
+    /// selection.
+    pub(super) fn current_anim_target(&self) -> Option<AnimTarget> {
+        if let Some(target) = self.anim_target {
+            let follows_selection = match target {
+                AnimTarget::Object(id) => self.selection.primary() == Some(id),
+                AnimTarget::Tag(node, _) => self.selection.primary() == Some(node),
+                AnimTarget::Material(_) => true,
+            };
+            if follows_selection && self.target_is_valid(target) {
+                return Some(target);
+            }
+        }
+        self.selection.primary().map(AnimTarget::Object)
+    }
+
+    /// Choose what the F-curve editor edits. Changing target drops key and row
+    /// selections that belonged to the previous entity.
+    pub(super) fn set_anim_target(&mut self, target: AnimTarget) -> bool {
+        if !self.target_is_valid(target) {
+            return false;
+        }
+        if self.anim_target != Some(target) {
+            self.selected_keys.clear();
+            self.curve_key_drag = None;
+            self.curve_box_select = None;
+            self.selected_curve_channel = None;
+        }
+        self.anim_target = Some(target);
+        true
+    }
+
+    /// Current clip for a target. Tag targets without keys still yield an
+    /// empty clip so the editor can show their registry rows and record into
+    /// them; object and material targets require a live entity.
+    pub(super) fn target_clip(&self, target: AnimTarget) -> Option<AnimationClip> {
+        match target {
+            AnimTarget::Object(id) => Some(self.doc.scene.get(id)?.animation.clone()),
+            AnimTarget::Tag(node, index) => {
+                let owner = self.doc.scene.get(node)?;
+                let tag = owner.tags.get(index)?;
+                Self::tag_animation_channel(tag)?;
+                Some(
+                    owner
+                        .tag_animations
+                        .get(&(index as u32))
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            }
+            AnimTarget::Material(id) => Some(self.doc.materials.get(id)?.animation.clone()),
+        }
+    }
+
+    pub(super) fn target_label(&self, target: AnimTarget) -> String {
+        match target {
+            AnimTarget::Object(id) => format!(
+                "Object: {}",
+                self.doc
+                    .scene
+                    .get(id)
+                    .map(|n| n.name.as_str())
+                    .unwrap_or("Object")
+            ),
+            AnimTarget::Tag(node, index) => {
+                let tag_name = self
+                    .doc
+                    .scene
+                    .get(node)
+                    .and_then(|n| n.tags.get(index))
+                    .map(|tag| tag.label())
+                    .unwrap_or("Tag");
+                format!("Tag: {tag_name} #{}", index + 1)
+            }
+            AnimTarget::Material(id) => format!(
+                "Material: {}",
+                self.doc
+                    .materials
+                    .get(id)
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("Material")
+            ),
+        }
+    }
+
+    fn channel_applies_to_target(&self, channel: AnimChannel, target: AnimTarget) -> bool {
+        let scope_matches = match target {
+            AnimTarget::Object(_) => channel.scope() == lc_anim::ChannelScope::Object,
+            AnimTarget::Tag(..) => channel.scope() == lc_anim::ChannelScope::Tag,
+            AnimTarget::Material(_) => channel.scope() == lc_anim::ChannelScope::Material,
+        };
+        if !scope_matches {
+            return false;
+        }
+        let AnimTarget::Object(id) = target else {
+            return true;
         };
         let Some(node) = self.doc.scene.get(id) else {
-            return;
+            return false;
         };
-        let mut clip = node.animation.clone();
-        let t = node.transform;
-        let e = t.euler_degrees();
+        match channel.applies_to() {
+            ChannelAppliesTo::AnyObject => true,
+            ChannelAppliesTo::Camera => matches!(node.kind, NodeKind::Camera { .. }),
+            ChannelAppliesTo::Light => matches!(node.kind, NodeKind::Light { .. }),
+            ChannelAppliesTo::Tag | ChannelAppliesTo::Material => false,
+        }
+    }
+
+    /// Every registry channel offered for a target, expanded into one row per
+    /// scalar component. Quaternion channels stay a single row.
+    pub(super) fn curve_rows(&self, target: AnimTarget) -> Vec<CurveRow> {
+        let mut rows = Vec::new();
+        for channel in AnimChannel::ALL {
+            if !self.channel_applies_to_target(channel, target) {
+                continue;
+            }
+            match channel.kind() {
+                ChannelKind::Quaternion => rows.push(CurveRow {
+                    channel,
+                    property: None,
+                }),
+                _ => {
+                    for property in channel.scalar_properties() {
+                        rows.push(CurveRow {
+                            channel,
+                            property: Some(*property),
+                        });
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// Live values for a registry channel, in registry component order.
+    fn channel_values(&self, target: AnimTarget, channel: AnimChannel) -> Option<Vec<f32>> {
+        match (target, channel) {
+            (AnimTarget::Object(id), AnimChannel::Translation) => {
+                let node = self.doc.scene.get(id)?;
+                Some(node.transform.translation.to_array().to_vec())
+            }
+            (AnimTarget::Object(id), AnimChannel::Scale) => {
+                let node = self.doc.scene.get(id)?;
+                Some(node.transform.scale.to_array().to_vec())
+            }
+            (AnimTarget::Object(id), AnimChannel::Fov) => match &self.doc.scene.get(id)?.kind {
+                NodeKind::Camera { camera } => Some(vec![camera.fov_y_deg]),
+                _ => None,
+            },
+            (AnimTarget::Object(id), AnimChannel::LightIntensity) => {
+                match &self.doc.scene.get(id)?.kind {
+                    NodeKind::Light { light } => Some(vec![light.intensity]),
+                    _ => None,
+                }
+            }
+            (AnimTarget::Object(id), AnimChannel::LightColor) => {
+                match &self.doc.scene.get(id)?.kind {
+                    NodeKind::Light { light } => Some(light.color.to_array().to_vec()),
+                    _ => None,
+                }
+            }
+            (AnimTarget::Tag(node, index), AnimChannel::CopyLocationWeight) => {
+                match self.doc.scene.get(node)?.tags.get(index)? {
+                    Tag::CopyLocation { weight, .. } => Some(vec![*weight]),
+                    _ => None,
+                }
+            }
+            (AnimTarget::Material(id), AnimChannel::MaterialRoughness) => Some(vec![self
+                .doc
+                .materials
+                .get(id)?
+                .base_roughness(&self.texture_cache)]),
+            (AnimTarget::Material(id), AnimChannel::MaterialMetallic) => Some(vec![self
+                .doc
+                .materials
+                .get(id)?
+                .base_metallic(&self.texture_cache)]),
+            _ => None,
+        }
+    }
+
+    /// Record one registry channel at the playhead as one undoable command.
+    pub(super) fn record_channel_key(&mut self, target: AnimTarget, channel: AnimChannel) -> bool {
+        if !self.target_is_valid(target) || !self.channel_applies_to_target(channel, target) {
+            return false;
+        }
         let time = self.playback.time;
-        clip.set_key(
-            AnimProperty::TranslationX,
-            time,
-            t.translation.x,
-            Interpolation::Bezier,
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        if channel.kind() == ChannelKind::Quaternion {
+            let AnimTarget::Object(id) = target else {
+                return false;
+            };
+            let Some(node) = self.doc.scene.get(id) else {
+                return false;
+            };
+            after.set_rotation_key(time, node.transform.rotation, Interpolation::Bezier);
+        } else {
+            let Some(values) = self.channel_values(target, channel) else {
+                return false;
+            };
+            if !after.record_channel(channel, &values, time, Interpolation::Bezier) {
+                return false;
+            }
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.anim_target = Some(target);
+        self.selected_curve_channel = Some((target, channel));
+        self.status = format!(
+            "Keyed {} at frame {}",
+            channel.label(),
+            (time * self.playback.fps).round()
         );
-        clip.set_key(
-            AnimProperty::TranslationY,
-            time,
-            t.translation.y,
-            Interpolation::Bezier,
+        true
+    }
+
+    /// Build the single command that writes a clip to the entity that owns it.
+    fn target_clip_command(
+        &self,
+        target: AnimTarget,
+        after: AnimationClip,
+    ) -> Option<Box<dyn Command>> {
+        match target {
+            AnimTarget::Object(id) => Some(Box::new(SetAnimationCmd::new(&self.doc, id, after)?)),
+            AnimTarget::Tag(node, index) => Some(Box::new(SetTagAnimationCmd::new(
+                &self.doc, node, index, after,
+            )?)),
+            AnimTarget::Material(id) => {
+                let before = self.doc.materials.get(id).cloned()?;
+                let mut updated = before.clone();
+                updated.animation = after;
+                if updated == before {
+                    return None;
+                }
+                Some(Box::new(SetMaterialCmd {
+                    before,
+                    after: updated,
+                }))
+            }
+        }
+    }
+
+    /// Commit a clip to the entity that owns it as exactly one undo step.
+    fn commit_target_clip(&mut self, target: AnimTarget, after: AnimationClip) -> bool {
+        let Some(cmd) = self.target_clip_command(target, after) else {
+            return false;
+        };
+        self.history.execute(&mut self.doc, cmd);
+        true
+    }
+
+    /// Commit a paste and carry its before/after key selection on the same
+    /// history entry. Undo and redo can then restore the editor selection
+    /// without a second history stack.
+    fn commit_pasted_target_clip(
+        &mut self,
+        target: AnimTarget,
+        after: AnimationClip,
+        before_selection: Vec<SelectedKey>,
+        after_selection: Vec<SelectedKey>,
+    ) -> bool {
+        let Some(inner) = self.target_clip_command(target, after) else {
+            return false;
+        };
+        self.history.execute(
+            &mut self.doc,
+            Box::new(PasteCurveKeysCmd {
+                inner,
+                target,
+                before_selection,
+                after_selection,
+            }),
         );
-        clip.set_key(
-            AnimProperty::TranslationZ,
+        true
+    }
+
+    /// Index of the key at `time` on `property`, using the editor's key
+    /// tolerance so selection survives frame snapping.
+    pub(super) fn curve_key_index(
+        clip: &AnimationClip,
+        property: AnimProperty,
+        time: f32,
+    ) -> Option<usize> {
+        let track = clip.track(property)?;
+        track
+            .curve
+            .keys
+            .iter()
+            .position(|key| (key.time - time).abs() <= KEY_TIME_EPSILON)
+    }
+
+    /// Select the F-curve key at `time` on the primary object.
+    #[cfg(test)]
+    pub(super) fn select_curve_key(&mut self, property: AnimProperty, time: f32) -> bool {
+        self.select_track_key(CurveTrackId::Scalar(property), time)
+    }
+
+    /// Select one quaternion rotation key on the primary object.
+    #[cfg(test)]
+    pub(super) fn select_rotation_key(&mut self, time: f32) -> bool {
+        self.select_track_key(CurveTrackId::Rotation, time)
+    }
+
+    #[cfg(test)]
+    pub(super) fn select_track_key(&mut self, track: CurveTrackId, time: f32) -> bool {
+        let Some(target) = self.current_anim_target() else {
+            return false;
+        };
+        self.select_target_track_key(target, track, time)
+    }
+
+    /// Select a key on an explicit object, tag or material target.
+    #[cfg(test)]
+    pub(super) fn select_target_track_key(
+        &mut self,
+        target: AnimTarget,
+        track: CurveTrackId,
+        time: f32,
+    ) -> bool {
+        self.select_target_track_key_additive(target, track, time, false)
+    }
+
+    /// Add or replace one F-curve key in the current selection.
+    pub(super) fn select_target_track_key_additive(
+        &mut self,
+        target: AnimTarget,
+        track: CurveTrackId,
+        time: f32,
+        additive: bool,
+    ) -> bool {
+        let Some(clip) = self.target_clip(target) else {
+            return false;
+        };
+        let key = SelectedKey {
+            target,
+            track,
             time,
-            t.translation.z,
-            Interpolation::Bezier,
+        };
+        if !Self::curve_key_exists(&clip, &key) {
+            return false;
+        }
+        if !additive {
+            self.selected_keys.clear();
+        }
+        if !self
+            .selected_keys
+            .iter()
+            .any(|existing| Self::same_curve_key(*existing, key))
+        {
+            self.selected_keys.push(key);
+        }
+        true
+    }
+
+    /// Toggle a key in the selection for shift/command clicks, matching the
+    /// object selection semantics.
+    pub(super) fn toggle_target_track_key(
+        &mut self,
+        target: AnimTarget,
+        track: CurveTrackId,
+        time: f32,
+    ) -> bool {
+        let Some(clip) = self.target_clip(target) else {
+            return false;
+        };
+        let key = SelectedKey {
+            target,
+            track,
+            time,
+        };
+        if !Self::curve_key_exists(&clip, &key) {
+            return false;
+        }
+        if let Some(index) = self
+            .selected_keys
+            .iter()
+            .position(|existing| Self::same_curve_key(*existing, key))
+        {
+            self.selected_keys.remove(index);
+        } else {
+            self.selected_keys.push(key);
+        }
+        true
+    }
+
+    fn same_curve_key(a: SelectedKey, b: SelectedKey) -> bool {
+        a.target == b.target && a.track == b.track && (a.time - b.time).abs() <= KEY_TIME_EPSILON
+    }
+
+    fn curve_key_exists(clip: &AnimationClip, key: &SelectedKey) -> bool {
+        match key.track {
+            CurveTrackId::Scalar(property) => {
+                Self::curve_key_index(clip, property, key.time).is_some()
+            }
+            CurveTrackId::Rotation => clip.rotation_key_index(key.time).is_some(),
+        }
+    }
+
+    /// All selected keys that still exist on the current target.
+    pub(super) fn selected_curve_keys(&self) -> Vec<SelectedKey> {
+        let Some(target) = self.current_anim_target() else {
+            return Vec::new();
+        };
+        let Some(clip) = self.target_clip(target) else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        for key in &self.selected_keys {
+            if key.target != target || !Self::curve_key_exists(&clip, key) {
+                continue;
+            }
+            if !keys
+                .iter()
+                .any(|existing| Self::same_curve_key(*existing, *key))
+            {
+                keys.push(*key);
+            }
+        }
+        keys
+    }
+
+    /// The last selected key, used by single-key controls and tests.
+    #[cfg(test)]
+    pub(super) fn selected_curve_key(&self) -> Option<SelectedKey> {
+        self.selected_curve_keys().last().copied()
+    }
+
+    pub(super) fn is_curve_key_selected(&self, key: &SelectedKey) -> bool {
+        self.selected_keys
+            .iter()
+            .any(|existing| Self::same_curve_key(*existing, *key))
+    }
+
+    pub(super) fn clear_curve_key_selection(&mut self) {
+        self.selected_keys.clear();
+    }
+
+    /// Select every scalar or quaternion key whose frame and displayed value
+    /// fall inside the marquee. Additive selection keeps what was already
+    /// selected, matching shift/command selection elsewhere in the editor.
+    pub(super) fn select_keys_in_box(
+        &mut self,
+        target: AnimTarget,
+        clip: &AnimationClip,
+        time_range: (f32, f32),
+        value_range: (f32, f32),
+        additive: bool,
+    ) -> bool {
+        let (time_min, time_max) = time_range;
+        let (value_min, value_max) = value_range;
+        if !time_min.is_finite()
+            || !time_max.is_finite()
+            || !value_min.is_finite()
+            || !value_max.is_finite()
+        {
+            return false;
+        }
+        let mut hits = Vec::new();
+        for track in &clip.tracks {
+            for key in &track.curve.keys {
+                if key.time >= time_min
+                    && key.time <= time_max
+                    && key.value >= value_min
+                    && key.value <= value_max
+                {
+                    hits.push(SelectedKey {
+                        target,
+                        track: CurveTrackId::Scalar(track.property),
+                        time: key.time,
+                    });
+                }
+            }
+        }
+        if let Some(track) = &clip.rotation {
+            for key in &track.keys {
+                if key.time >= time_min
+                    && key.time <= time_max
+                    && key.value.w >= value_min
+                    && key.value.w <= value_max
+                {
+                    hits.push(SelectedKey {
+                        target,
+                        track: CurveTrackId::Rotation,
+                        time: key.time,
+                    });
+                }
+            }
+        }
+        if !additive {
+            self.selected_keys.clear();
+        }
+        for hit in hits {
+            if !self
+                .selected_keys
+                .iter()
+                .any(|existing| Self::same_curve_key(*existing, hit))
+            {
+                self.selected_keys.push(hit);
+            }
+        }
+        !self.selected_keys.is_empty()
+    }
+
+    /// Move one scalar key on any object, tag or material target in time as a
+    /// single undo step.
+    #[cfg(test)]
+    pub(super) fn move_target_curve_key(
+        &mut self,
+        target: AnimTarget,
+        property: AnimProperty,
+        from: f32,
+        to: f32,
+    ) -> bool {
+        if !to.is_finite() {
+            return false;
+        }
+        let to = to.max(0.0);
+        let Some(before) = self.target_clip(target) else {
+            return false;
+        };
+        let mut after = before.clone();
+        let Some(track) = after.track_mut(property) else {
+            return false;
+        };
+        let Some(index) = track
+            .curve
+            .keys
+            .iter()
+            .position(|key| (key.time - from).abs() <= KEY_TIME_EPSILON)
+        else {
+            return false;
+        };
+        if (to - from).abs() <= 1e-4 {
+            return false;
+        }
+        if track
+            .curve
+            .keys
+            .iter()
+            .enumerate()
+            .any(|(i, key)| i != index && (key.time - to).abs() <= KEY_TIME_EPSILON)
+        {
+            self.status = "Another key already sits at that frame".into();
+            return false;
+        }
+        track.curve.keys[index].time = to;
+        track.curve.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+        track.curve.update_tangents();
+        if after == before {
+            return false;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys = vec![SelectedKey {
+            target,
+            track: CurveTrackId::Scalar(property),
+            time: to,
+        }];
+        self.status = format!("Moved key to frame {}", (to * self.playback.fps).round());
+        true
+    }
+
+    /// Delete one scalar key on any target as a single undo step, dropping the
+    /// track when its last key goes away.
+    pub(super) fn delete_target_curve_key(
+        &mut self,
+        target: AnimTarget,
+        property: AnimProperty,
+        time: f32,
+    ) -> bool {
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let Some(track) = after.track_mut(property) else {
+            return false;
+        };
+        let Some(index) = track
+            .curve
+            .keys
+            .iter()
+            .position(|key| (key.time - time).abs() <= KEY_TIME_EPSILON)
+        else {
+            return false;
+        };
+        track.curve.keys.remove(index);
+        after.tracks.retain(|track| !track.curve.keys.is_empty());
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys.clear();
+        self.status = "Deleted key".into();
+        true
+    }
+
+    /// Change interpolation for exactly one scalar key on any target.
+    #[cfg(test)]
+    pub(super) fn set_target_curve_key_interpolation(
+        &mut self,
+        target: AnimTarget,
+        property: AnimProperty,
+        time: f32,
+        interpolation: Interpolation,
+    ) -> bool {
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let Some(track) = after.track_mut(property) else {
+            return false;
+        };
+        let Some(index) = track
+            .curve
+            .keys
+            .iter()
+            .position(|key| (key.time - time).abs() <= KEY_TIME_EPSILON)
+        else {
+            return false;
+        };
+        if track.curve.keys[index].interpolation == interpolation {
+            return false;
+        }
+        track.curve.keys[index].interpolation = interpolation;
+        track.curve.update_tangents();
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys = vec![SelectedKey {
+            target,
+            track: CurveTrackId::Scalar(property),
+            time,
+        }];
+        self.status = format!("Set key interpolation to {}", interpolation.label());
+        true
+    }
+
+    pub(super) fn delete_target_rotation_curve_key(
+        &mut self,
+        target: AnimTarget,
+        time: f32,
+    ) -> bool {
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let Some(track) = after.rotation.as_mut() else {
+            return false;
+        };
+        if track.key_index(time).is_none() {
+            return false;
+        }
+        track.remove_nearest(time);
+        if track.is_empty() {
+            after.rotation = None;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys.clear();
+        self.status = "Deleted key".into();
+        true
+    }
+
+    /// Move every selected key by one frame delta as a single undo step.
+    pub(super) fn move_selected_curve_keys_by(&mut self, delta: f32) -> bool {
+        if !delta.is_finite() || delta.abs() <= 1e-4 {
+            return false;
+        }
+        let keys = self.selected_curve_keys();
+        if keys.is_empty() {
+            return false;
+        }
+        let target = keys[0].target;
+        if keys.iter().any(|key| key.target != target) {
+            return false;
+        }
+        let Some(before) = self.target_clip(target) else {
+            return false;
+        };
+        // Clamp the whole selection at frame zero so spacing is preserved even
+        // when the drag would push the earliest key before the timeline start.
+        let earliest = keys
+            .iter()
+            .map(|key| key.time)
+            .fold(f32::INFINITY, f32::min);
+        let delta = delta.max(-earliest);
+        if delta.abs() <= 1e-4 {
+            return false;
+        }
+        let mut after = before.clone();
+        let mut moved = Vec::with_capacity(keys.len());
+        for key in &keys {
+            moved.push((*key, key.time + delta));
+        }
+        for (key, new_time) in &moved {
+            let selected_times: Vec<f32> = keys
+                .iter()
+                .filter(|other| other.track == key.track)
+                .map(|other| other.time)
+                .collect();
+            let collides = match key.track {
+                CurveTrackId::Scalar(property) => after.track(property).is_some_and(|track| {
+                    track.curve.keys.iter().any(|candidate| {
+                        (candidate.time - *new_time).abs() <= KEY_TIME_EPSILON
+                            && !selected_times
+                                .iter()
+                                .any(|time| (candidate.time - time).abs() <= KEY_TIME_EPSILON)
+                    })
+                }),
+                CurveTrackId::Rotation => after.rotation.as_ref().is_some_and(|track| {
+                    track.keys.iter().any(|candidate| {
+                        (candidate.time - *new_time).abs() <= KEY_TIME_EPSILON
+                            && !selected_times
+                                .iter()
+                                .any(|time| (candidate.time - time).abs() <= KEY_TIME_EPSILON)
+                    })
+                }),
+            };
+            if collides {
+                self.status = "Another key already sits at that frame".into();
+                return false;
+            }
+        }
+        for (index, (key, new_time)) in moved.iter().enumerate() {
+            for (other, other_time) in moved.iter().skip(index + 1) {
+                if key.track == other.track && (*new_time - *other_time).abs() <= KEY_TIME_EPSILON {
+                    self.status = "Two selected keys would land on the same frame".into();
+                    return false;
+                }
+            }
+        }
+        for (key, new_time) in &moved {
+            match key.track {
+                CurveTrackId::Scalar(property) => {
+                    let Some(track) = after.track_mut(property) else {
+                        return false;
+                    };
+                    let Some(index) = track.curve.keys.iter().position(|candidate| {
+                        (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
+                    }) else {
+                        return false;
+                    };
+                    track.curve.keys[index].time = *new_time;
+                }
+                CurveTrackId::Rotation => {
+                    let Some(track) = after.rotation.as_mut() else {
+                        return false;
+                    };
+                    let Some(index) = track.key_index(key.time) else {
+                        return false;
+                    };
+                    track.keys[index].time = *new_time;
+                }
+            }
+        }
+        for track in &mut after.tracks {
+            track.curve.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+            track.curve.update_tangents();
+        }
+        if let Some(track) = after.rotation.as_mut() {
+            track.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+        }
+        if after == before {
+            return false;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys = moved
+            .into_iter()
+            .map(|(mut key, time)| {
+                key.time = time;
+                key
+            })
+            .collect();
+        self.status = format!(
+            "Moved {} key(s) by {} frame(s)",
+            self.selected_keys.len(),
+            (delta * self.playback.fps).round()
         );
-        clip.set_key(AnimProperty::RotationX, time, e.x, Interpolation::Bezier);
-        clip.set_key(AnimProperty::RotationY, time, e.y, Interpolation::Bezier);
-        clip.set_key(AnimProperty::RotationZ, time, e.z, Interpolation::Bezier);
-        clip.set_key(AnimProperty::ScaleX, time, t.scale.x, Interpolation::Bezier);
-        clip.set_key(AnimProperty::ScaleY, time, t.scale.y, Interpolation::Bezier);
-        clip.set_key(AnimProperty::ScaleZ, time, t.scale.z, Interpolation::Bezier);
-        if let Some(cmd) = SetAnimationCmd::new(&self.doc, id, clip) {
-            self.history.execute(&mut self.doc, Box::new(cmd));
-            self.status = format!(
+        true
+    }
+
+    /// Move the selected anchor key to `to`, carrying the whole multi-key
+    /// selection with it.
+    #[cfg(test)]
+    pub(super) fn move_selected_curve_key(&mut self, to: f32) -> bool {
+        let Some(key) = self.selected_curve_key() else {
+            return false;
+        };
+        self.move_selected_curve_keys_by(to - key.time)
+    }
+
+    /// Delete every selected key as a single undo step. A track disappears
+    /// when its last key is removed, and a quaternion track is dropped with it.
+    pub(super) fn delete_selected_curve_key(&mut self) -> bool {
+        let keys = self.selected_curve_keys();
+        if keys.is_empty() {
+            return false;
+        }
+        let target = keys[0].target;
+        if keys.iter().any(|key| key.target != target) {
+            return false;
+        }
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let count = keys.len();
+        for key in &keys {
+            match key.track {
+                CurveTrackId::Scalar(property) => {
+                    if let Some(track) = after.track_mut(property) {
+                        track.curve.remove_nearest(key.time);
+                    }
+                }
+                CurveTrackId::Rotation => {
+                    if let Some(track) = after.rotation.as_mut() {
+                        track.remove_nearest(key.time);
+                        if track.is_empty() {
+                            after.rotation = None;
+                        }
+                    }
+                }
+            }
+        }
+        after.tracks.retain(|track| !track.curve.keys.is_empty());
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys.clear();
+        self.status = if count == 1 {
+            "Deleted key".into()
+        } else {
+            format!("Deleted {count} keys")
+        };
+        true
+    }
+
+    /// Set interpolation for every selected key as one undo step.
+    #[cfg(test)]
+    pub(super) fn set_selected_curve_key_interpolation(
+        &mut self,
+        interpolation: Interpolation,
+    ) -> bool {
+        let keys = self.selected_curve_keys();
+        if keys.is_empty() {
+            return false;
+        }
+        let target = keys[0].target;
+        if keys.iter().any(|key| key.target != target) {
+            return false;
+        }
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let mut changed = 0;
+        for key in &keys {
+            match key.track {
+                CurveTrackId::Scalar(property) => {
+                    if let Some(track) = after.track_mut(property) {
+                        if let Some(index) = track.curve.keys.iter().position(|candidate| {
+                            (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
+                        }) {
+                            if track.curve.keys[index].interpolation != interpolation {
+                                track.curve.keys[index].interpolation = interpolation;
+                                changed += 1;
+                            }
+                        }
+                        track.curve.update_tangents();
+                    }
+                }
+                CurveTrackId::Rotation => {
+                    if let Some(track) = after.rotation.as_mut() {
+                        if let Some(index) = track.key_index(key.time) {
+                            if track.keys[index].interpolation != interpolation {
+                                track.keys[index].interpolation = interpolation;
+                                changed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if changed == 0 {
+            return false;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.status = format!("Set key interpolation to {}", interpolation.label());
+        true
+    }
+
+    /// Copy the current key selection, preserving each key's offset from the
+    /// earliest selected key.
+    pub(super) fn copy_selected_curve_keys(&mut self) -> bool {
+        let keys = self.selected_curve_keys();
+        let Some(first) = keys.first() else {
+            self.status = "Select F-curve keys to copy".into();
+            return false;
+        };
+        let target = first.target;
+        let Some(clip) = self.target_clip(target) else {
+            return false;
+        };
+        let anchor = keys
+            .iter()
+            .map(|key| key.time)
+            .fold(f32::INFINITY, f32::min);
+        let mut clipboard = Vec::with_capacity(keys.len());
+        for key in &keys {
+            match key.track {
+                CurveTrackId::Scalar(property) => {
+                    let Some(track) = clip.track(property) else {
+                        continue;
+                    };
+                    let Some(value) =
+                        track.curve.keys.iter().find(|candidate| {
+                            (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
+                        })
+                    else {
+                        continue;
+                    };
+                    clipboard.push(CurveClipboardKey {
+                        track: key.track,
+                        offset: key.time - anchor,
+                        value: CurveKeyValue::Scalar(value.value),
+                        interpolation: value.interpolation,
+                    });
+                }
+                CurveTrackId::Rotation => {
+                    let Some(track) = clip.rotation.as_ref() else {
+                        continue;
+                    };
+                    let Some(value) = track
+                        .keys
+                        .iter()
+                        .find(|candidate| (candidate.time - key.time).abs() <= KEY_TIME_EPSILON)
+                    else {
+                        continue;
+                    };
+                    clipboard.push(CurveClipboardKey {
+                        track: key.track,
+                        offset: key.time - anchor,
+                        value: CurveKeyValue::Rotation(value.value),
+                        interpolation: value.interpolation,
+                    });
+                }
+            }
+        }
+        if clipboard.is_empty() {
+            return false;
+        }
+        let count = clipboard.len();
+        self.curve_clipboard = CurveClipboard { keys: clipboard };
+        self.status = format!("Copied {count} key(s)");
+        true
+    }
+
+    /// Paste copied keys at the playhead. Destination channels are resolved
+    /// through the registry, so a paste can target another object, tag or
+    /// material and only compatible channels are written. The whole paste,
+    /// including overwrites, is one undo step.
+    pub(super) fn paste_curve_keys(&mut self) -> bool {
+        let Some(target) = self.current_anim_target() else {
+            return false;
+        };
+        if self.curve_clipboard.keys.is_empty() {
+            self.status = "Nothing copied to paste".into();
+            return false;
+        }
+        let before_selection = self.selected_curve_keys();
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let mut pasted = Vec::new();
+        for item in &self.curve_clipboard.keys {
+            let channel = match item.track {
+                CurveTrackId::Scalar(property) => AnimChannel::from_scalar_property(property),
+                CurveTrackId::Rotation => Some(AnimChannel::Rotation),
+            };
+            let Some(channel) = channel else {
+                continue;
+            };
+            let compatible = match item.track {
+                CurveTrackId::Scalar(_) => channel.kind() != ChannelKind::Quaternion,
+                CurveTrackId::Rotation => channel.kind() == ChannelKind::Quaternion,
+            };
+            if !compatible || !self.channel_applies_to_target(channel, target) {
+                continue;
+            }
+            let time = (self.playback.time + item.offset).max(0.0);
+            if !time.is_finite() {
+                continue;
+            }
+            match item.track {
+                CurveTrackId::Scalar(property) => {
+                    let CurveKeyValue::Scalar(value) = item.value else {
+                        continue;
+                    };
+                    after.set_key(property, time, value, item.interpolation);
+                    pasted.push(SelectedKey {
+                        target,
+                        track: item.track,
+                        time,
+                    });
+                }
+                CurveTrackId::Rotation => {
+                    let CurveKeyValue::Rotation(value) = item.value else {
+                        continue;
+                    };
+                    after.set_rotation_key(time, value, item.interpolation);
+                    pasted.push(SelectedKey {
+                        target,
+                        track: item.track,
+                        time,
+                    });
+                }
+            }
+        }
+        if pasted.is_empty() {
+            self.status = "No copied channels apply to this target".into();
+            return false;
+        }
+        let after_selection = pasted.clone();
+        if !self.commit_pasted_target_clip(target, after, before_selection, after_selection) {
+            return false;
+        }
+        let count = pasted.len();
+        self.selected_keys = pasted;
+        self.status = format!("Pasted {count} key(s)");
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn move_curve_key(&mut self, property: AnimProperty, from: f32, to: f32) -> bool {
+        let Some(target) = self.current_anim_target() else {
+            return false;
+        };
+        self.move_target_curve_key(target, property, from, to)
+    }
+
+    #[cfg(test)]
+    pub(super) fn delete_curve_key(&mut self, property: AnimProperty, time: f32) -> bool {
+        let Some(target) = self.current_anim_target() else {
+            return false;
+        };
+        self.delete_target_curve_key(target, property, time)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_curve_key_interpolation(
+        &mut self,
+        property: AnimProperty,
+        time: f32,
+        interpolation: Interpolation,
+    ) -> bool {
+        let Some(target) = self.current_anim_target() else {
+            return false;
+        };
+        self.set_target_curve_key_interpolation(target, property, time, interpolation)
+    }
+
+    pub(super) fn key_transforms_ready(&self) -> bool {
+        !self.selection.is_empty() && !self.key_transform_edits().is_empty()
+    }
+
+    fn key_transform_channels(&mut self) {
+        let edits = self.key_transform_edits();
+        if edits.is_empty() {
+            self.status = "No transform keys to change at this frame".into();
+            return;
+        }
+        let count = edits.len();
+        let time = self.playback.time;
+        self.history
+            .execute(&mut self.doc, Box::new(SetAnimationsCmd { edits }));
+        self.status = if count == 1 {
+            format!(
                 "Keyed transforms at frame {}",
                 (time * self.playback.fps).round()
-            );
-        }
+            )
+        } else {
+            format!(
+                "Keyed transforms on {count} objects at frame {}",
+                (time * self.playback.fps).round()
+            )
+        };
     }
 }
 
@@ -2044,33 +4359,7 @@ impl eframe::App for LeopardApp {
             self.playback.advance(dt);
             ctx.request_repaint();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
-            self.focus_search = true;
-            self.browser_tab = BrowserTab::Objects;
-        }
-        let undo = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
-        let redo = ctx.input_mut(|i| {
-            i.consume_key(
-                egui::Modifiers {
-                    shift: true,
-                    ..egui::Modifiers::COMMAND
-                },
-                egui::Key::Z,
-            )
-        });
-        if undo {
-            self.undo();
-        }
-        if redo {
-            self.redo();
-        }
-        let typing = ctx.memory(|m| m.focused().is_some());
-        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Delete)) && self.selected.is_some() {
-            self.delete_selected();
-        }
-        if !typing && ctx.input(|i| i.key_pressed(egui::Key::F)) {
-            self.frame_selected();
-        }
+        self.handle_shortcuts(&ctx);
 
         self.poll_render(&ctx);
         self.log_status();
@@ -2325,6 +4614,106 @@ fn format_age(when: SystemTime) -> String {
 // ---------------------------------------------------------------------------
 
 impl LeopardApp {
+    /// Keyboard commands shared by the real app frame and input-driven tests.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.focus_search = true;
+            self.browser_tab = BrowserTab::Objects;
+        }
+        // Check the more specific Shift+Cmd/Ctrl+Z first: egui ignores extra
+        // Shift when matching, so otherwise a redo would be consumed as undo.
+        let redo = ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers {
+                    shift: true,
+                    ..egui::Modifiers::COMMAND
+                },
+                egui::Key::Z,
+            )
+        });
+        let undo = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z));
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
+        let typing = ctx.text_edit_focused();
+        let native_copy = ctx.input(|i| i.events.contains(&egui::Event::Copy));
+        let native_paste = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)))
+        });
+        // egui-winit suppresses Ctrl/Cmd+V when the system clipboard has no
+        // text, but still forwards the V key release. Fall back to the editor's
+        // internal curve clipboard on that release.
+        let paste_release = ctx.input(|i| {
+            // Some backends report the modifier after releasing Ctrl, so a V
+            // release in the same frame as a Ctrl release is still the chord.
+            let ctrl_released = i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::ControlLeft | egui::Key::ControlRight,
+                        pressed: false,
+                        ..
+                    }
+                )
+            });
+            i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: false,
+                        modifiers,
+                        ..
+                    } if modifiers.command || ctrl_released
+                )
+            })
+        });
+        if !typing && self.show_curves {
+            // Native backends translate Ctrl/Cmd+C and Ctrl/Cmd+V into clipboard
+            // events instead of key presses, so handle both forms.
+            if native_copy
+                || ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::C))
+            {
+                self.copy_selected_curve_keys();
+            }
+            if native_paste {
+                self.paste_curve_keys();
+                self.native_paste_pending = !paste_release;
+            } else if paste_release {
+                if self.native_paste_pending {
+                    self.native_paste_pending = false;
+                } else {
+                    self.paste_curve_keys();
+                }
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)) {
+                self.paste_curve_keys();
+                // Platforms that still deliver a raw V press will also deliver
+                // the release; swallow it so the chord pastes only once.
+                self.native_paste_pending = true;
+            }
+        } else if !self.show_curves {
+            self.native_paste_pending = false;
+        }
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Delete)) && !self.selection.is_empty()
+        {
+            self.delete_selected();
+        }
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::F)) {
+            self.frame_selected();
+        }
+        if !typing
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D))
+            && !self.selection.is_empty()
+        {
+            self.duplicate_selected();
+        }
+    }
+
     fn ui_viewport(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
         if available.x < 32.0 || available.y < 32.0 {
@@ -2458,6 +4847,16 @@ impl LeopardApp {
     }
 
     fn build_frame(&self, evaluated: &EvaluatedScene) -> FrameData {
+        #[cfg(test)]
+        {
+            let visible: Vec<NodeId> = evaluated.mesh_nodes().map(|node| node.id).collect();
+            let selected = visible
+                .iter()
+                .copied()
+                .filter(|id| self.selection.contains(*id))
+                .collect();
+            ui_test_support::record_viewport(visible, selected);
+        }
         let aspect = (self.last_viewport_size.x / self.last_viewport_size.y.max(1.0)).max(0.01);
         let world = self.orbit.world();
         let camera = self.orbit.camera();
@@ -2568,7 +4967,7 @@ impl LeopardApp {
             let Some(spline) = node.spline() else {
                 continue;
             };
-            let selected = Some(node.id) == self.selected;
+            let selected = self.selection.contains(node.id);
             let color = if selected {
                 Vec3::splat(0.97)
             } else {
@@ -2613,14 +5012,14 @@ impl LeopardApp {
             self.shading,
             ShadingMode::Wireframe | ShadingMode::ShadedWireframe
         );
-        let selected_overlay = !wireframe && self.selected.is_some();
+        let selected_overlay = !wireframe && !self.selection.is_empty();
         if wireframe || selected_overlay {
             for node in evaluated.mesh_nodes() {
                 let Some(mesh) = node.mesh() else {
                     continue;
                 };
 
-                let selected = Some(node.id) == self.selected;
+                let selected = self.selection.contains(node.id);
                 if selected_overlay && !selected {
                     continue;
                 }
@@ -2745,9 +5144,18 @@ impl LeopardApp {
         if drag_started {
             if let Some(pointer) = pointer {
                 self.gizmo_drag = self.gizmo_hit(evaluated, rect, pixel_w, pixel_h, pointer);
+                if self.gizmo_drag.is_none() && !self.mesh_edit {
+                    let start = ui.input(|i| i.pointer.press_origin()).unwrap_or(pointer);
+                    self.box_select = Some(BoxSelect {
+                        start,
+                        current: pointer,
+                        base: self.selection.ids().to_vec(),
+                        additive: modifiers.shift || modifiers.command,
+                    });
+                }
             }
         }
-        if let Some(mut drag) = self.gizmo_drag {
+        if let Some(mut drag) = self.gizmo_drag.take() {
             if response.dragged_by(egui::PointerButton::Primary) {
                 if let Some(pointer) = pointer {
                     let delta = pointer - drag.start_pointer;
@@ -2759,7 +5167,20 @@ impl LeopardApp {
             }
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 self.commit_pending();
-                self.gizmo_drag = None;
+            } else {
+                self.gizmo_drag = Some(drag);
+            }
+            return;
+        }
+
+        if let Some(mut marquee) = self.box_select.take() {
+            if let Some(pointer) = pointer {
+                marquee.current = pointer;
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                self.finish_box_select(&marquee, evaluated, rect, pixel_w, pixel_h);
+            } else {
+                self.box_select = Some(marquee);
             }
             return;
         }
@@ -2779,28 +5200,126 @@ impl LeopardApp {
                                     self.mesh_select_mode.label().to_lowercase()
                                 );
                             } else if !modifiers.shift {
-                                self.mesh_selected.clear();
+                                self.clear_mesh_component_selection();
                             }
                         }
                     }
                     return;
                 }
                 if let Some(id) = self.pick(evaluated, rect, pixel_w, pixel_h, pointer) {
-                    self.selected = Some(id);
+                    if modifiers.shift || modifiers.command {
+                        self.selection.toggle(id);
+                    } else {
+                        self.selection.select_one(id);
+                    }
                     self.sync_selection_material();
-                    self.status = format!(
-                        "Selected {}",
-                        self.doc
-                            .scene
-                            .get(id)
-                            .map(|n| n.name.clone())
-                            .unwrap_or_default()
-                    );
-                } else {
-                    self.selected = None;
+                    self.status = self.selection_status();
+                } else if !(modifiers.shift || modifiers.command) {
+                    self.selection.clear();
                 }
             }
         }
+    }
+
+    fn select_all_objects(&mut self) {
+        self.selection.set(self.doc.scene.depth_first());
+        self.clear_mesh_component_selection();
+        self.sync_selection_material();
+        self.status = self.selection_status();
+    }
+
+    fn deselect_all_objects(&mut self) {
+        self.selection.clear();
+        self.clear_mesh_component_selection();
+        self.status = "Selection cleared".into();
+    }
+
+    fn selection_status(&self) -> String {
+        match self.selection.len() {
+            0 => "Selection cleared".into(),
+            1 => self
+                .selection
+                .primary()
+                .and_then(|id| self.doc.scene.get(id))
+                .map(|node| format!("Selected {}", node.name))
+                .unwrap_or_else(|| "Selected object".into()),
+            count => format!("Selected {count} objects"),
+        }
+    }
+
+    fn finish_box_select(
+        &mut self,
+        marquee: &BoxSelect,
+        evaluated: &EvaluatedScene,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+    ) {
+        let area = Rect::from_two_pos(marquee.start, marquee.current);
+        if area.width() < 4.0 && area.height() < 4.0 {
+            return;
+        }
+        let mut hits = Vec::new();
+        for node in &evaluated.nodes {
+            if !node.visible {
+                continue;
+            }
+            if let Some(bounds) = self.node_screen_rect(node, rect, pixel_w, pixel_h) {
+                if area.intersects(bounds) {
+                    hits.push(node.id);
+                }
+            }
+        }
+        if marquee.additive {
+            self.selection.set(marquee.base.iter().copied().chain(hits));
+        } else {
+            self.selection.set(hits);
+        }
+        self.sync_selection_material();
+        self.status = self.selection_status();
+    }
+
+    fn node_screen_rect(
+        &self,
+        node: &lc_scene::EvaluatedNode,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+    ) -> Option<Rect> {
+        let points: Vec<Vec3> = if let Some(mesh) = node.mesh() {
+            let bounds = mesh.bounds();
+            if !bounds.is_valid() {
+                return None;
+            }
+            let corners = [
+                Vec3::new(bounds.min.x, bounds.min.y, bounds.min.z),
+                Vec3::new(bounds.max.x, bounds.min.y, bounds.min.z),
+                Vec3::new(bounds.min.x, bounds.max.y, bounds.min.z),
+                Vec3::new(bounds.max.x, bounds.max.y, bounds.min.z),
+                Vec3::new(bounds.min.x, bounds.min.y, bounds.max.z),
+                Vec3::new(bounds.max.x, bounds.min.y, bounds.max.z),
+                Vec3::new(bounds.min.x, bounds.max.y, bounds.max.z),
+                Vec3::new(bounds.max.x, bounds.max.y, bounds.max.z),
+            ];
+            corners
+                .into_iter()
+                .map(|point| node.world.transform_point3(point))
+                .collect()
+        } else {
+            vec![node.world.w_axis.truncate()]
+        };
+        let mut min = Pos2::new(f32::INFINITY, f32::INFINITY);
+        let mut max = Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let mut any = false;
+        for point in points {
+            let Some(screen) = self.project(point, rect, pixel_w, pixel_h) else {
+                continue;
+            };
+            any = true;
+            min = Pos2::new(min.x.min(screen.x), min.y.min(screen.y));
+            max = Pos2::new(max.x.max(screen.x), max.y.max(screen.y));
+        }
+        any.then(|| Rect::from_min_max(min, max).expand(3.0))
     }
 
     fn gizmo_hit(
@@ -2817,11 +5336,18 @@ impl LeopardApp {
         if self.gizmo == GizmoMode::Off {
             return None;
         }
-        let id = self.selected?;
-        let node = evaluated.node(id)?;
-        let origin = node.world.w_axis.truncate();
+        let roots = self.selection_transform_roots();
+        if roots.is_empty() {
+            return None;
+        }
+        let origin = self.selection_pivot(evaluated)?;
+        let axis_node = self
+            .selection
+            .primary()
+            .and_then(|id| evaluated.node(id))
+            .or_else(|| roots.first().and_then(|id| evaluated.node(*id)))?;
         let scale = (self.orbit.distance * 0.16).clamp(0.3, 6.0);
-        let axes = self.gizmo_axes(node.world);
+        let axes = self.gizmo_axes(axis_node.world);
         let origin_screen = self.project(origin, rect, pixel_w, pixel_h)?;
         let mut best: Option<(usize, f32, Pos2, Vec2)> = None;
         for (i, axis) in axes.iter().enumerate() {
@@ -2839,14 +5365,19 @@ impl LeopardApp {
             let t = (rel.dot(dir_n) / len).clamp(0.0, 1.0);
             let closest = origin_screen + dir * t;
             let dist = (pointer - closest).length();
-            if dist < 14.0 && t > 0.15 {
-                if best.map(|(_, d, _, _)| dist < d).unwrap_or(true) {
-                    best = Some((i, dist, end_screen, dir_n));
-                }
+            if dist < 14.0 && t > 0.15 && best.is_none_or(|(_, d, _, _)| dist < d) {
+                best = Some((i, dist, end_screen, dir_n));
             }
         }
         best.map(|(axis, _, _, screen_dir)| GizmoDrag {
-            node: id,
+            nodes: roots
+                .into_iter()
+                .filter_map(|id| {
+                    let node = self.doc.scene.get(id)?;
+                    Some((id, node.transform))
+                })
+                .collect(),
+            pivot: origin,
             mode: self.gizmo,
             axis,
             start_pointer: pointer,
@@ -2857,12 +5388,7 @@ impl LeopardApp {
                     .map(|p| (p - origin_screen).length())
                     .unwrap_or(0.0)
             },
-            world_dir: if self.gizmo_world {
-                axes[axis]
-            } else {
-                (node.local.rotation * axes[axis]).normalize_or(axes[axis])
-            },
-            start_transform: node.local,
+            world_dir: axes[axis],
         })
     }
 
@@ -2879,50 +5405,90 @@ impl LeopardApp {
     }
 
     fn apply_gizmo_drag(&mut self, drag: &mut GizmoDrag, amount: f32) {
-        let Some(node) = self.doc.scene.get(drag.node) else {
+        if drag.mode == GizmoMode::Off {
             return;
-        };
-        let parent_world = node
-            .parent
-            .map(|p| self.doc.scene.world_matrix_plain(p))
-            .unwrap_or(Mat4::IDENTITY);
+        }
         let scale = (self.orbit.distance * 0.16).clamp(0.3, 6.0);
-        let mut transform = drag.start_transform;
-        match drag.mode {
-            GizmoMode::Translate => {
-                let world_delta = drag.world_dir * (amount * scale);
-                let local_delta = parent_world.inverse().transform_vector3(world_delta);
-                transform.translation = drag.start_transform.translation + local_delta;
+        let axis = drag.world_dir.normalize_or(Vec3::Y);
+        let world_delta = match drag.mode {
+            GizmoMode::Translate => Mat4::from_translation(axis * (amount * scale)),
+            GizmoMode::Rotate => {
+                let rotation = Mat4::from_quat(Quat::from_axis_angle(axis, amount * 1.8));
+                Mat4::from_translation(drag.pivot) * rotation * Mat4::from_translation(-drag.pivot)
             }
             GizmoMode::Scale => {
                 let factor = (1.0 + amount * 1.2).clamp(0.02, 100.0);
-                let base = drag.world_dir;
-                let local_axis =
-                    (drag.start_transform.rotation.inverse() * base).normalize_or(Vec3::Y);
-                let abs = local_axis.abs();
-                if abs.x >= abs.y && abs.x >= abs.z {
-                    transform.scale.x = drag.start_transform.scale.x * factor;
-                } else if abs.y >= abs.z {
-                    transform.scale.y = drag.start_transform.scale.y * factor;
-                } else {
-                    transform.scale.z = drag.start_transform.scale.z * factor;
+                let spread = factor - 1.0;
+                let cols = [
+                    glam::Vec4::new(
+                        1.0 + spread * axis.x * axis.x,
+                        spread * axis.x * axis.y,
+                        spread * axis.x * axis.z,
+                        0.0,
+                    ),
+                    glam::Vec4::new(
+                        spread * axis.y * axis.x,
+                        1.0 + spread * axis.y * axis.y,
+                        spread * axis.y * axis.z,
+                        0.0,
+                    ),
+                    glam::Vec4::new(
+                        spread * axis.z * axis.x,
+                        spread * axis.z * axis.y,
+                        1.0 + spread * axis.z * axis.z,
+                        0.0,
+                    ),
+                    glam::Vec4::new(0.0, 0.0, 0.0, 1.0),
+                ];
+                Mat4::from_translation(drag.pivot)
+                    * Mat4::from_cols(cols[0], cols[1], cols[2], cols[3])
+                    * Mat4::from_translation(-drag.pivot)
+            }
+            GizmoMode::Off => return,
+        };
+        let mut updates = Vec::new();
+        for (id, start) in drag.nodes.clone() {
+            let Some(node) = self.doc.scene.get(id) else {
+                continue;
+            };
+            if node.locked {
+                continue;
+            }
+            let parent_world = node
+                .parent
+                .map(|p| self.doc.scene.world_matrix_plain(p))
+                .unwrap_or(Mat4::IDENTITY);
+            let transform = match drag.mode {
+                GizmoMode::Translate => {
+                    let local_delta = parent_world
+                        .inverse()
+                        .transform_vector3(axis * (amount * scale));
+                    Transform {
+                        translation: start.translation + local_delta,
+                        ..start
+                    }
                 }
-            }
-            GizmoMode::Rotate => {
-                let angle = amount * 1.8;
-                let local_axis = (drag.start_transform.rotation.inverse() * drag.world_dir)
-                    .normalize_or(Vec3::Y);
-                transform.rotation = (Quat::from_axis_angle(local_axis, angle)
-                    * drag.start_transform.rotation)
-                    .normalize();
-            }
-            GizmoMode::Off => {}
+                GizmoMode::Rotate | GizmoMode::Scale => {
+                    let start_world = parent_world * start.matrix();
+                    let new_local = parent_world.inverse() * world_delta * start_world;
+                    let (scale, rotation, translation) = new_local.to_scale_rotation_translation();
+                    Transform::new(translation, rotation, scale)
+                }
+                GizmoMode::Off => start,
+            };
+            updates.push((id, start, transform));
         }
-        if let Some(node) = self.doc.scene.get_mut(drag.node) {
-            if self.pending_transform.is_none() {
-                self.pending_transform = Some((drag.node, drag.start_transform));
+        if updates.is_empty() {
+            return;
+        }
+        let pending = self.pending_transform.get_or_insert_with(Vec::new);
+        for (id, start, transform) in updates {
+            if !pending.iter().any(|(pending_id, _)| *pending_id == id) {
+                pending.push((id, start));
             }
-            node.transform = transform;
+            if let Some(node) = self.doc.scene.get_mut(id) {
+                node.transform = transform;
+            }
         }
     }
 
@@ -2993,55 +5559,89 @@ impl LeopardApp {
             self.draw_mesh_edit_overlay(ui, rect, evaluated, pixel_w, pixel_h);
             return;
         }
-        if let Some(id) = self.selected {
-            if let Some(node) = evaluated.node(id) {
-                let origin = node.world.w_axis.truncate();
-                if let Some(origin_screen) = self.project(origin, rect, pixel_w, pixel_h) {
-                    let scale = (self.orbit.distance * 0.16).clamp(0.3, 6.0);
-                    let axes = self.gizmo_axes(node.world);
-                    let colors = [
-                        Color32::from_rgb(230, 80, 80),
-                        Color32::from_rgb(90, 210, 110),
-                        Color32::from_rgb(80, 140, 245),
-                    ];
-                    if self.gizmo != GizmoMode::Off {
-                        for (i, axis) in axes.iter().enumerate() {
-                            if let Some(end) =
-                                self.project(origin + *axis * scale, rect, pixel_w, pixel_h)
-                            {
-                                painter.line_segment(
-                                    [origin_screen, end],
-                                    egui::Stroke::new(
-                                        if self.gizmo_drag.map(|d| d.axis == i).unwrap_or(false) {
-                                            4.0
-                                        } else {
-                                            2.2
-                                        },
-                                        colors[i],
-                                    ),
-                                );
-                                if self.gizmo == GizmoMode::Translate {
-                                    painter.circle_filled(end, 4.0, colors[i]);
-                                }
-                                painter.text(
-                                    end + Vec2::new(4.0, -4.0),
-                                    egui::Align2::LEFT_BOTTOM,
-                                    ["X", "Y", "Z"][i],
-                                    egui::FontId::proportional(11.0),
+        for id in self.selection.ids() {
+            let Some(node) = evaluated.node(*id) else {
+                continue;
+            };
+            if let Some(origin) = self.project(node.world.w_axis.truncate(), rect, pixel_w, pixel_h)
+            {
+                painter.circle_filled(origin, 2.6, Color32::from_rgb(245, 248, 255));
+                painter.circle_stroke(origin, 4.2, egui::Stroke::new(1.2, theme::SELECTION));
+            }
+        }
+        if let Some(origin) = self.selection_pivot(evaluated) {
+            let axis_node = self
+                .selection
+                .primary()
+                .and_then(|id| evaluated.node(id))
+                .or_else(|| {
+                    self.selection
+                        .ids()
+                        .iter()
+                        .find_map(|id| evaluated.node(*id))
+                });
+            if let (Some(node), Some(origin_screen)) =
+                (axis_node, self.project(origin, rect, pixel_w, pixel_h))
+            {
+                let scale = (self.orbit.distance * 0.16).clamp(0.3, 6.0);
+                let axes = self.gizmo_axes(node.world);
+                let colors = [
+                    Color32::from_rgb(230, 80, 80),
+                    Color32::from_rgb(90, 210, 110),
+                    Color32::from_rgb(80, 140, 245),
+                ];
+                if self.gizmo != GizmoMode::Off {
+                    for (i, axis) in axes.iter().enumerate() {
+                        if let Some(end) =
+                            self.project(origin + *axis * scale, rect, pixel_w, pixel_h)
+                        {
+                            painter.line_segment(
+                                [origin_screen, end],
+                                egui::Stroke::new(
+                                    if self
+                                        .gizmo_drag
+                                        .as_ref()
+                                        .map(|d| d.axis == i)
+                                        .unwrap_or(false)
+                                    {
+                                        4.0
+                                    } else {
+                                        2.2
+                                    },
                                     colors[i],
-                                );
+                                ),
+                            );
+                            if self.gizmo == GizmoMode::Translate {
+                                painter.circle_filled(end, 4.0, colors[i]);
                             }
-                        }
-                        if self.gizmo == GizmoMode::Rotate {
-                            painter.circle_stroke(
-                                origin_screen,
-                                38.0,
-                                egui::Stroke::new(1.0, Color32::from_rgb(220, 180, 120)),
+                            painter.text(
+                                end + Vec2::new(4.0, -4.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                ["X", "Y", "Z"][i],
+                                egui::FontId::proportional(11.0),
+                                colors[i],
                             );
                         }
                     }
+                    if self.gizmo == GizmoMode::Rotate {
+                        painter.circle_stroke(
+                            origin_screen,
+                            38.0,
+                            egui::Stroke::new(1.0, Color32::from_rgb(220, 180, 120)),
+                        );
+                    }
                 }
             }
+        }
+        if let Some(marquee) = &self.box_select {
+            let area = Rect::from_two_pos(marquee.start, marquee.current);
+            painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(70, 120, 210, 28));
+            painter.rect_stroke(
+                area,
+                0.0,
+                egui::Stroke::new(1.0, theme::SELECTION),
+                egui::StrokeKind::Inside,
+            );
         }
     }
 }
@@ -3136,7 +5736,93 @@ fn point_in_polygon(p: Pos2, polygon: &[Pos2]) -> bool {
     inside
 }
 
-fn weld_selected_points(mesh: &Mesh, selected: &[u32]) -> Mesh {
+struct SkinTarget {
+    vertex_count: usize,
+    joint_count: usize,
+    skin: Option<Skin>,
+}
+
+fn skin_binding_candidate<'a>(node: &Node, target: &'a SkinTarget) -> Option<&'a Skin> {
+    target
+        .skin
+        .as_ref()
+        .filter(|skin| node.skin.as_ref() != Some(*skin))
+}
+
+fn skin_binding_ready(node: &Node, target: &SkinTarget) -> bool {
+    skin_binding_candidate(node, target).is_some()
+}
+
+fn skin_unbind_ready(node: &Node) -> bool {
+    node.skin.is_some()
+}
+
+fn modifier_applies_to(node: &Node, modifier: &Modifier) -> bool {
+    match modifier {
+        Modifier::Sweep { .. } => matches!(node.kind, NodeKind::Spline { .. }),
+        Modifier::Lathe { .. } => true,
+        _ => node.is_mesh(),
+    }
+}
+
+fn mesh_transform_axis(
+    mesh: &Mesh,
+    affected: &HashSet<u32>,
+    space: MeshTransformSpace,
+    axis: usize,
+    rotation: Quat,
+) -> Vec3 {
+    match space {
+        MeshTransformSpace::Local => axis_vector(axis),
+        MeshTransformSpace::World => (rotation.inverse() * axis_vector(axis)).normalize_or(Vec3::Y),
+        MeshTransformSpace::Normal => {
+            let mut normal = Vec3::ZERO;
+            for (fi, poly) in mesh.polygons.iter().enumerate() {
+                if poly.corners.iter().any(|c| affected.contains(&c.point)) {
+                    normal += mesh.face_normal(fi);
+                }
+            }
+            normal.normalize_or(Vec3::Y)
+        }
+    }
+}
+
+fn mesh_transform_would_change(
+    mesh: &Mesh,
+    affected: &HashSet<u32>,
+    mode: MeshTransformMode,
+    local_axis: Vec3,
+    value: f32,
+) -> bool {
+    let center = affected
+        .iter()
+        .filter_map(|p| mesh.positions.get(*p as usize).copied())
+        .sum::<Vec3>()
+        / affected.len() as f32;
+    match mode {
+        MeshTransformMode::Move => value.abs() > 1e-6,
+        MeshTransformMode::Rotate => {
+            value.rem_euclid(360.0).abs() > 1e-6
+                && affected.iter().any(|p| {
+                    mesh.positions
+                        .get(*p as usize)
+                        .map(|position| (*position - center).length_squared() > 1e-12)
+                        .unwrap_or(false)
+                })
+        }
+        MeshTransformMode::Scale => {
+            value.abs() > 1e-6
+                && affected.iter().any(|p| {
+                    mesh.positions
+                        .get(*p as usize)
+                        .map(|position| (*position - center).dot(local_axis).abs() > 1e-6)
+                        .unwrap_or(false)
+                })
+        }
+    }
+}
+
+fn selected_valid_points(mesh: &Mesh, selected: &[u32]) -> Vec<u32> {
     let mut unique: Vec<u32> = selected
         .iter()
         .copied()
@@ -3144,6 +5830,34 @@ fn weld_selected_points(mesh: &Mesh, selected: &[u32]) -> Mesh {
         .collect();
     unique.sort_unstable();
     unique.dedup();
+    unique
+}
+
+/// The cut plane must strictly cross a polygon; that is exactly when
+/// `lc_geom::ring_cut` is guaranteed to change the mesh.
+fn ring_cut_would_split(mesh: &Mesh, axis: usize, offset: f32) -> bool {
+    let normal = match axis {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
+    };
+    mesh.polygons.iter().any(|poly| {
+        let mut front = false;
+        let mut back = false;
+        for corner in &poly.corners {
+            let Some(position) = mesh.positions.get(corner.point as usize) else {
+                continue;
+            };
+            let distance = position.dot(normal) - offset;
+            front |= distance > 1e-6;
+            back |= distance < -1e-6;
+        }
+        front && back
+    })
+}
+
+fn weld_selected_points(mesh: &Mesh, selected: &[u32]) -> Mesh {
+    let unique = selected_valid_points(mesh, selected);
     if unique.len() < 2 {
         return mesh.clone();
     }
@@ -3166,6 +5880,21 @@ fn weld_selected_points(mesh: &Mesh, selected: &[u32]) -> Mesh {
     out.remove_degenerate_polygons();
     out.compact_points();
     out
+}
+
+/// Orders the selected edges into exactly the two clean closed loops Bridge
+/// needs. The menu enablement and the handler both call this, so they cannot
+/// disagree about whether a bridge is possible.
+fn selected_bridge_loops(mesh: &Mesh, selected: &[u32]) -> Result<(Vec<u32>, Vec<u32>), String> {
+    let loops = selected_edge_loops(mesh, selected)?;
+    match loops.as_slice() {
+        [a, b] if a.len() == b.len() => Ok((a.clone(), b.clone())),
+        [_, _] => Err("the two loops must have the same number of points".into()),
+        other => Err(format!(
+            "select exactly two closed edge loops (found {})",
+            other.len()
+        )),
+    }
 }
 
 fn selected_edge_loops(mesh: &Mesh, selected: &[u32]) -> Result<Vec<Vec<u32>>, String> {
@@ -3297,6 +6026,26 @@ mod mesh_edit_tests {
                 Pos2::new(0.0, 1.0)
             ]
         ));
+    }
+
+    #[test]
+    fn bridge_rejects_two_loops_that_cannot_pair() {
+        let mesh = Mesh::from_polygons(
+            "triangle and quad",
+            vec![
+                Vec3::ZERO,
+                Vec3::X,
+                Vec3::Y,
+                Vec3::new(0.0, 0.0, 3.0),
+                Vec3::new(1.0, 0.0, 3.0),
+                Vec3::new(1.0, 1.0, 3.0),
+                Vec3::new(0.0, 1.0, 3.0),
+            ],
+            vec![vec![0, 1, 2], vec![3, 4, 5, 6]],
+        );
+        let selected: Vec<u32> = (0..mesh.edges().len() as u32).collect();
+        let error = selected_bridge_loops(&mesh, &selected).expect_err("unequal loops");
+        assert!(error.contains("same number of points"), "{error}");
     }
 }
 

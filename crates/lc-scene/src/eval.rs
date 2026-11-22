@@ -181,7 +181,7 @@ impl Document {
                     .and_then(|p| worlds.get(&p).copied())
                     .unwrap_or(Mat4::IDENTITY);
                 let mut local = locals.get(id).copied().unwrap_or(node.transform);
-                for tag in &node.tags {
+                for (tag_index, tag) in node.tags.iter().enumerate() {
                     match tag {
                         Tag::LookAt { target, up } => {
                             if let Some(target_world) = worlds.get(target) {
@@ -211,6 +211,17 @@ impl Document {
                                     source_world.transform_point3(Vec3::ZERO) + *offset;
                                 let local_target =
                                     parent_world.inverse().transform_point3(target_world);
+                                let weight = node
+                                    .tag_animations
+                                    .get(&(tag_index as u32))
+                                    .and_then(|clip| {
+                                        clip.sample(AnimProperty::CopyLocationWeight, time)
+                                    })
+                                    .or_else(|| {
+                                        node.animation
+                                            .sample(AnimProperty::CopyLocationWeight, time)
+                                    })
+                                    .unwrap_or(*weight);
                                 local.translation =
                                     local.translation.lerp(local_target, weight.clamp(0.0, 1.0));
                             }
@@ -509,7 +520,7 @@ pub fn aim_at(eye: Vec3, target: Vec3, up: Vec3) -> Quat {
 mod tests {
     use super::*;
     use crate::{GeometrySource, Primitive, Skin};
-    use lc_anim::Interpolation;
+    use lc_anim::{AnimationClip, Interpolation};
 
     #[test]
     fn demo_evaluates_to_renderable_scene() {
@@ -534,6 +545,46 @@ mod tests {
         let yb = b.node(id).unwrap().world.w_axis.y;
         assert!((ya - 1.05).abs() < 1e-4);
         assert!(yb > ya + 0.5);
+    }
+
+    #[test]
+    fn animated_copy_location_weight_is_sampled_during_evaluation() {
+        let mut doc = Document::demo();
+        let cube = doc.scene.find_by_name("Cube").unwrap();
+        let target = doc.scene.find_by_name("Sphere").unwrap();
+        {
+            let node = doc.scene.get_mut(cube).unwrap();
+            node.tags
+                .retain(|tag| !matches!(tag, Tag::CopyLocation { .. }));
+            node.tags.push(Tag::CopyLocation {
+                source: target,
+                offset: Vec3::ZERO,
+                weight: 0.0,
+            });
+            node.animation = AnimationClip::default();
+            node.animation.set_key(
+                AnimProperty::CopyLocationWeight,
+                0.0,
+                0.0,
+                Interpolation::Linear,
+            );
+            node.animation.set_key(
+                AnimProperty::CopyLocationWeight,
+                1.0,
+                1.0,
+                Interpolation::Linear,
+            );
+        }
+        let scene0 = doc.evaluate(0.0);
+        let scene1 = doc.evaluate(1.0);
+        let target_pos = scene1.node(target).unwrap().world.w_axis.truncate();
+        let pos0 = scene0.node(cube).unwrap().world.w_axis.truncate();
+        let pos1 = scene1.node(cube).unwrap().world.w_axis.truncate();
+        assert!((pos0 - pos1).length() > 0.3);
+        assert!(
+            (pos1 - target_pos).length() < 0.05,
+            "pos1 {pos1:?} target {target_pos:?}"
+        );
     }
 
     #[test]

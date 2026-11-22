@@ -480,17 +480,13 @@ pub fn lathe(profile: &[Vec2], segments: u32, angle_deg: f32, caps: bool) -> Mes
     let segments = segments.clamp(3, 512);
     let full = (angle_deg.abs() - 360.0).abs() < 1e-3;
     let sweep = angle_deg.to_radians();
-    let cols = if full { segments + 1 } else { segments + 1 };
+    let cols = segments + 1;
     let mut m = Mesh::new("Lathe");
     let mut grid: Vec<Vec<u32>> = Vec::new();
     for (pi, p) in profile.iter().enumerate() {
         let mut row = Vec::new();
         for s in 0..cols {
-            let t = if full {
-                s as f32 / segments as f32
-            } else {
-                s as f32 / segments as f32
-            };
+            let t = s as f32 / segments as f32;
             let a = sweep * t;
             let pos = Vec3::new(p.x * a.cos(), p.y, -p.x * a.sin());
             row.push(m.add_point(pos));

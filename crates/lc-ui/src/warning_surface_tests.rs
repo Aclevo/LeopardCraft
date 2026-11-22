@@ -39,7 +39,10 @@ impl Drop for TestRoot {
 fn test_app(recovery_dir: &Path, autosave_interval: Duration) -> LeopardApp {
     let doc = Document::demo();
     let fps = doc.settings.fps.max(1.0);
-    let selected = doc.scene.find_by_name("Cube");
+    let mut selection = Selection::default();
+    if let Some(id) = doc.scene.find_by_name("Cube") {
+        selection.select_one(id);
+    }
     let mut lifecycle = DocumentLifecycle::new(
         RecoveryStore::at(recovery_dir.to_path_buf()),
         autosave_interval,
@@ -54,10 +57,17 @@ fn test_app(recovery_dir: &Path, autosave_interval: Duration) -> LeopardApp {
             looping: true,
             ..Default::default()
         },
-        selected,
+        selection,
         selected_material: Some(0),
         selected_shader_node: None,
         selected_uv: None,
+        anim_target: None,
+        selected_keys: Vec::new(),
+        curve_key_drag: None,
+        curve_box_select: None,
+        curve_clipboard: CurveClipboard::default(),
+        selected_curve_channel: None,
+        native_paste_pending: false,
         doc,
         history: History::new(200),
         editor_view: EditorView::Scene3d,
@@ -97,9 +107,11 @@ fn test_app(recovery_dir: &Path, autosave_interval: Duration) -> LeopardApp {
         pending_shape: None,
         pending_material: None,
         gizmo_drag: None,
+        box_select: None,
         mesh_edit: false,
         mesh_select_mode: MeshSelectMode::Polygons,
         mesh_selected: Vec::new(),
+        mesh_components: BTreeMap::new(),
         mesh_transform: MeshTransformMode::Move,
         mesh_space: MeshTransformSpace::World,
         mesh_axis: 1,
@@ -109,6 +121,10 @@ fn test_app(recovery_dir: &Path, autosave_interval: Duration) -> LeopardApp {
         mesh_extrude_individual: false,
         last_viewport_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
         last_viewport_size: Vec2::splat(100.0),
+        object_row_rects: Vec::new(),
+        object_row_highlights: Vec::new(),
+        object_row_icons: Vec::new(),
+        object_row_flags: Vec::new(),
     }
 }
 

@@ -15,6 +15,12 @@ pub trait Command: Send {
     fn label(&self) -> String;
     fn apply(&mut self, doc: &mut Document);
     fn undo(&mut self, doc: &mut Document);
+
+    /// Optional editor metadata carried by a command, so UI state such as a
+    /// key selection can be restored alongside the document edit.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -58,6 +64,18 @@ impl History {
         let label = command.label();
         self.undo_stack.push(command);
         Some(label)
+    }
+
+    /// The command at the top of the undo stack. After a redo, this is the
+    /// command that was just reapplied.
+    pub fn undo_top(&self) -> Option<&dyn Command> {
+        self.undo_stack.last().map(|command| command.as_ref())
+    }
+
+    /// The command at the top of the redo stack. After an undo, this is the
+    /// command that was just reversed.
+    pub fn redo_top(&self) -> Option<&dyn Command> {
+        self.redo_stack.last().map(|command| command.as_ref())
     }
 
     pub fn can_undo(&self) -> bool {
@@ -200,6 +218,66 @@ impl Command for SetTransformCmd {
     }
 }
 
+/// One undo step for a shared-pivot or multi-object transform gesture.
+pub struct SetTransformsCmd {
+    pub edits: Vec<(NodeId, Transform, Transform)>,
+}
+
+impl Command for SetTransformsCmd {
+    fn label(&self) -> String {
+        match self.edits.len() {
+            0 | 1 => "Transform".into(),
+            count => format!("Transform {count} Objects"),
+        }
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        for (id, _, after) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                n.transform = *after;
+            }
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        for (id, before, _) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                n.transform = *before;
+            }
+        }
+    }
+}
+
+/// One undo step for a batch visibility, render flag or lock change.
+pub struct SetNodesPropsCmd {
+    pub edits: Vec<(NodeId, NodeProps, NodeProps)>,
+}
+
+impl Command for SetNodesPropsCmd {
+    fn label(&self) -> String {
+        match self.edits.len() {
+            0 | 1 => "Edit Properties".into(),
+            count => format!("Edit Properties on {count} Objects"),
+        }
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        for (id, _, after) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                after.apply(n);
+            }
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        for (id, before, _) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                before.apply(n);
+            }
+        }
+    }
+}
+
 pub struct RenameNodeCmd {
     pub id: NodeId,
     pub before: String,
@@ -307,6 +385,41 @@ impl Command for SetShapeCmd {
     }
 }
 
+/// One undo step for a shape change that covers every object in a shared
+/// selection. Single-object edits keep the historic `"Edit Geometry"` label.
+pub struct SetShapesCmd {
+    pub edits: Vec<(NodeId, Shape, Shape)>,
+}
+
+impl Command for SetShapesCmd {
+    fn label(&self) -> String {
+        match self.edits.len() {
+            0 | 1 => "Edit Geometry".into(),
+            count => format!("Edit Geometry on {count} Objects"),
+        }
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        for (id, _, after) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                n.kind = after.kind.clone();
+                n.modifiers = after.modifiers.clone();
+                n.skin = after.skin.clone();
+            }
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        for (id, before, _) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                n.kind = before.kind.clone();
+                n.modifiers = before.modifiers.clone();
+                n.skin = before.skin.clone();
+            }
+        }
+    }
+}
+
 pub struct SetAnimationCmd {
     pub id: NodeId,
     pub before: AnimationClip,
@@ -334,6 +447,92 @@ impl Command for SetAnimationCmd {
     fn undo(&mut self, doc: &mut Document) {
         if let Some(n) = doc.scene.get_mut(self.id) {
             n.animation = self.before.clone();
+        }
+    }
+}
+
+/// One undo step for a tag-scope animation clip.
+pub struct SetTagAnimationCmd {
+    pub node: NodeId,
+    pub tag: usize,
+    pub before: AnimationClip,
+    pub after: AnimationClip,
+}
+
+impl SetTagAnimationCmd {
+    pub fn new(doc: &Document, node: NodeId, tag: usize, after: AnimationClip) -> Option<Self> {
+        let before = doc
+            .scene
+            .get(node)?
+            .tag_animations
+            .get(&(tag as u32))
+            .cloned()
+            .unwrap_or_default();
+        Some(Self {
+            node,
+            tag,
+            before,
+            after,
+        })
+    }
+}
+
+impl Command for SetTagAnimationCmd {
+    fn label(&self) -> String {
+        "Edit Tag Animation".into()
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        let Some(node) = doc.scene.get_mut(self.node) else {
+            return;
+        };
+        if self.after.is_empty() {
+            node.tag_animations.remove(&(self.tag as u32));
+        } else {
+            node.tag_animations
+                .insert(self.tag as u32, self.after.clone());
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        let Some(node) = doc.scene.get_mut(self.node) else {
+            return;
+        };
+        if self.before.is_empty() {
+            node.tag_animations.remove(&(self.tag as u32));
+        } else {
+            node.tag_animations
+                .insert(self.tag as u32, self.before.clone());
+        }
+    }
+}
+
+/// One undo step for keying transforms on a shared multi-object selection.
+pub struct SetAnimationsCmd {
+    pub edits: Vec<(NodeId, AnimationClip, AnimationClip)>,
+}
+
+impl Command for SetAnimationsCmd {
+    fn label(&self) -> String {
+        match self.edits.len() {
+            0 | 1 => "Edit Animation".into(),
+            count => format!("Edit Animation on {count} Objects"),
+        }
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        for (id, _, after) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                n.animation = after.clone();
+            }
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        for (id, before, _) in &self.edits {
+            if let Some(n) = doc.scene.get_mut(*id) {
+                n.animation = before.clone();
+            }
         }
     }
 }

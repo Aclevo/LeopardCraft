@@ -8,6 +8,8 @@ use crate::theme;
 
 impl LeopardApp {
     pub(super) fn shell(&mut self, root: &mut egui::Ui) {
+        #[cfg(test)]
+        ui_test_support::clear_menu_hits();
         let menu_frame = egui::Frame::new()
             .fill(theme::MENU)
             .inner_margin(egui::Margin::symmetric(4, 2));
@@ -194,7 +196,9 @@ impl LeopardApp {
                         self.orbit.distance = (self.orbit.distance * 0.86).max(0.2);
                         self.view_label = "Viewport".into();
                     }
-                    if icons::icon_button(ui, Icon::Fit, "Frame selection", true).clicked() {
+                    let frame_button = icons::icon_button(ui, Icon::Fit, "Frame selection", true);
+                    record_menu_item_state("toolbar:Frame Selected", &frame_button, true);
+                    if frame_button.clicked() {
                         self.frame_selected();
                     }
                     if icons::icon_button(ui, Icon::ZoomOut, "Zoom out", true).clicked() {
@@ -242,65 +246,86 @@ impl LeopardApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let mesh_ready = self.selected_is_mesh();
+        let mesh_ready = self.mesh_mode_ready();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
             if icons::icon_button(ui, Icon::Select, "Select / object mode", true).clicked() {
                 self.leave_mesh_edit();
             }
-            if icons::icon_button_toggle(
+            let move_button = icons::icon_button_toggle(
                 ui,
                 Icon::Move,
                 "Move gizmo (W)",
                 self.gizmo == GizmoMode::Translate,
                 true,
-            )
-            .clicked()
-            {
+            );
+            record_menu_item_state("toolbar:Move", &move_button, true);
+            if move_button.clicked() {
                 self.gizmo = GizmoMode::Translate;
             }
-            if icons::icon_button_toggle(
+            let rotate_button = icons::icon_button_toggle(
                 ui,
                 Icon::Rotate,
                 "Rotate gizmo (E)",
                 self.gizmo == GizmoMode::Rotate,
                 true,
-            )
-            .clicked()
-            {
+            );
+            record_menu_item_state("toolbar:Rotate", &rotate_button, true);
+            if rotate_button.clicked() {
                 self.gizmo = GizmoMode::Rotate;
             }
-            if icons::icon_button_toggle(
+            let scale_button = icons::icon_button_toggle(
                 ui,
                 Icon::Scale,
                 "Scale gizmo (R)",
                 self.gizmo == GizmoMode::Scale,
                 true,
-            )
-            .clicked()
-            {
+            );
+            record_menu_item_state("toolbar:Scale", &scale_button, true);
+            if scale_button.clicked() {
                 self.gizmo = GizmoMode::Scale;
             }
             theme::toolbar_sep(ui);
-            if icons::icon_button_toggle(ui, Icon::ObjectMode, "Object mode", !self.mesh_edit, true)
-                .clicked()
-            {
+            let object_mode_button = icons::icon_button_toggle(
+                ui,
+                Icon::ObjectMode,
+                "Object mode",
+                !self.mesh_edit,
+                true,
+            );
+            record_menu_item_state("toolbar:Object Mode", &object_mode_button, true);
+            if object_mode_button.clicked() {
                 self.leave_mesh_edit();
             }
-            for (icon, mode, tip) in [
-                (Icon::PointMode, MeshSelectMode::Points, "Point mode"),
-                (Icon::EdgeMode, MeshSelectMode::Edges, "Edge mode"),
-                (Icon::PolygonMode, MeshSelectMode::Polygons, "Polygon mode"),
+            for (icon, mode, tip, key) in [
+                (
+                    Icon::PointMode,
+                    MeshSelectMode::Points,
+                    "Point mode",
+                    "toolbar:Point Mode",
+                ),
+                (
+                    Icon::EdgeMode,
+                    MeshSelectMode::Edges,
+                    "Edge mode",
+                    "toolbar:Edge Mode",
+                ),
+                (
+                    Icon::PolygonMode,
+                    MeshSelectMode::Polygons,
+                    "Polygon mode",
+                    "toolbar:Polygon Mode",
+                ),
             ] {
-                if icons::icon_button_toggle(
+                let button = icons::icon_button_toggle(
                     ui,
                     icon,
                     tip,
                     self.mesh_edit && self.mesh_select_mode == mode,
                     mesh_ready,
-                )
-                .clicked()
-                {
+                );
+                record_menu_item_state(key, &button, mesh_ready);
+                if button.clicked() {
                     self.set_mesh_mode(mode);
                 }
             }
@@ -372,9 +397,18 @@ impl LeopardApp {
                 });
             }
             theme::toolbar_sep(ui);
-            if icons::icon_button(ui, Icon::Subdivide, "Add subdivision modifier", mesh_ready)
-                .clicked()
-            {
+            let subdivide_button = icons::icon_button(
+                ui,
+                Icon::Subdivide,
+                "Add subdivision modifier",
+                self.selection_has_mesh(),
+            );
+            record_menu_item_state(
+                "toolbar:Add Subdivision",
+                &subdivide_button,
+                self.selection_has_mesh(),
+            );
+            if subdivide_button.clicked() {
                 self.add_subdivision();
             }
             theme::toolbar_sep(ui);
@@ -448,15 +482,14 @@ impl LeopardApp {
                     self.request_action(ui.ctx(), PendingAction::Quit);
                 }
             });
-            ui.menu_button("Edit", |ui| {
+            recorded_submenu(ui, "menu:Edit", "Edit", |ui| {
                 ui.set_min_width(190.0);
                 let undo_label = self
                     .history
                     .undo_label()
                     .map(|label| format!("Undo {label}"))
                     .unwrap_or_else(|| "Undo".into());
-                if ui
-                    .add_enabled(self.history.can_undo(), egui::Button::new(undo_label))
+                if recorded_button_enabled(ui, "Edit:Undo", self.history.can_undo(), undo_label)
                     .clicked()
                 {
                     self.undo();
@@ -466,59 +499,108 @@ impl LeopardApp {
                     .redo_label()
                     .map(|label| format!("Redo {label}"))
                     .unwrap_or_else(|| "Redo".into());
-                if ui
-                    .add_enabled(self.history.can_redo(), egui::Button::new(redo_label))
+                if recorded_button_enabled(ui, "Edit:Redo", self.history.can_redo(), redo_label)
                     .clicked()
                 {
                     self.redo();
                 }
                 ui.separator();
-                if ui
-                    .add_enabled(self.selected.is_some(), egui::Button::new("Duplicate"))
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Edit:Duplicate",
+                    !self.selection.is_empty(),
+                    "Duplicate",
+                )
+                .clicked()
                 {
                     self.duplicate_selected();
                 }
-                if ui
-                    .add_enabled(self.selected.is_some(), egui::Button::new("Delete"))
+                if recorded_button_enabled(ui, "Edit:Delete", !self.selection.is_empty(), "Delete")
                     .clicked()
                 {
                     self.delete_selected();
                 }
             });
-            ui.menu_button("Selection", |ui| {
+            recorded_submenu(ui, "menu:Selection", "Selection", |ui| {
                 ui.set_min_width(190.0);
-                if ui.button("Object Mode").clicked() {
+                if recorded_button(ui, "Selection:Object Mode", "Object Mode").clicked() {
                     self.leave_mesh_edit();
                 }
-                if ui.button("Point Mode").clicked() {
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Point Mode",
+                    self.mesh_mode_ready(),
+                    "Point Mode",
+                )
+                .clicked()
+                {
                     self.set_mesh_mode(MeshSelectMode::Points);
                 }
-                if ui.button("Edge Mode").clicked() {
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Edge Mode",
+                    self.mesh_mode_ready(),
+                    "Edge Mode",
+                )
+                .clicked()
+                {
                     self.set_mesh_mode(MeshSelectMode::Edges);
                 }
-                if ui.button("Polygon Mode").clicked() {
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Polygon Mode",
+                    self.mesh_mode_ready(),
+                    "Polygon Mode",
+                )
+                .clicked()
+                {
                     self.set_mesh_mode(MeshSelectMode::Polygons);
                 }
                 ui.separator();
-                if ui.button("Select All Components").clicked() {
+                if recorded_button(ui, "Selection:Select All Objects", "Select All Objects")
+                    .clicked()
+                {
+                    self.select_all_objects();
+                }
+                if recorded_button(ui, "Selection:Deselect All Objects", "Deselect All Objects")
+                    .clicked()
+                {
+                    self.deselect_all_objects();
+                }
+                ui.separator();
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Select All Components",
+                    self.mesh_component_selection_ready(),
+                    "Select All Components",
+                )
+                .clicked()
+                {
                     self.perform_mesh_action(MeshAction::SelectAll);
                 }
-                if ui.button("Deselect All Components").clicked() {
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Deselect All Components",
+                    self.mesh_component_selection_ready(),
+                    "Deselect All Components",
+                )
+                .clicked()
+                {
                     self.perform_mesh_action(MeshAction::SelectNone);
                 }
                 ui.separator();
-                if ui
-                    .add_enabled(
-                        self.selected.is_some(),
-                        egui::Button::new("Convert to Editable Mesh"),
-                    )
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Convert to Editable Mesh",
+                    self.selection_convert_ready(),
+                    "Convert to Editable Mesh",
+                )
+                .clicked()
                 {
                     self.make_selected_editable();
                 }
             });
-            ui.menu_button("Objects", |ui| {
+            recorded_submenu(ui, "menu:Objects", "Objects", |ui| {
                 ui.set_min_width(190.0);
                 if ui.button("Box").clicked() {
                     self.add_primitive(Primitive::Box {
@@ -571,6 +653,78 @@ impl LeopardApp {
                 if ui.button("Folder / Null").clicked() {
                     self.add_null();
                 }
+                if recorded_button_enabled(
+                    ui,
+                    "Objects:Group Selection",
+                    self.selection.len() > 1,
+                    "Group Selection",
+                )
+                .clicked()
+                {
+                    self.group_selection();
+                }
+                recorded_submenu(ui, "Objects:Selected Flags", "Selected Flags", |ui| {
+                    if recorded_button_enabled(
+                        ui,
+                        "Objects:Flags:Show Selected",
+                        self.selection_flag_ready(NodeFlag::Visible, true),
+                        "Show Selected",
+                    )
+                    .clicked()
+                    {
+                        self.set_selection_flag(NodeFlag::Visible, true);
+                    }
+                    if recorded_button_enabled(
+                        ui,
+                        "Objects:Flags:Hide Selected",
+                        self.selection_flag_ready(NodeFlag::Visible, false),
+                        "Hide Selected",
+                    )
+                    .clicked()
+                    {
+                        self.set_selection_flag(NodeFlag::Visible, false);
+                    }
+                    if recorded_button_enabled(
+                        ui,
+                        "Objects:Flags:Enable Render on Selected",
+                        self.selection_flag_ready(NodeFlag::Renderable, true),
+                        "Enable Render on Selected",
+                    )
+                    .clicked()
+                    {
+                        self.set_selection_flag(NodeFlag::Renderable, true);
+                    }
+                    if recorded_button_enabled(
+                        ui,
+                        "Objects:Flags:Disable Render on Selected",
+                        self.selection_flag_ready(NodeFlag::Renderable, false),
+                        "Disable Render on Selected",
+                    )
+                    .clicked()
+                    {
+                        self.set_selection_flag(NodeFlag::Renderable, false);
+                    }
+                    if recorded_button_enabled(
+                        ui,
+                        "Objects:Flags:Lock Selected",
+                        self.selection_flag_ready(NodeFlag::Locked, true),
+                        "Lock Selected",
+                    )
+                    .clicked()
+                    {
+                        self.set_selection_flag(NodeFlag::Locked, true);
+                    }
+                    if recorded_button_enabled(
+                        ui,
+                        "Objects:Flags:Unlock Selected",
+                        self.selection_flag_ready(NodeFlag::Locked, false),
+                        "Unlock Selected",
+                    )
+                    .clicked()
+                    {
+                        self.set_selection_flag(NodeFlag::Locked, false);
+                    }
+                });
                 if ui.button("Joint").clicked() {
                     self.add_joint();
                 }
@@ -587,124 +741,205 @@ impl LeopardApp {
                     });
                 }
                 ui.separator();
-                if ui
-                    .add_enabled(
-                        self.selected.is_some(),
-                        egui::Button::new("Convert to Editable Mesh"),
-                    )
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Objects:Convert to Editable Mesh",
+                    self.selection_convert_ready(),
+                    "Convert to Editable Mesh",
+                )
+                .clicked()
                 {
                     self.make_selected_editable();
                 }
-                if ui
-                    .add_enabled(
-                        self.selected.is_some(),
-                        egui::Button::new("Add Subdivision"),
-                    )
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Objects:Add Subdivision",
+                    self.selection_has_mesh(),
+                    "Add Subdivision",
+                )
+                .clicked()
                 {
                     self.add_subdivision();
                 }
-                if ui
-                    .add_enabled(
-                        self.selected.is_some(),
-                        egui::Button::new("Add Boolean Subtract"),
-                    )
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Objects:Add Boolean Subtract",
+                    self.boolean_ready(),
+                    "Add Boolean Subtract",
+                )
+                .clicked()
                 {
                     self.add_boolean();
                 }
             });
-            ui.menu_button("Tools", |ui| {
+            recorded_submenu(ui, "menu:Tools", "Tools", |ui| {
                 ui.set_min_width(190.0);
-                if ui
-                    .selectable_label(self.gizmo == GizmoMode::Translate, "Move")
+                if recorded_selectable(ui, "Tools:Move", self.gizmo == GizmoMode::Translate, "Move")
                     .clicked()
                 {
                     self.gizmo = GizmoMode::Translate;
                 }
-                if ui
-                    .selectable_label(self.gizmo == GizmoMode::Rotate, "Rotate")
-                    .clicked()
+                if recorded_selectable(
+                    ui,
+                    "Tools:Rotate",
+                    self.gizmo == GizmoMode::Rotate,
+                    "Rotate",
+                )
+                .clicked()
                 {
                     self.gizmo = GizmoMode::Rotate;
                 }
-                if ui
-                    .selectable_label(self.gizmo == GizmoMode::Scale, "Scale")
+                if recorded_selectable(ui, "Tools:Scale", self.gizmo == GizmoMode::Scale, "Scale")
                     .clicked()
                 {
                     self.gizmo = GizmoMode::Scale;
                 }
-                if ui
-                    .selectable_label(self.gizmo == GizmoMode::Off, "No Gizmo")
-                    .clicked()
+                if recorded_selectable(
+                    ui,
+                    "Tools:No Gizmo",
+                    self.gizmo == GizmoMode::Off,
+                    "No Gizmo",
+                )
+                .clicked()
                 {
                     self.gizmo = GizmoMode::Off;
                 }
                 ui.separator();
-                if ui.button("Frame Selected (F)").clicked() {
+                if recorded_button(ui, "Tools:Frame Selected", "Frame Selected (F)").clicked() {
                     self.frame_selected();
                 }
                 ui.separator();
-                let mesh_ready = self.mesh_edit && self.selected.is_some();
-                if ui
-                    .add_enabled(mesh_ready, egui::Button::new("Extrude"))
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Extrude",
+                    self.mesh_topology_ready(MeshSelectMode::Polygons, 1),
+                    "Extrude",
+                )
+                .clicked()
                 {
                     self.perform_mesh_action(MeshAction::Extrude);
                 }
-                if ui
-                    .add_enabled(mesh_ready, egui::Button::new("Inset"))
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Inset",
+                    self.mesh_topology_ready(MeshSelectMode::Polygons, 1),
+                    "Inset",
+                )
+                .clicked()
                 {
                     self.perform_mesh_action(MeshAction::Inset);
                 }
-                if ui
-                    .add_enabled(mesh_ready, egui::Button::new("Bevel"))
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Bevel",
+                    self.mesh_topology_ready(MeshSelectMode::Polygons, 1),
+                    "Bevel",
+                )
+                .clicked()
                 {
                     self.perform_mesh_action(MeshAction::Bevel);
                 }
-                if ui
-                    .add_enabled(mesh_ready, egui::Button::new("Ring Cut"))
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Ring Cut",
+                    self.mesh_ring_cut_ready(),
+                    "Ring Cut",
+                )
+                .clicked()
                 {
                     self.perform_mesh_action(MeshAction::RingCut);
                 }
-                if ui
-                    .add_enabled(mesh_ready, egui::Button::new("Weld Points"))
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Weld Points",
+                    self.mesh_weld_ready(),
+                    "Weld Points",
+                )
+                .clicked()
                 {
                     self.perform_mesh_action(MeshAction::Weld);
                 }
-                if ui
-                    .add_enabled(mesh_ready, egui::Button::new("Bridge Loops"))
-                    .clicked()
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Bridge Loops",
+                    self.mesh_bridge_ready(),
+                    "Bridge Loops",
+                )
+                .clicked()
                 {
                     self.perform_mesh_action(MeshAction::Bridge);
                 }
                 ui.separator();
-                ui.menu_button("UV Projection", |ui| {
+                recorded_submenu(ui, "Tools:UV Projection", "UV Projection", |ui| {
                     ui.set_min_width(190.0);
-                    if ui.button("Planar").clicked() {
+                    if recorded_button_enabled(
+                        ui,
+                        "Tools:UV Projection:Planar",
+                        self.selection_uv_ready(),
+                        "Planar",
+                    )
+                    .clicked()
+                    {
                         self.apply_uv_op(UvOp::Planar);
                     }
-                    if ui.button("Box").clicked() {
+                    if recorded_button_enabled(
+                        ui,
+                        "Tools:UV Projection:Box",
+                        self.selection_uv_ready(),
+                        "Box",
+                    )
+                    .clicked()
+                    {
                         self.apply_uv_op(UvOp::Box);
                     }
-                    if ui.button("Cylindrical").clicked() {
+                    if recorded_button_enabled(
+                        ui,
+                        "Tools:UV Projection:Cylindrical",
+                        self.selection_uv_ready(),
+                        "Cylindrical",
+                    )
+                    .clicked()
+                    {
                         self.apply_uv_op(UvOp::Cylindrical);
                     }
-                    if ui.button("Spherical").clicked() {
+                    if recorded_button_enabled(
+                        ui,
+                        "Tools:UV Projection:Spherical",
+                        self.selection_uv_ready(),
+                        "Spherical",
+                    )
+                    .clicked()
+                    {
                         self.apply_uv_op(UvOp::Spherical);
                     }
-                    if ui.button("Automatic Unwrap").clicked() {
+                    if recorded_button_enabled(
+                        ui,
+                        "Tools:UV Projection:Automatic Unwrap",
+                        self.selection_uv_ready(),
+                        "Automatic Unwrap",
+                    )
+                    .clicked()
+                    {
                         self.apply_uv_op(UvOp::Unwrap);
                     }
-                    if ui.button("Relax").clicked() {
+                    if recorded_button_enabled(
+                        ui,
+                        "Tools:UV Projection:Relax",
+                        self.selection_uv_ready(),
+                        "Relax",
+                    )
+                    .clicked()
+                    {
                         self.apply_uv_op(UvOp::Relax);
                     }
-                    if ui.button("Normalize").clicked() {
+                    if recorded_button_enabled(
+                        ui,
+                        "Tools:UV Projection:Normalize",
+                        self.selection_uv_ready(),
+                        "Normalize",
+                    )
+                    .clicked()
+                    {
                         self.apply_uv_op(UvOp::Normalize);
                     }
                 });
@@ -741,7 +976,7 @@ impl LeopardApp {
                     self.inspector_tab = InspectorTab::Render;
                 }
             });
-            ui.menu_button("Animation", |ui| {
+            recorded_submenu(ui, "menu:Animation", "Animation", |ui| {
                 ui.set_min_width(190.0);
                 if ui
                     .button(if self.playback.playing {
@@ -762,7 +997,14 @@ impl LeopardApp {
                     self.playback.playing = false;
                 }
                 ui.separator();
-                if ui.button("Key Transforms").clicked() {
+                if recorded_button_enabled(
+                    ui,
+                    "Animation:Key Transforms",
+                    self.key_transforms_ready(),
+                    "Key Transforms",
+                )
+                .clicked()
+                {
                     self.key_transform_channels();
                 }
                 if ui
@@ -771,10 +1013,7 @@ impl LeopardApp {
                 {
                     self.show_curves = !self.show_curves;
                 }
-                if ui
-                    .checkbox(&mut self.playback.looping, "Loop Playback")
-                    .clicked()
-                {}
+                ui.checkbox(&mut self.playback.looping, "Loop Playback");
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Frames/sec");
@@ -804,7 +1043,7 @@ impl LeopardApp {
                     self.show_render_manager = true;
                 }
                 ui.separator();
-                if ui.checkbox(&mut self.show_grid, "Show Grid").clicked() {}
+                ui.checkbox(&mut self.show_grid, "Show Grid");
                 if ui
                     .checkbox(&mut self.show_helpers, "Light / Camera Helpers")
                     .clicked()
@@ -882,17 +1121,25 @@ impl LeopardApp {
 
     pub(super) fn leave_mesh_edit(&mut self) {
         self.mesh_edit = false;
-        self.mesh_selected.clear();
+        self.clear_mesh_component_selection();
         self.status = "Object mode".into();
     }
 
     pub(super) fn set_mesh_mode(&mut self, mode: MeshSelectMode) {
+        if !self.mesh_mode_ready() {
+            self.status = if self.selection.is_empty() {
+                "Select a mesh object to edit components".into()
+            } else {
+                "Component editing needs a mesh-only selection".into()
+            };
+            return;
+        }
         self.mesh_select_mode = mode;
-        self.mesh_selected.clear();
+        self.clear_mesh_component_selection();
         if self.mesh_edit {
             return;
         }
-        if self.selected_editable_mesh().is_some() {
+        if self.selected_meshes_editable() {
             self.mesh_edit = true;
             self.status = format!("{} mode", mode.label());
         } else {
@@ -927,59 +1174,69 @@ impl LeopardApp {
         self.status = format!("View: {preset}");
     }
 
-    fn add_subdivision(&mut self) {
-        let Some(id) = self.selected else {
-            self.status = "Select a mesh object first".into();
-            return;
-        };
-        if !self
-            .doc
-            .scene
-            .get(id)
-            .map(|node| node.is_mesh())
-            .unwrap_or(false)
-        {
+    pub(super) fn add_subdivision(&mut self) {
+        if !self.selection_has_mesh() {
             self.status = "Select a mesh object first".into();
             return;
         }
-        let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
-            return;
-        };
-        let mut after = before.clone();
-        after.modifiers.push(Modifier::Subdivision { levels: 1 });
+        let mut edits = Vec::new();
+        for id in self.selection.ids() {
+            let Some(node) = self.doc.scene.get(*id) else {
+                continue;
+            };
+            if !node.is_mesh() {
+                continue;
+            }
+            let before = Shape::of(node);
+            let mut after = before.clone();
+            after.modifiers.push(Modifier::Subdivision { levels: 1 });
+            edits.push((*id, before, after));
+        }
+        let count = edits.len();
         self.history
-            .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
-        self.status = "Added subdivision modifier".into();
+            .execute(&mut self.doc, Box::new(SetShapesCmd { edits }));
+        self.status = if count == 1 {
+            "Added subdivision modifier".into()
+        } else {
+            format!("Added subdivision modifier to {count} objects")
+        };
     }
 
-    fn add_boolean(&mut self) {
-        let Some(id) = self.selected else {
-            self.status = "Select a mesh object first".into();
+    pub(super) fn add_boolean(&mut self) {
+        if !self.boolean_ready() {
+            self.status = if self.selection_has_mesh() {
+                "Add an unselected mesh object to use as the boolean operand".into()
+            } else {
+                "Select a mesh object first".into()
+            };
+            return;
+        }
+        let Some(operand) = self.boolean_operand() else {
             return;
         };
-        let operand = self.doc.scene.depth_first().into_iter().find(|other| {
-            *other != id
-                && self
-                    .doc
-                    .scene
-                    .get(*other)
-                    .map(|node| node.is_mesh())
-                    .unwrap_or(false)
-        });
-        let Some(operand) = operand else {
-            self.status = "Add a second mesh object to use as the boolean operand".into();
-            return;
-        };
-        let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
-            return;
-        };
-        let mut after = before.clone();
-        after.modifiers.push(Modifier::Boolean {
-            operand,
-            operation: lc_scene::CsgOperation::Subtract,
-        });
+        let mut edits = Vec::new();
+        for id in self.selection.ids() {
+            let Some(node) = self.doc.scene.get(*id) else {
+                continue;
+            };
+            if !node.is_mesh() {
+                continue;
+            }
+            let before = Shape::of(node);
+            let mut after = before.clone();
+            after.modifiers.push(Modifier::Boolean {
+                operand,
+                operation: lc_scene::CsgOperation::Subtract,
+            });
+            edits.push((*id, before, after));
+        }
+        let count = edits.len();
         self.history
-            .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
-        self.status = "Added boolean subtract modifier".into();
+            .execute(&mut self.doc, Box::new(SetShapesCmd { edits }));
+        self.status = if count == 1 {
+            "Added boolean subtract modifier".into()
+        } else {
+            format!("Added boolean subtract modifier to {count} objects")
+        };
     }
 }

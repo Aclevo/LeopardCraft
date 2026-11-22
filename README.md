@@ -70,18 +70,65 @@ Manager window.
 - **3D Viewport** — wgpu shaded/wireframe display with a blue-grey gradient,
   light floor grid, white selected wireframe, light and camera helpers,
   orbit/pan/zoom navigation and a transform gizmo. Alt+drag orbits or pans.
+- **Multi-object selection** — Shift/Cmd-click adds or removes objects in the
+  viewport or Object Browser; drag in the viewport to box-select (Shift/Cmd
+  adds). The last clicked object stays the inspector's primary. The gizmo
+  moves, rotates or scales the whole selection around a shared pivot, and
+  Delete, Duplicate, visibility, render and lock changes apply to the whole
+  selection as one undo step. Group Selection and Selected Flags are in the
+  Objects menu; the Object Browser context menu can also reparent or unparent
+  the selection.
+  Convert to Editable Mesh, Add Subdivision, Add Boolean Subtract, every UV
+  projection operation and Key Transforms also apply to the whole selection as
+  one undo step. Context-menu Frame Selected keeps the existing selection and
+  frames all of it rather than collapsing to the right-clicked row; mesh-only
+  menu and toolbar actions are disabled when the selection contains no mesh,
+  and UV projection requires every selected mesh to be editable. Selected Flags
+  are enabled per flag only while some selected object still needs that change,
+  and Key Transforms only while some selected transform is not already keyed at
+  the current frame.
+  Component modes accept any selection made only of meshes; entering a mode
+  converts every selected primitive in one undo step, so primitives and
+  editable meshes can be edited together. Select All Components and Deselect
+  All Components act on every selected mesh, and the topology tools either
+  apply to every selected mesh with one undo step or are disabled/refused when
+  any selected mesh lacks the required component selection. Mixed selections
+  containing lights, cameras or other non-mesh objects are refused.
 - **Object Browser** — hierarchical scene tree with type icons, visibility,
   render and lock toggles, modifier rows, and a layer manager.
 - **Properties / Tags** — icon tabs for object, material and render settings;
   object, camera, light, spline and primitive parameters; modifier stack; tags;
-  skin binding; mesh-editing tools; spline control points.
+  skin binding; mesh-editing tools; spline control points. Modifier, skin and
+  direct UV-point controls edit the primary object only.
 - **Node Materials** — material shelf with shaded sphere previews and an
   editable light-canvas shader graph with Principled, noise, voronoi, ramp,
-  math, texture, normal and emission nodes.
-- **UV Editor** — planar/box/cylindrical/spherical projection, auto-unwrap,
-  relaxation and draggable UV points over a light checker.
+  math, texture, normal and emission nodes. Material roughness and metallic
+  honour material-scope animation keys during evaluation.
+- **UV Editor** — planar/box/cylindrical/spherical projection, auto-unwrap and
+  relaxation apply to every selected editable mesh; direct UV-point dragging
+  edits the primary editable mesh and needs an existing UV set.
 - **Timeline / F-Curves** — transport, frame ruler, key diamonds, orange
-  playhead, scrubbing, key insertion and an expandable curve editor.
+  playhead, scrubbing, key insertion and an expandable curve editor. Click a
+  key to select it, drag it to a new frame, right-click it or use Delete Key to
+  remove it, and cycle the interpolation of one selected key without changing
+  the rest of the track. Rotation is a four-component quaternion channel:
+  Linear keys use shortest-path slerp, Stepped keys hold, and Smooth keys
+  normalise a component-wise cubic, so sign-opposed quaternions cannot flip or
+  pop. One channel registry declares every animatable property, its scope
+  (object, tag or material), applicability and component count; recording and
+  the curve editor both resolve channels through it. The curve editor's target
+  selector switches between the primary object, each Copy Location tag and the
+  selected material. Rows are generated from the registry for that scope,
+  including channels that have no keys yet; select a row and use `Key Channel`
+  to record it. Tag keys are stored in a per-tag clip and material keys in the
+  material clip. Shift/command-click or drag a marquee over the curve view to
+  select multiple scalar or quaternion keys; dragging one selected key moves the
+  whole selection while preserving spacing. Copy/paste with the header buttons
+  or Ctrl/Cmd+C and Ctrl/Cmd+V works across objects, tags and materials: keys
+  keep their offsets from the earliest copied key, paste starts at the playhead,
+  and colliding keys are overwritten. Selection, multi-key drag, paste and
+  overwrite each collapse to one undo step through the same animation commands
+  as single-key editing.
 - **Render Manager** — capped job history with thumbnails and info, live
   progress, cancellation, and PNG/EXR export from background CPU path tracing.
 
@@ -115,14 +162,25 @@ Manager window.
 
 ### Mesh editing
 
-Select a mesh, open **Properties / Tags → Mesh Editing** and press **Enter Mesh
-Edit**. Primitives are converted to editable n-gon meshes first. Click points,
-edges or polygons in the viewport; Shift-click extends the selection.
+Select one or more meshes, open **Properties / Tags → Mesh Editing** and press
+**Enter Mesh Edit**. Primitives are converted to editable n-gon meshes first
+(all selected primitives in one undo step). Click points, edges or polygons in
+the viewport; Shift-click extends the selection. Component modes and Select
+All/Deselect All Components cover every selected mesh, but require a mesh-only
+selection. Topology tools validate the component selection on every selected
+mesh before applying one combined undo step; they are disabled or refuse with a
+status message rather than modifying only part of the selection. Ring Cut is
+only offered when the cut plane strictly crosses geometry on every selected
+mesh, Weld requires two distinct valid points on every mesh, and Bridge Loops is
+only offered when every selected mesh has exactly two valid closed edge loops of
+matching length. Each handler reuses its menu's predicate before touching
+geometry, and Apply Transform is enabled only when the current mode, axis and
+value would actually move components on every selected mesh.
 
 The panel provides:
 
-- Move, rotate and scale selected components along world, local or average-normal
-  axes.
+- Move, rotate and scale selected components on every selected mesh along world,
+  local or average-normal axes.
 - Region or individual extrude, inset, bevel, ring cut, weld selected points and
   bridge two selected edge loops.
 - Assign the material selected in the Materials tab to selected polygons.
@@ -133,16 +191,21 @@ The panel provides:
 - Spline objects have linear, Bézier and smooth modes, editable control points,
   closed/open curves and a viewport preview with control-point markers.
 - The Boolean modifier is created with **Add Boolean** in the modifier stack and
-  chooses another mesh as Union, Subtract or Intersect operand.
+  chooses a mesh as Union, Subtract or Intersect operand. Add Modifier enables
+  only entries whose geometry input exists: mesh modifiers on meshes, Sweep on
+  splines, and Lathe everywhere; Boolean entries additionally require a valid
+  mesh operand. Adding and removing a modifier each commit one edit.
 - Mesh nodes can be bound to all Joint objects in the scene from the **Skinning**
   section. Binding creates inverse-bind matrices and starts every vertex fully
   weighted to the first joint; the evaluation path supports up to four weights.
+  Binding and rebinding require a non-empty primary mesh and at least one joint;
+  Rebind is disabled when it would reproduce the current skin unchanged.
 
 ### Viewport controls
 
 | Input | Action |
 | --- | --- |
-| Left mouse | select object or mesh component; drag the object gizmo |
+| Left mouse | select an object or mesh component; Shift/Cmd-click toggles multi-selection; drag empty space to box-select; drag the gizmo to transform the selection |
 | Middle mouse drag | orbit |
 | Shift + middle drag | pan |
 | Right mouse drag | pan |
@@ -150,7 +213,8 @@ The panel provides:
 | `F` | frame selected |
 | `Cmd/Ctrl+Z` | undo |
 | `Cmd/Ctrl+Shift+Z` | redo |
-| `Delete` | delete selected object |
+| `Delete` | delete selected objects |
+| `Cmd/Ctrl+D` | duplicate selected objects |
 | View menu | shading mode, grid, helpers |
 
 ## Headless CLI
@@ -229,6 +293,12 @@ production modeller. Known limitations:
   but there is no batch image-sequence render command yet.
 - Skinning currently provides bind-to-joint setup and runtime evaluation; a
   weight-painting brush is not implemented.
+- Older documents that animate rotation as three Euler curves still load and
+  evaluate; new recordings write the quaternion rotation channel.
+- The F-curve editor exposes registry channels for the primary object, a Copy
+  Location tag or the selected material. Tag targeting is only offered for tags
+  that declare an animation channel. Scale-in-time, key filtering and
+  tangent-handle editing remain open.
 
 ## License
 

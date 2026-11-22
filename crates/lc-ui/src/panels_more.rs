@@ -172,34 +172,53 @@ impl LeopardApp {
     }
 
     pub(super) fn ui_uv(&mut self, ui: &mut egui::Ui) {
-        let Some(id) = self.selected else {
+        if self.selection.primary().is_none() {
             ui.label("Select an object to edit UVs.");
             return;
-        };
+        }
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Planar").clicked() {
+            let uv_ready = self.selection_uv_ready();
+            if ui
+                .add_enabled(uv_ready, egui::Button::new("Planar"))
+                .clicked()
+            {
                 self.apply_uv_op(UvOp::Planar);
             }
-            if ui.button("Box").clicked() {
+            if ui.add_enabled(uv_ready, egui::Button::new("Box")).clicked() {
                 self.apply_uv_op(UvOp::Box);
             }
-            if ui.button("Cylindrical").clicked() {
+            if ui
+                .add_enabled(uv_ready, egui::Button::new("Cylindrical"))
+                .clicked()
+            {
                 self.apply_uv_op(UvOp::Cylindrical);
             }
-            if ui.button("Spherical").clicked() {
+            if ui
+                .add_enabled(uv_ready, egui::Button::new("Spherical"))
+                .clicked()
+            {
                 self.apply_uv_op(UvOp::Spherical);
             }
-            if ui.button("Auto Unwrap").clicked() {
+            if ui
+                .add_enabled(uv_ready, egui::Button::new("Auto Unwrap"))
+                .clicked()
+            {
                 self.apply_uv_op(UvOp::Unwrap);
             }
-            if ui.button("Relax").clicked() {
+            if ui
+                .add_enabled(uv_ready, egui::Button::new("Relax"))
+                .clicked()
+            {
                 self.apply_uv_op(UvOp::Relax);
             }
-            if ui.button("Normalize").clicked() {
+            if ui
+                .add_enabled(uv_ready, egui::Button::new("Normalize"))
+                .clicked()
+            {
                 self.apply_uv_op(UvOp::Normalize);
             }
         });
-        let Some((_, original_mesh)) = self.selected_editable_mesh() else {
+        let Some((id, original_mesh)) = self.selected_editable_mesh() else {
             ui.label(
                 egui::RichText::new(
                     "UV editing requires an editable mesh. Convert a primitive first.",
@@ -207,11 +226,33 @@ impl LeopardApp {
                 .small()
                 .weak(),
             );
-            if ui.button("Convert to Editable Mesh").clicked() {
+            if ui
+                .add_enabled(
+                    self.selection_convert_ready(),
+                    egui::Button::new("Convert to Editable Mesh"),
+                )
+                .clicked()
+            {
                 self.make_selected_editable();
             }
             return;
         };
+        if !self.uv_point_edit_ready() {
+            ui.label(
+                egui::RichText::new(
+                    "No UV points yet. Apply a projection above to create a UV set.",
+                )
+                .small()
+                .weak(),
+            );
+            return;
+        }
+        if self
+            .selected_uv
+            .is_some_and(|index| index >= original_mesh.uvs.len())
+        {
+            self.selected_uv = None;
+        }
         let mut mesh = original_mesh.clone();
         let side = ui
             .available_height()
@@ -301,6 +342,7 @@ impl LeopardApp {
                 if let Some(uv) = mesh.uvs.get_mut(index) {
                     uv.x += delta.x / rect.width().max(1.0);
                     uv.y -= delta.y / rect.height().max(1.0);
+                    self.set_uv_point(id, index, *uv);
                 }
             }
         }
@@ -313,20 +355,6 @@ impl LeopardApp {
             .small()
             .weak(),
         );
-        if mesh != original_mesh {
-            let before = self.doc.scene.get(id).map(Shape::of);
-            if self.pending_shape.is_none() {
-                if let Some(before) = before.clone() {
-                    self.pending_shape = Some((id, before));
-                }
-            }
-            if let Some(node) = self.doc.scene.get_mut(id) {
-                if let NodeKind::Mesh { geometry } = &mut node.kind {
-                    let updated = geometry.with_mesh(mesh);
-                    *geometry = updated;
-                }
-            }
-        }
     }
 }
 
@@ -477,9 +505,8 @@ fn shader_graph_ui(ui: &mut egui::Ui, material: &mut Material, selected: &mut Op
             }
         }
         let inputs = node.kind.input_names();
-        let mut shown = 0;
         for (i, name) in inputs.iter().enumerate() {
-            if shown >= 4 {
+            if i >= 4 {
                 break;
             }
             let y = rect.top() + 24.0 + i as f32 * 11.0;
@@ -503,7 +530,6 @@ fn shader_graph_ui(ui: &mut egui::Ui, material: &mut Material, selected: &mut Op
                 egui::FontId::proportional(8.5),
                 Color32::from_rgb(82, 82, 82),
             );
-            shown += 1;
         }
         painter.circle_filled(
             Pos2::new(rect.right(), rect.center().y + 8.0),
@@ -652,16 +678,14 @@ fn shader_graph_ui(ui: &mut egui::Ui, material: &mut Material, selected: &mut Op
             }
         });
         if let Some(id) = *selected {
-            if ui.button("Remove Node").clicked() {
-                if !material
+            if ui.button("Remove Node").clicked()
+                && !material
                     .graph
                     .node(id)
-                    .map(|n| matches!(&n.kind, ShaderNodeKind::MaterialOutput))
-                    .unwrap_or(false)
-                {
-                    material.graph.remove_node(id);
-                    *selected = None;
-                }
+                    .is_some_and(|n| matches!(&n.kind, ShaderNodeKind::MaterialOutput))
+            {
+                material.graph.remove_node(id);
+                *selected = None;
             }
             if let Some(node) = material.graph.node_mut(id) {
                 if let ShaderNodeKind::Texture { path } = &mut node.kind {
@@ -695,7 +719,7 @@ fn shader_graph_ui(ui: &mut egui::Ui, material: &mut Material, selected: &mut Op
                     }
                 }
             }
-            let targets: Vec<(u32, String, Vec<(usize, String)>)> = material
+            let targets: Vec<_> = material
                 .graph
                 .nodes
                 .iter()
@@ -819,7 +843,7 @@ impl LeopardApp {
                             egui::Align2::CENTER_BOTTOM,
                             label,
                             egui::FontId::proportional(9.5),
-                            if selected { theme::TEXT } else { theme::TEXT },
+                            theme::TEXT,
                         );
                         if response.clicked() {
                             select = Some(*id);
@@ -865,24 +889,31 @@ impl LeopardApp {
             self.editor_view = EditorView::Nodes;
         }
         if let Some(id) = assign {
-            if let Some(object) = self.selected {
-                if let Some(node) = self.doc.scene.get(object).cloned() {
-                    let before = NodeProps::of(&node);
-                    let mut after = before.clone();
-                    after.material = Some(id);
-                    self.history.execute(
-                        &mut self.doc,
-                        Box::new(SetNodePropsCmd {
-                            id: object,
-                            before,
-                            after,
-                        }),
-                    );
-                    self.selected_material = Some(id);
-                    self.status = "Assigned material to object".into();
-                }
-            } else {
+            if self.selection.is_empty() {
                 self.status = "Select an object before assigning a material".into();
+            } else {
+                let mut edits = Vec::new();
+                for object in self.selection.ids().to_vec() {
+                    if let Some(node) = self.doc.scene.get(object).cloned() {
+                        let before = NodeProps::of(&node);
+                        let mut after = before.clone();
+                        after.material = Some(id);
+                        if after != before {
+                            edits.push((object, before, after));
+                        }
+                    }
+                }
+                if !edits.is_empty() {
+                    let count = edits.len();
+                    self.history
+                        .execute(&mut self.doc, Box::new(SetNodesPropsCmd { edits }));
+                    self.selected_material = Some(id);
+                    self.status = if count == 1 {
+                        "Assigned material to object".into()
+                    } else {
+                        format!("Assigned material to {count} objects")
+                    };
+                }
             }
         }
         if let Some(id) = delete {
@@ -1017,7 +1048,7 @@ impl LeopardApp {
                 Icon::Record,
                 "Key transforms at the current frame",
                 false,
-                self.selected.is_some(),
+                self.key_transforms_ready(),
                 22.0,
             )
             .clicked()
@@ -1144,7 +1175,7 @@ impl LeopardApp {
             );
             frame += step;
         }
-        if let Some(id) = self.selected {
+        if let Some(id) = self.selection.primary() {
             if let Some(node) = self.doc.scene.get(id) {
                 for time in node.animation.key_times() {
                     let x = x_of(time * fps);
@@ -1224,6 +1255,99 @@ impl LeopardApp {
             ui.label(egui::RichText::new("fps").size(9.0).color(theme::TEXT_WEAK));
             ui.add(egui::DragValue::new(&mut fps).speed(0.2).range(1.0..=240.0));
             ui.checkbox(&mut loop_playback, "Loop");
+            let has_selection = !self.selected_curve_keys().is_empty();
+            if ui
+                .add_enabled(
+                    has_selection,
+                    egui::Button::new(egui::RichText::new("Delete Keys").size(9.0)),
+                )
+                .on_hover_text("Delete every selected F-curve key")
+                .clicked()
+                && has_selection
+            {
+                self.delete_selected_curve_key();
+            }
+            if ui
+                .add_enabled(
+                    has_selection,
+                    egui::Button::new(egui::RichText::new("Copy").size(9.0)),
+                )
+                .on_hover_text("Copy selected keys (Ctrl/Cmd+C)")
+                .clicked()
+            {
+                self.copy_selected_curve_keys();
+            }
+            let paste_ready =
+                !self.curve_clipboard.keys.is_empty() && self.current_anim_target().is_some();
+            if ui
+                .add_enabled(
+                    paste_ready,
+                    egui::Button::new(egui::RichText::new("Paste").size(9.0)),
+                )
+                .on_hover_text("Paste at the playhead (Ctrl/Cmd+V)")
+                .clicked()
+            {
+                self.paste_curve_keys();
+            }
+            ui.separator();
+            let mut target_options: Vec<(AnimTarget, String)> = Vec::new();
+            if let Some(id) = self.selection.primary() {
+                if let Some(node) = self.doc.scene.get(id) {
+                    target_options.push((AnimTarget::Object(id), format!("Object: {}", node.name)));
+                    for (index, tag) in node.tags.iter().enumerate() {
+                        if Self::tag_animation_channel(tag).is_some() {
+                            target_options.push((
+                                AnimTarget::Tag(id, index),
+                                format!("Tag: {} #{}", tag.label(), index + 1),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(material_id) = self.selected_material {
+                if let Some(material) = self.doc.materials.get(material_id) {
+                    target_options.push((
+                        AnimTarget::Material(material_id),
+                        format!("Material: {}", material.name),
+                    ));
+                }
+            }
+            let current_target = self.current_anim_target();
+            let mut chosen_target = current_target;
+            egui::ComboBox::from_id_salt("curve_anim_target")
+                .selected_text(
+                    current_target
+                        .map(|target| self.target_label(target))
+                        .unwrap_or_else(|| "No target".into()),
+                )
+                .show_ui(ui, |ui| {
+                    for (target, label) in &target_options {
+                        ui.selectable_value(&mut chosen_target, Some(*target), label);
+                    }
+                });
+            if chosen_target != current_target {
+                if let Some(target) = chosen_target {
+                    self.set_anim_target(target);
+                }
+            }
+            let key_ready = self
+                .selected_curve_channel
+                .is_some_and(|(target, channel)| {
+                    self.current_anim_target() == Some(target)
+                        && self.channel_applies_to_target(channel, target)
+                });
+            if ui
+                .add_enabled(
+                    key_ready,
+                    egui::Button::new(egui::RichText::new("Key Channel").size(9.0)),
+                )
+                .on_hover_text("Record the selected registry channel at the playhead")
+                .clicked()
+            {
+                if let Some((target, channel)) = self.selected_curve_channel {
+                    self.record_channel_key(target, channel);
+                }
+            }
         });
         self.playback.fps = fps.max(1.0);
         self.playback.start = start_frame / self.playback.fps;
@@ -1233,12 +1357,26 @@ impl LeopardApp {
 
         let start = self.playback.start;
         let end = self.playback.end.max(start + 1e-4);
-        let mut clip = self
-            .selected
-            .and_then(|id| self.doc.scene.get(id))
-            .map(|node| node.animation.clone());
+        let anim_target = self.current_anim_target();
+        let mut clip = anim_target.and_then(|target| self.target_clip(target));
         let original = clip.clone();
+        if !self.selected_keys.is_empty() && self.selected_curve_keys().is_empty() {
+            self.selected_keys.clear();
+        }
+        if let Some(drag) = self.curve_key_drag.as_ref() {
+            let valid = Some(drag.key.target) == anim_target
+                && clip.as_ref().is_some_and(|clip| match drag.key.track {
+                    CurveTrackId::Scalar(property) => {
+                        Self::curve_key_index(clip, property, drag.original_time).is_some()
+                    }
+                    CurveTrackId::Rotation => clip.rotation_key_index(drag.original_time).is_some(),
+                });
+            if !valid {
+                self.curve_key_drag = None;
+            }
+        }
         let mut remove_track: Option<AnimProperty> = None;
+        let mut remove_rotation = false;
         let height = (ui.available_height() - 46.0).clamp(60.0, 118.0);
         let (area, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
@@ -1247,38 +1385,75 @@ impl LeopardApp {
             Rect::from_min_max(Pos2::new(left_rect.right() + 1.0, area.top()), area.max);
         let list_painter = ui.painter_at(left_rect);
         list_painter.rect_filled(left_rect, 0.0, Color32::from_rgb(243, 243, 243));
-        if let Some(clip) = clip.as_mut() {
+        if let (Some(target), Some(clip)) = (anim_target, clip.as_mut()) {
+            let rows = self.curve_rows(target);
             let row_h = 16.0;
+            let row_count = rows.len();
             let mut max_rows = (height / row_h).floor() as usize;
-            if clip.tracks.len() > max_rows {
+            if row_count > max_rows {
                 max_rows = max_rows.saturating_sub(1).max(1);
             }
-            for (track_index, track) in clip.tracks.iter_mut().take(max_rows).enumerate() {
-                let y = left_rect.top() + track_index as f32 * row_h;
-                let row = Rect::from_min_size(
+            for (row_index, row) in rows.iter().take(max_rows).enumerate() {
+                let y = left_rect.top() + row_index as f32 * row_h;
+                let row_rect = Rect::from_min_size(
                     Pos2::new(left_rect.left(), y),
                     Vec2::new(left_rect.width(), row_h),
                 );
+                let selected_row = self.selected_curve_channel == Some((target, row.channel));
+                if selected_row {
+                    list_painter.rect_filled(row_rect, 2.0, Color32::from_rgb(231, 238, 247));
+                }
+                if ui
+                    .interact(
+                        row_rect,
+                        ui.id().with(("curve_row", row_index)),
+                        Sense::click(),
+                    )
+                    .clicked()
+                {
+                    self.selected_curve_channel = Some((target, row.channel));
+                }
                 list_painter.circle_filled(
-                    Pos2::new(row.left() + 6.0, row.center().y),
+                    Pos2::new(row_rect.left() + 6.0, row_rect.center().y),
                     3.0,
-                    track_color(track.property),
+                    channel_color(row.channel),
                 );
+                let label = match row.property {
+                    Some(property) => AnimChannel::scalar_label(property)
+                        .unwrap_or_else(|| property.label().to_string()),
+                    None => row.channel.label().to_string(),
+                };
                 list_painter.text(
-                    Pos2::new(row.left() + 13.0, row.center().y),
+                    Pos2::new(row_rect.left() + 13.0, row_rect.center().y),
                     egui::Align2::LEFT_CENTER,
-                    track.property.label(),
+                    format!("{label} ·{}", row.channel.component_count()),
                     egui::FontId::proportional(8.8),
                     theme::TEXT,
                 );
-                let mut interpolation = track
-                    .curve
-                    .keys
-                    .first()
-                    .map(|key| key.interpolation)
-                    .unwrap_or(Interpolation::Bezier);
+                let (has_track, interpolation) = match row.property {
+                    Some(property) => {
+                        let track = clip.track(property);
+                        (
+                            track.is_some(),
+                            track
+                                .and_then(|track| track.curve.keys.first())
+                                .map(|key| key.interpolation)
+                                .unwrap_or(Interpolation::Bezier),
+                        )
+                    }
+                    None => {
+                        let track = clip.rotation.as_ref();
+                        (
+                            track.is_some(),
+                            track
+                                .and_then(|track| track.keys.first())
+                                .map(|key| key.interpolation)
+                                .unwrap_or(Interpolation::Bezier),
+                        )
+                    }
+                };
                 let interp_rect = Rect::from_min_size(
-                    Pos2::new(row.left() + 74.0, y + 1.0),
+                    Pos2::new(row_rect.left() + 74.0, y + 1.0),
                     Vec2::new(58.0, 14.0),
                 );
                 list_painter.rect_filled(interp_rect, 2.0, Color32::WHITE);
@@ -1291,55 +1466,111 @@ impl LeopardApp {
                 list_painter.text(
                     interp_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    interpolation.label(),
+                    if has_track {
+                        interpolation.label()
+                    } else {
+                        "—"
+                    },
                     egui::FontId::proportional(8.3),
-                    theme::TEXT,
+                    if has_track {
+                        theme::TEXT
+                    } else {
+                        theme::TEXT_WEAK
+                    },
                 );
-                if ui
-                    .interact(
-                        interp_rect,
-                        ui.id().with(("curve_interp", track_index)),
-                        Sense::click(),
-                    )
-                    .clicked()
+                if has_track
+                    && ui
+                        .interact(
+                            interp_rect,
+                            ui.id().with(("curve_interp", row_index)),
+                            Sense::click(),
+                        )
+                        .clicked()
                 {
-                    interpolation = match interpolation {
+                    let next = match interpolation {
                         Interpolation::Bezier => Interpolation::Linear,
                         Interpolation::Linear => Interpolation::Step,
                         Interpolation::Step => Interpolation::Bezier,
                     };
-                    for key in &mut track.curve.keys {
-                        key.interpolation = interpolation;
+                    let track_id = match row.property {
+                        Some(property) => CurveTrackId::Scalar(property),
+                        None => CurveTrackId::Rotation,
+                    };
+                    let selected_times: Vec<f32> = self
+                        .selected_curve_keys()
+                        .into_iter()
+                        .filter(|key| key.target == target && key.track == track_id)
+                        .map(|key| key.time)
+                        .collect();
+                    if let Some(property) = row.property {
+                        if let Some(track) = clip.track_mut(property) {
+                            if !selected_times.is_empty() {
+                                for key in &mut track.curve.keys {
+                                    if selected_times
+                                        .iter()
+                                        .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                                    {
+                                        key.interpolation = next;
+                                    }
+                                }
+                            } else {
+                                for key in &mut track.curve.keys {
+                                    key.interpolation = next;
+                                }
+                            }
+                            track.curve.update_tangents();
+                        }
+                    } else if let Some(track) = clip.rotation.as_mut() {
+                        if !selected_times.is_empty() {
+                            for key in &mut track.keys {
+                                if selected_times
+                                    .iter()
+                                    .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                                {
+                                    key.interpolation = next;
+                                }
+                            }
+                        } else {
+                            for key in &mut track.keys {
+                                key.interpolation = next;
+                            }
+                        }
                     }
-                    track.curve.update_tangents();
                 }
-                let delete_rect =
-                    Rect::from_min_size(Pos2::new(row.right() - 18.0, y + 1.0), Vec2::splat(14.0));
-                let x = delete_rect.shrink(3.0);
-                list_painter.line_segment(
-                    [x.left_top(), x.right_bottom()],
-                    egui::Stroke::new(1.2, theme::TEXT_WEAK),
-                );
-                list_painter.line_segment(
-                    [x.right_top(), x.left_bottom()],
-                    egui::Stroke::new(1.2, theme::TEXT_WEAK),
-                );
-                if ui
-                    .interact(
-                        delete_rect,
-                        ui.id().with(("curve_delete", track_index)),
-                        Sense::click(),
-                    )
-                    .clicked()
-                {
-                    remove_track = Some(track.property);
+                if has_track {
+                    let delete_rect = Rect::from_min_size(
+                        Pos2::new(row_rect.right() - 18.0, y + 1.0),
+                        Vec2::splat(14.0),
+                    );
+                    let x = delete_rect.shrink(3.0);
+                    list_painter.line_segment(
+                        [x.left_top(), x.right_bottom()],
+                        egui::Stroke::new(1.2, theme::TEXT_WEAK),
+                    );
+                    list_painter.line_segment(
+                        [x.right_top(), x.left_bottom()],
+                        egui::Stroke::new(1.2, theme::TEXT_WEAK),
+                    );
+                    if ui
+                        .interact(
+                            delete_rect,
+                            ui.id().with(("curve_delete", row_index)),
+                            Sense::click(),
+                        )
+                        .clicked()
+                    {
+                        match row.property {
+                            Some(property) => remove_track = Some(property),
+                            None => remove_rotation = true,
+                        }
+                    }
                 }
             }
-            if clip.tracks.len() > max_rows {
+            if row_count > max_rows {
                 list_painter.text(
                     Pos2::new(left_rect.left() + 6.0, left_rect.bottom() - 5.0),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("+{} more tracks", clip.tracks.len() - max_rows),
+                    format!("+{} more channels", row_count - max_rows),
                     egui::FontId::proportional(8.0),
                     theme::TEXT_WEAK,
                 );
@@ -1348,7 +1579,7 @@ impl LeopardApp {
             list_painter.text(
                 Pos2::new(left_rect.left() + 6.0, left_rect.top() + 14.0),
                 egui::Align2::LEFT_CENTER,
-                "Select an animated object",
+                "Select an object, tag or material",
                 egui::FontId::proportional(9.0),
                 theme::TEXT_WEAK,
             );
@@ -1381,7 +1612,8 @@ impl LeopardApp {
         let series: Vec<(Color32, Vec<f32>)> = clip
             .as_ref()
             .map(|clip| {
-                clip.tracks
+                let mut series: Vec<(Color32, Vec<f32>)> = clip
+                    .tracks
                     .iter()
                     .map(|track| {
                         let values = (0..=64)
@@ -1392,7 +1624,20 @@ impl LeopardApp {
                             .collect();
                         (track_color(track.property), values)
                     })
-                    .collect()
+                    .collect();
+                if let Some(track) = &clip.rotation {
+                    let values = (0..=64)
+                        .map(|i| {
+                            let t = i as f32 / 64.0;
+                            track
+                                .sample(start + (end - start) * t)
+                                .map(|q| q.w)
+                                .unwrap_or(1.0)
+                        })
+                        .collect();
+                    series.push((channel_color(AnimChannel::Rotation), values));
+                }
+                series
             })
             .unwrap_or_default();
         let mut min = f32::INFINITY;
@@ -1413,6 +1658,150 @@ impl LeopardApp {
         }
         let value_y =
             |value: f32| rect.bottom() - 6.0 - (value - min) / (max - min) * (rect.height() - 12.0);
+        let canvas_response =
+            ui.interact(rect, ui.id().with("curve_canvas"), Sense::click_and_drag());
+        let fps = self.playback.fps.max(1.0);
+        let time_at = |x: f32| {
+            start + ((x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0) * (end - start)
+        };
+        let value_at = |y: f32| {
+            min + ((rect.bottom() - 6.0 - y) / (rect.height() - 12.0).max(1.0)).clamp(0.0, 1.0)
+                * (max - min)
+        };
+        let key_at = |pointer: Pos2| -> Option<(CurveTrackId, f32)> {
+            let clip = clip.as_ref()?;
+            let mut best: Option<(f32, CurveTrackId, f32)> = None;
+            for track in &clip.tracks {
+                for key in &track.curve.keys {
+                    if key.time < start || key.time > end {
+                        continue;
+                    }
+                    let x = rect.left() + (key.time - start) / (end - start) * rect.width();
+                    let y = value_y(key.value);
+                    let distance = (Pos2::new(x, y) - pointer).length();
+                    if distance <= 7.0 && best.map(|(best, _, _)| distance < best).unwrap_or(true) {
+                        best = Some((distance, CurveTrackId::Scalar(track.property), key.time));
+                    }
+                }
+            }
+            if let Some(rotation) = &clip.rotation {
+                for key in &rotation.keys {
+                    if key.time < start || key.time > end {
+                        continue;
+                    }
+                    let x = rect.left() + (key.time - start) / (end - start) * rect.width();
+                    let y = value_y(key.value.w);
+                    let distance = (Pos2::new(x, y) - pointer).length();
+                    if distance <= 7.0 && best.map(|(best, _, _)| distance < best).unwrap_or(true) {
+                        best = Some((distance, CurveTrackId::Rotation, key.time));
+                    }
+                }
+            }
+            best.map(|(_, track, time)| (track, time))
+        };
+        let additive = ui.input(|input| input.modifiers.shift || input.modifiers.command);
+        if canvas_response.clicked() {
+            if let (Some(pointer), Some(target)) =
+                (canvas_response.interact_pointer_pos(), anim_target)
+            {
+                match key_at(pointer) {
+                    Some((track, time)) if additive => {
+                        self.toggle_target_track_key(target, track, time);
+                    }
+                    Some((track, time)) => {
+                        self.select_target_track_key_additive(target, track, time, false);
+                    }
+                    None if !additive => self.clear_curve_key_selection(),
+                    None => {}
+                }
+            }
+        }
+        if canvas_response.drag_started_by(egui::PointerButton::Primary) {
+            if let (Some(pointer), Some(target)) =
+                (canvas_response.interact_pointer_pos(), anim_target)
+            {
+                if let Some((track, time)) = key_at(pointer) {
+                    let key = SelectedKey {
+                        target,
+                        track,
+                        time,
+                    };
+                    if !self.is_curve_key_selected(&key) {
+                        self.select_target_track_key_additive(target, track, time, additive);
+                    }
+                    self.curve_box_select = None;
+                    self.curve_key_drag = Some(CurveKeyDrag {
+                        key,
+                        original_time: time,
+                        current_time: time,
+                        original_selection: self.selected_curve_keys(),
+                    });
+                } else {
+                    self.curve_key_drag = None;
+                    self.curve_box_select = Some(CurveBoxSelect {
+                        start: pointer,
+                        current: pointer,
+                        additive,
+                    });
+                }
+            }
+        }
+        if canvas_response.dragged_by(egui::PointerButton::Primary) {
+            if let (Some(pointer), Some(mut drag)) = (
+                canvas_response.interact_pointer_pos(),
+                self.curve_key_drag.clone(),
+            ) {
+                drag.current_time = ((time_at(pointer.x) * fps).round() / fps).max(0.0);
+                self.curve_key_drag = Some(drag);
+            }
+            if let (Some(pointer), Some(mut marquee)) = (
+                canvas_response.interact_pointer_pos(),
+                self.curve_box_select,
+            ) {
+                marquee.current = pointer;
+                self.curve_box_select = Some(marquee);
+            }
+        }
+        if canvas_response.drag_stopped_by(egui::PointerButton::Primary) {
+            if let Some(drag) = self.curve_key_drag.take() {
+                let delta = drag.current_time - drag.original_time;
+                if delta.abs() > 1e-4 {
+                    self.selected_keys = drag.original_selection;
+                    self.move_selected_curve_keys_by(delta);
+                }
+            }
+            if let (Some(marquee), Some(clip), Some(target)) =
+                (self.curve_box_select.take(), clip.as_ref(), anim_target)
+            {
+                let min_x = marquee.start.x.min(marquee.current.x);
+                let max_x = marquee.start.x.max(marquee.current.x);
+                let min_y = marquee.start.y.min(marquee.current.y);
+                let max_y = marquee.start.y.max(marquee.current.y);
+                self.select_keys_in_box(
+                    target,
+                    clip,
+                    (time_at(min_x), time_at(max_x)),
+                    (value_at(max_y), value_at(min_y)),
+                    marquee.additive,
+                );
+            }
+        }
+        if canvas_response.secondary_clicked() {
+            if let (Some(pointer), Some(target)) =
+                (canvas_response.interact_pointer_pos(), anim_target)
+            {
+                if let Some((track, time)) = key_at(pointer) {
+                    match track {
+                        CurveTrackId::Scalar(property) => {
+                            self.delete_target_curve_key(target, property, time);
+                        }
+                        CurveTrackId::Rotation => {
+                            self.delete_target_rotation_curve_key(target, time);
+                        }
+                    }
+                }
+            }
+        }
         for (color, values) in &series {
             let points: Vec<Pos2> = values
                 .iter()
@@ -1426,32 +1815,124 @@ impl LeopardApp {
                 .collect();
             painter.add(egui::Shape::line(points, egui::Stroke::new(1.3, *color)));
         }
-        if let Some(clip) = clip.as_ref() {
+        if let (Some(target), Some(clip)) = (anim_target, clip.as_ref()) {
             for track in &clip.tracks {
                 for key in &track.curve.keys {
                     if key.time < start || key.time > end {
                         continue;
                     }
-                    let x = rect.left() + (key.time - start) / (end - start) * rect.width();
+                    let key_id = SelectedKey {
+                        target,
+                        track: CurveTrackId::Scalar(track.property),
+                        time: key.time,
+                    };
+                    let selected = self.is_curve_key_selected(&key_id);
+                    let dragged = self.curve_key_drag.as_ref().and_then(|drag| {
+                        drag.original_selection
+                            .iter()
+                            .find(|selected| {
+                                selected.target == target
+                                    && selected.track == CurveTrackId::Scalar(track.property)
+                                    && (selected.time - key.time).abs() <= 1e-3
+                            })
+                            .map(|_| key.time + (drag.current_time - drag.original_time))
+                    });
+                    let time = dragged.unwrap_or(key.time);
+                    let x = rect.left() + (time - start) / (end - start) * rect.width();
                     let y = value_y(key.value);
+                    let radius = if selected { 4.2 } else { 3.0 };
+                    let fill = if selected {
+                        theme::ACCENT
+                    } else {
+                        track_color(track.property)
+                    };
+                    let stroke = if selected {
+                        egui::Stroke::new(1.5, Color32::WHITE)
+                    } else {
+                        egui::Stroke::new(0.7, Color32::WHITE)
+                    };
                     painter.add(egui::Shape::convex_polygon(
                         vec![
-                            Pos2::new(x, y - 3.0),
-                            Pos2::new(x + 3.0, y),
-                            Pos2::new(x, y + 3.0),
-                            Pos2::new(x - 3.0, y),
+                            Pos2::new(x, y - radius),
+                            Pos2::new(x + radius, y),
+                            Pos2::new(x, y + radius),
+                            Pos2::new(x - radius, y),
                         ],
-                        track_color(track.property),
-                        egui::Stroke::new(0.7, Color32::WHITE),
+                        fill,
+                        stroke,
                     ));
                 }
             }
+        }
+        if let (Some(target), Some(rotation)) = (
+            anim_target,
+            clip.as_ref().and_then(|clip| clip.rotation.as_ref()),
+        ) {
+            for key in &rotation.keys {
+                if key.time < start || key.time > end {
+                    continue;
+                }
+                let key_id = SelectedKey {
+                    target,
+                    track: CurveTrackId::Rotation,
+                    time: key.time,
+                };
+                let selected = self.is_curve_key_selected(&key_id);
+                let dragged = self.curve_key_drag.as_ref().and_then(|drag| {
+                    drag.original_selection
+                        .iter()
+                        .find(|selected| {
+                            selected.target == target
+                                && selected.track == CurveTrackId::Rotation
+                                && (selected.time - key.time).abs() <= 1e-3
+                        })
+                        .map(|_| key.time + (drag.current_time - drag.original_time))
+                });
+                let time = dragged.unwrap_or(key.time);
+                let x = rect.left() + (time - start) / (end - start) * rect.width();
+                let y = value_y(key.value.w);
+                let radius = if selected { 4.2 } else { 3.0 };
+                let fill = if selected {
+                    theme::ACCENT
+                } else {
+                    channel_color(AnimChannel::Rotation)
+                };
+                let stroke = if selected {
+                    egui::Stroke::new(1.5, Color32::WHITE)
+                } else {
+                    egui::Stroke::new(0.7, Color32::WHITE)
+                };
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(x, y - radius),
+                        Pos2::new(x + radius, y),
+                        Pos2::new(x, y + radius),
+                        Pos2::new(x - radius, y),
+                    ],
+                    fill,
+                    stroke,
+                ));
+            }
+        }
+        if let Some(marquee) = self.curve_box_select {
+            let box_rect = Rect::from_two_pos(marquee.start, marquee.current).intersect(rect);
+            painter.rect_filled(
+                box_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(64, 116, 190, 32),
+            );
+            painter.rect_stroke(
+                box_rect,
+                0.0,
+                egui::Stroke::new(1.0, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
         }
         if series.is_empty() {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Key transforms to see curves",
+                "Select a channel row and key it to see curves",
                 egui::FontId::proportional(10.0),
                 theme::TEXT_WEAK,
             );
@@ -1462,17 +1943,15 @@ impl LeopardApp {
             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
             egui::Stroke::new(1.2, theme::ACCENT),
         );
-        if let (Some(id), Some(mut clip)) = (self.selected, clip) {
+        if let (Some(target), Some(mut clip)) = (anim_target, clip) {
             if let Some(property) = remove_track {
                 clip.remove_track(property);
             }
-            if let Some(original) = original {
-                if clip != original {
-                    if let Some(cmd) = SetAnimationCmd::new(&self.doc, id, clip) {
-                        self.history.execute(&mut self.doc, Box::new(cmd));
-                        self.status = "Edited animation curves".into();
-                    }
-                }
+            if remove_rotation {
+                clip.remove_rotation_track();
+            }
+            if original.as_ref() != Some(&clip) && self.commit_target_clip(target, clip) {
+                self.status = "Edited animation curves".into();
             }
         }
     }
@@ -2029,18 +2508,35 @@ impl LeopardApp {
     }
 }
 
+fn channel_color(channel: AnimChannel) -> Color32 {
+    match channel {
+        AnimChannel::Translation => Color32::from_rgb(206, 74, 66),
+        AnimChannel::Rotation => Color32::from_rgb(196, 122, 72),
+        AnimChannel::Scale => Color32::from_rgb(188, 104, 148),
+        AnimChannel::Fov => Color32::from_rgb(96, 132, 186),
+        AnimChannel::LightIntensity => Color32::from_rgb(212, 168, 70),
+        AnimChannel::LightColor => Color32::from_rgb(210, 150, 92),
+        AnimChannel::CopyLocationWeight => Color32::from_rgb(110, 156, 140),
+        AnimChannel::MaterialRoughness => Color32::from_rgb(128, 128, 128),
+        AnimChannel::MaterialMetallic => Color32::from_rgb(150, 150, 170),
+    }
+}
+
 fn track_color(property: AnimProperty) -> Color32 {
     match property {
         AnimProperty::TranslationX => Color32::from_rgb(206, 74, 66),
         AnimProperty::TranslationY => Color32::from_rgb(86, 158, 82),
         AnimProperty::TranslationZ => Color32::from_rgb(70, 108, 190),
+        // Legacy Euler rotation tracks keep their component colours.
         AnimProperty::RotationX => Color32::from_rgb(196, 122, 72),
         AnimProperty::RotationY => Color32::from_rgb(132, 150, 62),
         AnimProperty::RotationZ => Color32::from_rgb(122, 92, 168),
         AnimProperty::ScaleX => Color32::from_rgb(188, 104, 148),
         AnimProperty::ScaleY => Color32::from_rgb(92, 152, 152),
         AnimProperty::ScaleZ => Color32::from_rgb(102, 122, 178),
-        _ => Color32::from_rgb(128, 128, 128),
+        _ => AnimChannel::from_scalar_property(property)
+            .map(channel_color)
+            .unwrap_or(Color32::from_rgb(128, 128, 128)),
     }
 }
 
