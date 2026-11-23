@@ -15,6 +15,14 @@ pub enum LightKind {
         width: f32,
         height: f32,
     },
+    /// Cone light. The cone points down the light's local -Z axis; `inner_deg`
+    /// is the full-intensity core and `outer_deg` the falloff edge, both in
+    /// degrees (glTF authors the same angles in radians).
+    Spot {
+        radius: f32,
+        inner_deg: f32,
+        outer_deg: f32,
+    },
 }
 
 impl LightKind {
@@ -23,6 +31,7 @@ impl LightKind {
             Self::Directional => "Directional",
             Self::Point { .. } => "Point",
             Self::Area { .. } => "Area",
+            Self::Spot { .. } => "Spot",
         }
     }
 }
@@ -83,7 +92,7 @@ impl Light {
         -world.z_axis.truncate().normalize_or(Vec3::NEG_Z)
     }
 
-    /// Width/height in world units (radians for area lights; scaled by node).
+    /// Width/height in world units, scaled by the node's X/Y scale.
     pub fn area_size(&self, world: Mat4) -> (f32, f32) {
         match self.kind {
             LightKind::Area { width, height } => {

@@ -1203,6 +1203,7 @@ name = "lc-io"
 version = "0.1.1"
 dependencies = [
  "glam",
+ "lc-anim",
  "lc-core",
  "lc-geom",
  "lc-scene",
@@ -1210,6 +1211,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "lc-mcp"
+version = "0.1.1"
+dependencies = [
+ "glam",
+ "lc-core",
+ "lc-io",
+ "lc-render",
+ "lc-scene",
+ "serde_json",
 ]
 
 [[package]]
@@ -1281,10 +1294,12 @@ dependencies = [
  "lc-core",
  "lc-geom",
  "lc-io",
+ "lc-mcp",
  "lc-render",
  "lc-scene",
  "lc-shading",
  "lc-ui",
+ "serde_json",
 ]
 
 [[package]]

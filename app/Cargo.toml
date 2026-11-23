@@ -16,5 +16,9 @@ lc-shading = { path = "../crates/lc-shading" }
 lc-anim = { path = "../crates/lc-anim" }
 lc-render = { path = "../crates/lc-render" }
 lc-io = { path = "../crates/lc-io" }
+lc-mcp = { path = "../crates/lc-mcp" }
 lc-ui = { path = "../crates/lc-ui" }
 eframe.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

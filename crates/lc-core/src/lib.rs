@@ -100,9 +100,12 @@ impl Transform {
     }
 
     /// Euler angles in degrees (XYZ order), useful for the inspector and
-    /// for Euler-based animation channels.
+    /// for Euler-based animation channels. This is the inverse of
+    /// [`Self::from_euler_degrees`]; glam's `to_euler` returns radians, so the
+    /// components are converted here.
     pub fn euler_degrees(&self) -> Vec3 {
-        self.rotation.to_euler(glam::EulerRot::XYZ).into()
+        let radians: Vec3 = self.rotation.to_euler(glam::EulerRot::XYZ).into();
+        Vec3::from_array(radians.to_array().map(f32::to_degrees))
     }
 
     pub fn from_euler_degrees(euler: Vec3) -> Self {
@@ -601,6 +604,19 @@ mod tests {
             assert_eq!(x, b.next_f32());
             assert!((0.0..1.0).contains(&x));
         }
+    }
+
+    #[test]
+    fn euler_degrees_round_trips_with_from_euler_degrees() {
+        let euler = Vec3::new(15.0, 45.0, -30.0);
+        let round_trip = Transform::from_euler_degrees(euler).euler_degrees();
+        assert!(
+            (round_trip - euler).abs().max_element() < 1e-4,
+            "got {round_trip:?}"
+        );
+        // A quarter turn about Y must read back as 90 degrees, not 1.5708.
+        let y = Transform::from_rotation_y(std::f32::consts::FRAC_PI_2).euler_degrees();
+        assert!((y.y - 90.0).abs() < 1e-4, "got {y:?}");
     }
 
     #[test]

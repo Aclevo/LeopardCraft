@@ -10,6 +10,7 @@ pub mod native;
 pub mod obj;
 pub mod stl;
 
+pub use gltf::ImportReport;
 pub use native::{from_json, load as load_native, save as save_native, to_json};
 pub use stl::StlFormat;
 
@@ -32,6 +33,23 @@ pub fn import(path: impl AsRef<Path>) -> Result<Document, String> {
         _ => Err(format!(
             "unsupported import format '.{ext}' (use .lcscene, .obj, .stl, .glb or .gltf)"
         )),
+    }
+}
+
+/// Import like [`import`], but also describe the authored data the format's
+/// importer had to skip, so the caller can surface it to the user. Formats that
+/// never drop data return an empty report.
+pub fn import_with_report(path: impl AsRef<Path>) -> Result<(Document, ImportReport), String> {
+    let path = path.as_ref();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "glb" => gltf::import_glb_with_report(path),
+        "gltf" => gltf::import_gltf_with_report(path),
+        _ => import(path).map(|doc| (doc, ImportReport::default())),
     }
 }
 

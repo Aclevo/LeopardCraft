@@ -143,18 +143,42 @@ impl EvaluatedScene {
     }
 }
 
+/// Normalise `ClampRotation` bounds so evaluation cannot panic on a
+/// hand-edited or imported scene: a reversed pair is swapped per axis and a
+/// non-finite bound falls back to the full +-180 degree range on that axis.
+/// `f32::clamp` panics when its minimum exceeds its maximum, so the evaluator
+/// must never pass raw authored values through.
+pub(crate) fn normalized_clamp_bounds(min: Vec3, max: Vec3) -> (Vec3, Vec3) {
+    let mut low = min;
+    let mut high = max;
+    for axis in 0..3 {
+        let (a, b) = (low[axis], high[axis]);
+        if !a.is_finite() || !b.is_finite() {
+            low[axis] = -180.0;
+            high[axis] = 180.0;
+        } else if a > b {
+            low[axis] = b;
+            high[axis] = a;
+        }
+    }
+    (low, high)
+}
+
 impl Document {
     pub fn evaluate(&self, time: f32) -> EvaluatedScene {
         let time = if time.is_finite() { time.max(0.0) } else { 0.0 };
         let order = self.scene.depth_first();
         let mut locals: BTreeMap<NodeId, Transform> = BTreeMap::new();
 
-        // 1. Animated local transforms.
+        // 1. Animated local transforms, with authored joint limits applied to
+        // both direct animation and the rest pose before any solver runs.
         for id in &order {
             let Some(node) = self.scene.get(*id) else {
                 continue;
             };
-            locals.insert(*id, node.animation.apply_transform(node.transform, time));
+            let mut local = node.animation.apply_transform(node.transform, time);
+            let _ = crate::ik::clamp_joint_local(&self.scene, *id, &mut local);
+            locals.insert(*id, local);
         }
 
         // 2. World matrices with tag constraints. Two passes let constrained
@@ -171,6 +195,10 @@ impl Document {
             let local = locals.get(id).copied().unwrap_or(node.transform);
             worlds.insert(*id, parent_world * local.matrix());
         }
+        // Solve IK before the tag-constraint passes. The constraint loop below
+        // rebuilds every world matrix from the updated local rotations, so the
+        // geometry and skinning stages see the solved pose.
+        let _ = crate::ik::solve_ik_chains(&self.scene, &mut locals, &worlds);
         for _pass in 0..2 {
             for id in &order {
                 let Some(node) = self.scene.get(*id) else {
@@ -188,11 +216,12 @@ impl Document {
                                 let position = (parent_world * local.matrix()).w_axis.truncate();
                                 let desired =
                                     look_at_quat(position, target_world.w_axis.truncate(), *up);
-                                let parent_rot = parent_world.to_scale_rotation_translation().1;
+                                let parent_rot = world_rotation(parent_world);
                                 local.rotation = (parent_rot.inverse() * desired).normalize();
                             }
                         }
                         Tag::ClampRotation { min, max } => {
+                            let (min, max) = normalized_clamp_bounds(*min, *max);
                             let e = local.euler_degrees();
                             let clamped = Vec3::new(
                                 e.x.clamp(min.x, max.x),
@@ -272,7 +301,7 @@ impl Document {
             shadow_map.insert(*id, casts_shadow);
         }
 
-        // 4. Geometry, modifiers and skinning.
+        // 4. Geometry, modifiers, morph targets and skinning.
         let mut geometry_cache: HashMap<NodeId, EvaluatedGeometry> = HashMap::new();
         let mut visiting: HashSet<NodeId> = HashSet::new();
         let mut nodes = Vec::with_capacity(order.len());
@@ -289,10 +318,10 @@ impl Document {
             };
             let world = worlds.get(id).copied().unwrap_or(Mat4::IDENTITY);
             let local = locals.get(id).copied().unwrap_or(node.transform);
-            let (scale, rotation, translation) = world.to_scale_rotation_translation();
+            let (scale, _, translation) = world.to_scale_rotation_translation();
             let world_transform = Transform {
                 translation,
-                rotation,
+                rotation: world_rotation(world),
                 scale,
             };
             let rendered = rendered_map.get(id).copied().unwrap_or(false);
@@ -303,6 +332,7 @@ impl Document {
             if matches!(node.kind, NodeKind::Mesh { .. } | NodeKind::Spline { .. }) {
                 geo = self.evaluate_geometry_recursive(
                     *id,
+                    time,
                     &worlds,
                     &mut geometry_cache,
                     &mut visiting,
@@ -421,6 +451,7 @@ impl Document {
     fn evaluate_geometry_recursive(
         &self,
         id: NodeId,
+        time: f32,
         worlds: &BTreeMap<NodeId, Mat4>,
         cache: &mut HashMap<NodeId, EvaluatedGeometry>,
         visiting: &mut HashSet<NodeId>,
@@ -445,10 +476,43 @@ impl Document {
             _ => None,
         };
 
+        // The recorded morph base, not whatever pose the editable mesh is
+        // currently displayed in, is the source surface. That keeps a weight
+        // of zero at the base even after capturing a target from a moved mesh.
+        if let Some(mesh) = mesh.as_mut() {
+            node.morph.restore_base(&mut mesh.positions);
+            let weights: Vec<f32> = node
+                .morph
+                .targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    node.animation
+                        .sample_morph_weight(index as u32, time)
+                        .unwrap_or(target.weight)
+                })
+                .collect();
+            node.morph.apply_weighted(&mut mesh.positions, &weights);
+        }
+
         for modifier in &node.modifiers {
+            // The inspector and undo command write modifier fields directly,
+            // so repair a corrupt parameter here as well as on load.
+            let repaired;
+            let modifier = if modifier.parameters_are_finite() {
+                modifier
+            } else {
+                repaired = {
+                    let mut repaired = modifier.clone();
+                    repaired.sanitize();
+                    repaired
+                };
+                &repaired
+            };
             let operand_mesh = if let Modifier::Boolean { operand, .. } = modifier {
                 if *operand != id {
-                    let other = self.evaluate_geometry_recursive(*operand, worlds, cache, visiting);
+                    let other =
+                        self.evaluate_geometry_recursive(*operand, time, worlds, cache, visiting);
                     other.mesh.map(|mut m| {
                         let target_world = worlds.get(&id).copied().unwrap_or(Mat4::IDENTITY);
                         let source_world = worlds.get(operand).copied().unwrap_or(Mat4::IDENTITY);
@@ -500,7 +564,10 @@ fn apply_skin(
     for (i, joint) in skin.joints.iter().enumerate() {
         let joint_world = worlds.get(joint).copied().unwrap_or(Mat4::IDENTITY);
         let bind = skin.inverse_bind.get(i).copied().unwrap_or(Mat4::IDENTITY);
-        matrices.push(node_inv * joint_world * bind);
+        // `inverse_bind` stores the joint's inverse world at bind time. The
+        // trailing node world converts that world-space delta back into the
+        // mesh node's local space, so a transformed mesh still rests correctly.
+        matrices.push(node_inv * joint_world * bind * node_world);
     }
     let skinned = skin_positions_indexed(
         positions,
@@ -508,7 +575,13 @@ fn apply_skin(
         &skin.weights[..positions.len()],
         &matrices,
     );
-    positions.copy_from_slice(&skinned);
+    for (position, skinned) in positions.iter_mut().zip(&skinned) {
+        // A singular or overflowing joint chain has no meaningful deformation;
+        // keep that vertex at its rest pose instead of writing NaN or infinity.
+        if skinned.is_finite() {
+            *position = *skinned;
+        }
+    }
 }
 
 /// Convenience: build a camera look-at quaternion for a node transform.
@@ -516,10 +589,28 @@ pub fn aim_at(eye: Vec3, target: Vec3, up: Vec3) -> Quat {
     look_at_quat(eye, target, up)
 }
 
+/// Rotation carried by a world matrix, tolerating degenerate scale. A zero,
+/// non-finite or unmeasurably large scale makes `to_scale_rotation_translation`
+/// divide by it and return a NaN or non-unit quaternion. Such a matrix has no
+/// recoverable orientation, so callers get identity instead of NaN; a later
+/// non-degenerate frame restores the real rotation.
+pub(crate) fn world_rotation(world: Mat4) -> Quat {
+    let (scale, rotation, _) = world.to_scale_rotation_translation();
+    if scale.is_finite()
+        && scale.min_element() > 0.0
+        && rotation.is_finite()
+        && rotation.length_squared() > 1e-12
+    {
+        rotation.normalize()
+    } else {
+        Quat::IDENTITY
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GeometrySource, Primitive, Skin};
+    use crate::{GeometrySource, MorphTarget, Primitive, Skin, Tag};
     use lc_anim::{AnimationClip, Interpolation};
 
     #[test]
@@ -545,6 +636,35 @@ mod tests {
         let yb = b.node(id).unwrap().world.w_axis.y;
         assert!((ya - 1.05).abs() < 1e-4);
         assert!(yb > ya + 0.5);
+    }
+
+    #[test]
+    fn look_at_under_a_zero_scale_parent_keeps_a_finite_rotation() {
+        let mut doc = Document::empty();
+        let parent = doc.append_node(NodeKind::Null, "Parent", None);
+        doc.scene.get_mut(parent).unwrap().transform.scale = Vec3::ZERO;
+        let child = doc.append_node(NodeKind::Null, "Child", Some(parent));
+        doc.scene.get_mut(child).unwrap().transform.translation = Vec3::new(0.0, 0.0, 10.0);
+        let target = doc.append_node(NodeKind::Null, "Target", None);
+        doc.scene.get_mut(child).unwrap().tags.push(Tag::LookAt {
+            target,
+            up: Vec3::Y,
+        });
+
+        // A zero-scale parent has no recoverable rotation; the tag must stay
+        // finite instead of writing a NaN local rotation into the scene.
+        let solved = doc.evaluate(0.0);
+        let node = solved.node(child).unwrap();
+        assert!(
+            node.local.rotation.is_finite(),
+            "look-at under a zero-scale parent wrote {:?}",
+            node.local.rotation
+        );
+        assert!(
+            (node.local.rotation.length() - 1.0).abs() < 1e-4,
+            "the look-at rotation must stay unit length"
+        );
+        assert!(node.world.is_finite());
     }
 
     #[test]
@@ -609,12 +729,334 @@ mod tests {
         let mut doc = Document::demo();
         let id = doc.scene.find_by_name("Cube").unwrap();
         if let Some(node) = doc.scene.get_mut(id) {
-            node.modifiers.push(Modifier::Subdivision { levels: 2 });
+            node.modifiers.push(Modifier::Subdivision {
+                levels: 2,
+                scheme: Default::default(),
+            });
         }
         let scene = doc.evaluate(0.0);
         let node = scene.node(id).unwrap();
         let tris = node.mesh().map(|m| m.triangle_count()).unwrap_or(0);
         assert!(tris > 100, "got {tris} triangles");
+    }
+
+    #[test]
+    fn non_finite_primitive_dimensions_never_evaluate_to_non_finite_geometry() {
+        // The inspector edits primitive dimensions in place, so evaluation must
+        // repair them even when no load-time sanitize pass has run.
+        let primitives = [
+            Primitive::Box {
+                width: f32::INFINITY,
+                height: 2.0,
+                depth: 1.0,
+            },
+            Primitive::Sphere {
+                radius: f32::NAN,
+                segments: 8,
+                rings: 6,
+            },
+            Primitive::Cylinder {
+                radius: f32::INFINITY,
+                height: 2.0,
+                segments: 8,
+            },
+            Primitive::Capsule {
+                radius: 1.0,
+                height: f32::NEG_INFINITY,
+                segments: 8,
+                rings: 4,
+            },
+            Primitive::Disc {
+                radius: f32::NAN,
+                segments: 8,
+            },
+            Primitive::Cone {
+                radius: f32::INFINITY,
+                height: 2.0,
+                segments: 8,
+            },
+            Primitive::Torus {
+                major_radius: f32::INFINITY,
+                minor_radius: 0.25,
+                segments: 8,
+                rings: 6,
+            },
+            Primitive::Plane {
+                width: 2.0,
+                depth: f32::NAN,
+                segments_x: 2,
+                segments_z: 2,
+            },
+        ];
+        for primitive in primitives {
+            let mut doc = Document::empty();
+            let id = doc.append_node(
+                NodeKind::Mesh {
+                    geometry: GeometrySource::from_primitive(primitive),
+                },
+                "Poisoned Primitive",
+                None,
+            );
+            let scene = doc.evaluate(0.0);
+            let mesh = scene
+                .node(id)
+                .and_then(|node| node.mesh())
+                .cloned()
+                .expect("the primitive evaluates");
+            assert!(
+                mesh.positions.iter().all(|position| position.is_finite()),
+                "{} evaluated to non-finite positions from an in-memory dimension: {:?}",
+                primitive.label(),
+                mesh.positions
+            );
+            assert!(mesh.validate().is_ok(), "{}", primitive.label());
+            assert!(
+                scene.bounds.min.is_finite() && scene.bounds.max.is_finite(),
+                "{} produced non-finite scene bounds: {:?}",
+                primitive.label(),
+                scene.bounds
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_modifier_parameters_are_repaired_before_evaluation() {
+        // The inspector writes modifier fields directly into the document, so
+        // evaluation must not rely on the load-time sanitize pass.
+        for modifier in [
+            Modifier::ExtrudeFaces {
+                distance: f32::INFINITY,
+                individual: false,
+                faces: Vec::new(),
+            },
+            Modifier::BevelFaces {
+                amount: f32::NAN,
+                depth: 0.1,
+                faces: Vec::new(),
+            },
+        ] {
+            let mut doc = Document::empty();
+            let id = doc.append_node(
+                NodeKind::Mesh {
+                    geometry: GeometrySource::from_primitive(Primitive::Box {
+                        width: 1.0,
+                        height: 1.0,
+                        depth: 1.0,
+                    }),
+                },
+                "Box",
+                None,
+            );
+            doc.scene
+                .get_mut(id)
+                .unwrap()
+                .modifiers
+                .push(modifier.clone());
+            let mesh = doc
+                .evaluate(0.0)
+                .node(id)
+                .and_then(|node| node.mesh())
+                .cloned()
+                .expect("the box evaluates");
+            assert!(
+                mesh.positions.iter().all(|position| position.is_finite()),
+                "{} emitted non-finite positions from a non-finite parameter: {:?}",
+                modifier.label(),
+                mesh.positions
+            );
+            assert!(mesh.validate().is_ok(), "{}", modifier.label());
+        }
+    }
+
+    #[test]
+    fn morph_targets_blend_additively_before_skinning() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::from_primitive(Primitive::Box {
+                    width: 1.0,
+                    height: 1.0,
+                    depth: 1.0,
+                }),
+            },
+            "Morph Box",
+            None,
+        );
+        let rest = doc
+            .evaluate(0.0)
+            .node(id)
+            .and_then(|node| node.mesh())
+            .map(|mesh| mesh.positions.clone())
+            .unwrap();
+        let mut down = MorphTarget::new("Down", vec![-Vec3::Y; rest.len()]);
+        down.weight = 0.25;
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph.base = rest.clone();
+            node.morph
+                .targets
+                .push(MorphTarget::new("Up", vec![Vec3::Y; rest.len()]));
+            node.morph.targets.push(down);
+            node.morph.targets[0].weight = 0.5;
+        }
+        let posed = doc.evaluate(0.0);
+        let positions = &posed.node(id).unwrap().mesh().unwrap().positions;
+        for (rest, posed) in rest.iter().zip(positions) {
+            assert!(
+                (*posed - (*rest + Vec3::Y * 0.25)).length() < 1e-4,
+                "rest {rest:?} posed {posed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn morph_weights_clamp_and_stale_topology_is_ignored() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::from_primitive(Primitive::Box {
+                    width: 1.0,
+                    height: 1.0,
+                    depth: 1.0,
+                }),
+            },
+            "Morph Box",
+            None,
+        );
+        let rest = doc
+            .evaluate(0.0)
+            .node(id)
+            .and_then(|node| node.mesh())
+            .map(|mesh| mesh.positions.clone())
+            .unwrap();
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph.base = rest.clone();
+            let mut up = MorphTarget::new("Overdriven", vec![Vec3::Y; rest.len()]);
+            up.weight = 2.0;
+            node.morph.targets.push(up);
+            let mut stale = MorphTarget::new("Stale", vec![Vec3::X; 1]);
+            stale.weight = 1.0;
+            node.morph.targets.push(stale);
+        }
+        let posed = doc.evaluate(0.0);
+        let positions = &posed.node(id).unwrap().mesh().unwrap().positions;
+        for (rest, posed) in rest.iter().zip(positions) {
+            assert!((*posed - (*rest + Vec3::Y)).length() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn morph_weight_curve_clamps_extremes_and_roundtrips() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::from_primitive(Primitive::Box {
+                    width: 1.0,
+                    height: 1.0,
+                    depth: 1.0,
+                }),
+            },
+            "Curve Morph",
+            None,
+        );
+        let rest = doc
+            .evaluate(0.0)
+            .node(id)
+            .and_then(|node| node.mesh())
+            .map(|mesh| mesh.positions.clone())
+            .unwrap();
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph = crate::MorphSet {
+                base: rest.clone(),
+                targets: vec![MorphTarget::new("Lift", vec![Vec3::Y; rest.len()])],
+            };
+            for (time, value) in [(0.0, -0.5), (1.0, 0.5), (2.0, 1.5)] {
+                node.animation
+                    .set_morph_weight_key(0, time, value, Interpolation::Linear);
+            }
+        }
+
+        let check = |doc: &Document, time: f32, expected: f32| {
+            let position = doc
+                .evaluate(time)
+                .node(id)
+                .unwrap()
+                .mesh()
+                .unwrap()
+                .positions[0];
+            assert!(
+                (position - (rest[0] + Vec3::Y * expected)).length() < 1e-4,
+                "at {time}s expected weight {expected}, got {}",
+                (position - rest[0]).dot(Vec3::Y)
+            );
+        };
+        // The curve interpolates 0.5 at the midpoint and clamps the negative
+        // and over-one authored values at the extremes.
+        check(&doc, 0.0, 0.0);
+        check(&doc, 0.5, 0.0);
+        check(&doc, 1.5, 1.0);
+        check(&doc, 2.0, 1.0);
+
+        let json = crate::to_json(&doc).unwrap();
+        let loaded = crate::from_json(&json).unwrap();
+        assert_eq!(loaded.scene.get(id).unwrap().morph.base, rest);
+        assert_eq!(loaded.scene.get(id).unwrap().morph.targets.len(), 1);
+        for (time, expected) in [(0.0, 0.0), (0.5, 0.0), (1.5, 1.0), (2.0, 1.0)] {
+            check(&loaded, time, expected);
+        }
+        assert!(
+            (loaded
+                .scene
+                .get(id)
+                .unwrap()
+                .animation
+                .sample_morph_weight(0, 1.5)
+                .unwrap()
+                - 1.0)
+                .abs()
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn animated_morph_weight_is_sampled_from_the_take() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::from_primitive(Primitive::Box {
+                    width: 1.0,
+                    height: 1.0,
+                    depth: 1.0,
+                }),
+            },
+            "Animated Morph",
+            None,
+        );
+        let rest = doc
+            .evaluate(0.0)
+            .node(id)
+            .and_then(|node| node.mesh())
+            .map(|mesh| mesh.positions.clone())
+            .unwrap();
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph = crate::MorphSet {
+                base: rest.clone(),
+                targets: vec![MorphTarget::new("Lift", vec![Vec3::Y; rest.len()])],
+            };
+            node.animation
+                .set_morph_weight_key(0, 0.0, 0.0, Interpolation::Linear);
+            node.animation
+                .set_morph_weight_key(0, 1.0, 1.0, Interpolation::Linear);
+        }
+        let at_zero = doc.evaluate(0.0);
+        let at_one = doc.evaluate(1.0);
+        let zero = at_zero.node(id).unwrap().mesh().unwrap().positions[0];
+        let one = at_one.node(id).unwrap().mesh().unwrap().positions[0];
+        assert!((zero - rest[0]).length() < 1e-5);
+        assert!((one - (rest[0] + Vec3::Y)).length() < 1e-4);
     }
 
     #[test]
@@ -691,6 +1133,47 @@ mod tests {
     }
 
     #[test]
+    fn skinning_under_a_singular_mesh_world_keeps_rest_positions() {
+        let mut doc = Document::empty();
+        let joint = doc.append_node(
+            NodeKind::Joint {
+                length: 1.0,
+                width: 0.1,
+            },
+            "Joint",
+            None,
+        );
+        let mesh_id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(lc_geom::plane_mesh(1.0, 1.0, 1, 1)),
+            },
+            "Skinned",
+            None,
+        );
+        let mut skin = Skin::new(vec![joint], vec![Mat4::IDENTITY]);
+        skin.bind_all_to_first(4);
+        {
+            let node = doc.scene.get_mut(mesh_id).unwrap();
+            node.skin = Some(skin);
+            // Collapsing the mesh node makes its world matrix singular, so the
+            // skinning pass derives a non-finite inverse and joint matrices.
+            node.transform.scale = Vec3::ZERO;
+        }
+        doc.scene.get_mut(joint).unwrap().transform.translation.y = 2.0;
+
+        let scene = doc.evaluate(0.0);
+        let node = scene.node(mesh_id).unwrap();
+        let mesh = node.mesh().unwrap();
+        assert!(
+            mesh.positions.iter().all(|p| p.is_finite()),
+            "a singular mesh world must not skin vertices into NaN"
+        );
+        assert!(node.world_transform.rotation.is_finite());
+        assert!(node.world_transform.scale.is_finite());
+        assert!(node.world_transform.translation.is_finite());
+    }
+
+    #[test]
     fn layer_visibility_hides_nodes() {
         let mut doc = Document::demo();
         doc.settings.layers[0].visible = false;
@@ -698,6 +1181,60 @@ mod tests {
         assert!(scene.mesh_nodes().count() == 0);
         doc.settings.layers[0].visible = true;
         assert!(doc.evaluate(0.0).mesh_nodes().count() > 0);
+    }
+
+    #[test]
+    fn reversed_clamp_rotation_bounds_are_ordered_instead_of_panicking() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Clamped", None);
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.transform = Transform::from_euler_degrees(Vec3::new(0.0, 45.0, 30.0));
+            node.tags.push(Tag::ClampRotation {
+                min: Vec3::new(10.0, -180.0, 0.0),
+                max: Vec3::new(-10.0, 180.0, 0.0),
+            });
+        }
+
+        // Reversed X bounds are swapped and the zero-width Z range locks the
+        // axis. `f32::clamp` would panic on the raw pair.
+        let local = doc.evaluate(0.0).node(id).unwrap().local;
+        let euler = local.euler_degrees();
+        assert!(local.rotation.is_finite());
+        assert!(euler.x.abs() <= 10.0 + 1e-3, "x {euler:?}");
+        assert!((euler.y - 45.0).abs() < 1e-3, "y {euler:?}");
+        assert!(euler.z.abs() < 1e-3, "z {euler:?}");
+
+        // Loading normalises the stored tag so later saves stay sane.
+        let back = crate::from_json(&crate::to_json(&doc).unwrap()).unwrap();
+        match &back.scene.get(id).unwrap().tags[0] {
+            Tag::ClampRotation { min, max } => {
+                assert_eq!((min.x, min.z), (-10.0, 0.0));
+                assert_eq!((max.x, max.z), (10.0, 0.0));
+                assert_eq!((min.y, max.y), (-180.0, 180.0));
+            }
+            other => panic!("unexpected tag {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_finite_clamp_rotation_bounds_use_the_full_range() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Non-finite", None);
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.transform = Transform::from_euler_degrees(Vec3::new(0.0, 45.0, 0.0));
+            node.tags.push(Tag::ClampRotation {
+                min: Vec3::new(f32::NAN, -10.0, f32::NEG_INFINITY),
+                max: Vec3::new(20.0, 10.0, f32::INFINITY),
+            });
+        }
+        // The NaN X and infinite Z bounds become the full range, so only the
+        // finite Y range clamps the 45-degree rotation.
+        let local = doc.evaluate(0.0).node(id).unwrap().local;
+        assert!(local.rotation.is_finite());
+        let euler = local.euler_degrees();
+        assert!((euler.y - 10.0).abs() < 1e-3, "y {euler:?}");
     }
 
     #[test]

@@ -8,6 +8,7 @@ members = [
     "crates/lc-scene",
     "crates/lc-render",
     "crates/lc-io",
+    "crates/lc-mcp",
     "crates/lc-ui",
     "app",
 ]

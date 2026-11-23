@@ -17,6 +17,7 @@ pub enum Icon {
     PointMode,
     EdgeMode,
     PolygonMode,
+    WeightPaint,
     Box,
     Ball,
     Cylinder,
@@ -190,6 +191,7 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, tint: Color32) {
             ];
             painter.add(Shape::convex_polygon(pts, tint, Stroke::NONE));
         }
+        Icon::WeightPaint => weight_paint_icon(painter, rect, tint),
         Icon::Box => box_icon(painter, rect),
         Icon::Ball => ball_icon(painter, rect, Vec2::ZERO),
         Icon::Cylinder => cylinder_icon(painter, rect),
@@ -738,6 +740,22 @@ fn joint_icon(p: &Painter, r: Rect) {
     ));
     p.circle_filled(c, 2.6, Color32::from_rgb(61, 105, 47));
     p.circle_stroke(c, 4.2, Stroke::new(1.0, Color32::from_rgb(68, 116, 53)));
+}
+
+fn weight_paint_icon(p: &Painter, r: Rect, tint: Color32) {
+    let handle_start = r.left_bottom() + Vec2::new(4.0, -4.0);
+    let handle_end = r.center() + Vec2::new(2.0, -2.0);
+    p.line_segment([handle_start, handle_end], Stroke::new(2.4, tint));
+    p.circle_filled(handle_end, 3.2, tint);
+    p.add(Shape::convex_polygon(
+        vec![
+            handle_end + Vec2::new(2.5, -2.5),
+            r.right_top() + Vec2::new(-2.0, 2.0),
+            r.right_top() + Vec2::new(2.0, 6.0),
+        ],
+        tint.gamma_multiply(0.75),
+        Stroke::NONE,
+    ));
 }
 
 fn camera_icon(p: &Painter, r: Rect) {

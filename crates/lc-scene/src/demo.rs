@@ -200,7 +200,7 @@ impl Document {
                 (96.0, 1.05),
             ] {
                 node.animation
-                    .set_key(AnimProperty::TranslationY, t, y, Interpolation::Bezier);
+                    .set_key(AnimProperty::TranslationY, t, y, Interpolation::Smooth);
             }
             add(&mut doc, node, Some(geometry_root));
         }

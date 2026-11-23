@@ -58,6 +58,16 @@ pub enum SceneLightKind {
         v: Vec3,
         normal: Vec3,
     },
+    Spot {
+        position: Vec3,
+        radius: f32,
+        /// Cone axis, pointing away from the light.
+        direction: Vec3,
+        /// Cosine of the full-intensity cone angle (the larger of the two).
+        cos_inner: f32,
+        /// Cosine of the cone edge angle (the smaller of the two).
+        cos_outer: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +174,21 @@ impl RenderScene {
                     position: light.world.w_axis.truncate(),
                     radius,
                 },
+                LightKind::Spot {
+                    radius,
+                    inner_deg,
+                    outer_deg,
+                } => {
+                    let inner = inner_deg.clamp(0.0, 90.0);
+                    let outer = outer_deg.clamp(0.0, 90.0).max(inner);
+                    SceneLightKind::Spot {
+                        position: light.world.w_axis.truncate(),
+                        radius,
+                        direction: -light.world.z_axis.truncate().normalize_or(Vec3::Z),
+                        cos_inner: inner.to_radians().cos(),
+                        cos_outer: outer.to_radians().cos(),
+                    }
+                }
                 LightKind::Area { width, height } => {
                     let u = light.world.x_axis.truncate() * width;
                     let v = light.world.y_axis.truncate() * height;

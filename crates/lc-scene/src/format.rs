@@ -594,8 +594,15 @@ impl Document {
 
         for (&key, node) in scene.nodes.iter_mut() {
             node.id = key;
+            sanitize_transform(&mut node.transform);
             if node.name.trim().is_empty() {
                 node.name = format!("Object {key}");
+            }
+            if let Some(limits) = &mut node.rotation_limits {
+                *limits = limits.sanitized();
+            }
+            if !matches!(&node.kind, NodeKind::Joint { .. }) {
+                node.rotation_limits = None;
             }
             if node.layer >= layer_count {
                 node.layer = 0;
@@ -609,7 +616,8 @@ impl Document {
                 .retain(|_, m| valid_materials.contains(m));
             let old_tags = std::mem::take(&mut node.tags);
             let old_tag_animations = std::mem::take(&mut node.tag_animations);
-            for (old_index, tag) in old_tags.into_iter().enumerate() {
+            for (old_index, mut tag) in old_tags.into_iter().enumerate() {
+                sanitize_tag(&mut tag);
                 let valid = match &tag {
                     crate::Tag::LookAt { target, .. }
                     | crate::Tag::CopyLocation { source: target, .. } => node_ids.contains(target),
@@ -624,9 +632,14 @@ impl Document {
                     node.tags.push(tag);
                 }
             }
-            node.modifiers.retain(|m| match m {
-                crate::Modifier::Boolean { operand, .. } => node_ids.contains(operand),
-                _ => true,
+            node.modifiers.retain_mut(|modifier| {
+                if let crate::Modifier::Boolean { operand, .. } = modifier {
+                    if !node_ids.contains(operand) {
+                        return false;
+                    }
+                }
+                modifier.sanitize();
+                true
             });
             sanitize_animation(&mut node.animation);
             node.tag_animations
@@ -634,25 +647,66 @@ impl Document {
             for clip in node.tag_animations.values_mut() {
                 sanitize_animation(clip);
             }
-            if let NodeKind::Mesh {
-                geometry: crate::GeometrySource::Editable { mesh, .. },
-            } = &mut node.kind
-            {
-                repair_mesh(mesh);
+            if let NodeKind::Mesh { geometry } = &mut node.kind {
+                match geometry {
+                    crate::GeometrySource::Editable { mesh, origin } => {
+                        repair_mesh(mesh);
+                        if let Some(origin) = origin {
+                            origin.sanitize();
+                        }
+                    }
+                    crate::GeometrySource::Primitive { primitive } => primitive.sanitize(),
+                }
             }
+            if let NodeKind::Mesh { geometry } = &node.kind {
+                let vertex_count = match geometry {
+                    crate::GeometrySource::Editable { mesh, .. } => mesh.positions.len(),
+                    crate::GeometrySource::Primitive { primitive } => {
+                        primitive.build().positions.len()
+                    }
+                };
+                let targets_before = node.morph.targets.len();
+                node.morph.sanitize(Some(vertex_count));
+                if node.morph.targets.len() != targets_before {
+                    // Removing a target shifts the indices used by weight
+                    // curves; dropping them is safer than driving the wrong
+                    // target.
+                    node.animation.morph_weights.clear();
+                }
+            } else {
+                node.morph = Default::default();
+            }
+            let morph_target_count = node.morph.targets.len();
+            node.animation
+                .morph_weights
+                .retain(|index, _| (*index as usize) < morph_target_count);
+            let mesh_vertex_count = match &node.kind {
+                NodeKind::Mesh { geometry } => Some(match geometry {
+                    crate::GeometrySource::Editable { mesh, .. } => mesh.positions.len(),
+                    crate::GeometrySource::Primitive { primitive } => {
+                        primitive.build().positions.len()
+                    }
+                }),
+                _ => None,
+            };
             if let Some(skin) = &mut node.skin {
                 if skin.inverse_bind.len() != skin.joints.len()
+                    || skin.joints.is_empty()
                     || skin.joints.iter().any(|j| !node_ids.contains(j))
                 {
                     node.skin = None;
+                } else if let Some(mesh_vertex_count) = mesh_vertex_count {
+                    // Skin arrays index the evaluated mesh. A modifier stack can
+                    // change that topology, so only force the editable-mesh count
+                    // when there is no stack to change it.
+                    let vertex_count = if node.modifiers.is_empty() {
+                        mesh_vertex_count
+                    } else {
+                        skin.vertex_count()
+                    };
+                    skin.sanitize(vertex_count);
                 } else {
-                    for w in &mut skin.weights {
-                        for x in w.iter_mut() {
-                            if !x.is_finite() || *x < 0.0 {
-                                *x = 0.0;
-                            }
-                        }
-                    }
+                    node.skin = None;
                 }
             }
         }
@@ -774,6 +828,17 @@ impl Document {
     }
 }
 
+/// Repair tag values that evaluation cannot represent. A reversed
+/// `ClampRotation` range is representable in JSON and would make `f32::clamp`
+/// panic during evaluation, so the bounds are ordered here.
+fn sanitize_tag(tag: &mut crate::Tag) {
+    if let crate::Tag::ClampRotation { min, max } = tag {
+        let (low, high) = crate::eval::normalized_clamp_bounds(*min, *max);
+        *min = low;
+        *max = high;
+    }
+}
+
 fn sanitize_animation(animation: &mut lc_anim::AnimationClip) {
     for track in &mut animation.tracks {
         track
@@ -787,6 +852,18 @@ fn sanitize_animation(animation: &mut lc_anim::AnimationClip) {
             }
             if !key.tangent_out.is_finite() {
                 key.tangent_out = 0.0;
+            }
+            // Pre-tangent-type files deserialize the new fields as Spline.
+            // A non-manual Smooth key used Catmull-Rom before those fields
+            // existed, so restore that automatic rule instead of silently
+            // changing an old scene to Spline's secant fallback.
+            if !key.tangent_manual
+                && key.interpolation == lc_anim::Interpolation::Smooth
+                && key.tangent_in_type == lc_anim::TangentType::Spline
+                && key.tangent_out_type == lc_anim::TangentType::Spline
+            {
+                key.tangent_in_type = lc_anim::TangentType::Smooth;
+                key.tangent_out_type = lc_anim::TangentType::Smooth;
             }
         }
         track.curve.keys.sort_by(|a, b| {
@@ -803,6 +880,103 @@ fn sanitize_animation(animation: &mut lc_anim::AnimationClip) {
         }
     }
     animation.tracks.retain(|t| !t.curve.keys.is_empty());
+    for curve in animation.morph_weights.values_mut() {
+        curve
+            .keys
+            .retain(|k| k.time.is_finite() && k.value.is_finite());
+        for key in &mut curve.keys {
+            key.time = key.time.max(0.0);
+            if !key.tangent_in.is_finite() {
+                key.tangent_in = 0.0;
+            }
+            if !key.tangent_out.is_finite() {
+                key.tangent_out = 0.0;
+            }
+            if !key.tangent_manual
+                && key.interpolation == lc_anim::Interpolation::Smooth
+                && key.tangent_in_type == lc_anim::TangentType::Spline
+                && key.tangent_out_type == lc_anim::TangentType::Spline
+            {
+                key.tangent_in_type = lc_anim::TangentType::Smooth;
+                key.tangent_out_type = lc_anim::TangentType::Smooth;
+            }
+        }
+        curve.keys.sort_by(|a, b| {
+            a.time
+                .partial_cmp(&b.time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        curve.keys.dedup_by(|a, b| (a.time - b.time).abs() < 1e-6);
+        if !curve.keys.is_empty() {
+            curve.update_tangents();
+        }
+    }
+    animation
+        .morph_weights
+        .retain(|_, curve| !curve.keys.is_empty());
+    if let Some(rotation) = animation.rotation.as_mut() {
+        // Quaternion keys need the same repair as scalar keys: sampling binary
+        // searches the track, so non-finite or unsorted keys are dropped,
+        // clamped and ordered here instead of producing a NaN pose.
+        rotation
+            .keys
+            .retain(|key| key.time.is_finite() && key.value.is_finite());
+        for key in &mut rotation.keys {
+            key.time = key.time.max(0.0);
+            // The same legacy rule applies to quaternion keys: old Smooth
+            // rotations used the automatic Catmull-Rom cubic control, while a
+            // missing new field deserializes as Spline.
+            if key.interpolation == lc_anim::Interpolation::Smooth
+                && key.tangent_in_type == lc_anim::TangentType::Spline
+                && key.tangent_out_type == lc_anim::TangentType::Spline
+            {
+                key.tangent_in_type = lc_anim::TangentType::Smooth;
+                key.tangent_out_type = lc_anim::TangentType::Smooth;
+            }
+        }
+        rotation.keys.sort_by(|a, b| {
+            a.time
+                .partial_cmp(&b.time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rotation
+            .keys
+            .dedup_by(|a, b| (a.time - b.time).abs() < 1e-6);
+        if rotation.keys.is_empty() {
+            animation.rotation = None;
+        }
+    }
+}
+
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
+/// Repair transform values that cannot be represented. A JSON number beyond
+/// f32's range deserializes as infinity, and a zero or non-finite quaternion
+/// cannot build a rotation matrix, so both are replaced with a neutral value
+/// before evaluation. Merely large finite values are left alone.
+fn sanitize_transform(transform: &mut lc_core::Transform) {
+    transform.translation = glam::Vec3::new(
+        finite_or(transform.translation.x, 0.0),
+        finite_or(transform.translation.y, 0.0),
+        finite_or(transform.translation.z, 0.0),
+    );
+    transform.scale = glam::Vec3::new(
+        finite_or(transform.scale.x, 1.0),
+        finite_or(transform.scale.y, 1.0),
+        finite_or(transform.scale.z, 1.0),
+    );
+    let length_squared = transform.rotation.length_squared();
+    if !length_squared.is_finite() || length_squared <= f32::EPSILON {
+        transform.rotation = glam::Quat::IDENTITY;
+    } else if (length_squared - 1.0).abs() > 1e-5 {
+        transform.rotation = transform.rotation.normalize();
+    }
 }
 
 fn repair_mesh(mesh: &mut lc_geom::Mesh) {
@@ -839,11 +1013,238 @@ fn repair_mesh(mesh: &mut lc_geom::Mesh) {
     });
     mesh.compact_points();
     mesh.remove_degenerate_polygons();
+    mesh.normalize_creases();
+    mesh.normalize_seams();
+    mesh.normalize_pinned_uvs();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_finite_and_degenerate_transforms_are_repaired_on_load() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Broken", None);
+        {
+            let transform = &mut doc.scene.get_mut(id).unwrap().transform;
+            transform.translation = glam::Vec3::new(f32::INFINITY, 2.0, f32::NAN);
+            transform.rotation = glam::Quat::from_xyzw(0.0, 0.0, 0.0, 2.0);
+            transform.scale = glam::Vec3::new(f32::NAN, 3.0, f32::NEG_INFINITY);
+        }
+
+        doc.sanitize();
+
+        let transform = doc.scene.get(id).unwrap().transform;
+        assert_eq!(transform.translation, glam::Vec3::new(0.0, 2.0, 0.0));
+        assert_eq!(transform.scale, glam::Vec3::new(1.0, 3.0, 1.0));
+        assert!(
+            (transform.rotation.length() - 1.0).abs() < 1e-5,
+            "rotation {:?}",
+            transform.rotation
+        );
+        assert!(doc.evaluate(0.0).node(id).unwrap().world.is_finite());
+    }
+
+    fn primitive_variants() -> Vec<crate::Primitive> {
+        use crate::Primitive;
+        vec![
+            Primitive::Box {
+                width: 1.0,
+                height: 2.0,
+                depth: 3.0,
+            },
+            Primitive::Sphere {
+                radius: 1.0,
+                segments: 8,
+                rings: 6,
+            },
+            Primitive::Cylinder {
+                radius: 1.0,
+                height: 2.0,
+                segments: 8,
+            },
+            Primitive::Capsule {
+                radius: 1.0,
+                height: 2.0,
+                segments: 8,
+                rings: 4,
+            },
+            Primitive::Disc {
+                radius: 1.0,
+                segments: 8,
+            },
+            Primitive::Cone {
+                radius: 1.0,
+                height: 2.0,
+                segments: 8,
+            },
+            Primitive::Torus {
+                major_radius: 1.0,
+                minor_radius: 0.25,
+                segments: 8,
+                rings: 6,
+            },
+            Primitive::Plane {
+                width: 2.0,
+                depth: 3.0,
+                segments_x: 2,
+                segments_z: 3,
+            },
+        ]
+    }
+
+    fn primitive_float_fields(primitive: &crate::Primitive) -> &'static [&'static str] {
+        use crate::Primitive;
+        match primitive {
+            Primitive::Box { .. } => &["width", "height", "depth"],
+            Primitive::Sphere { .. } => &["radius"],
+            Primitive::Cylinder { .. } => &["radius", "height"],
+            Primitive::Capsule { .. } => &["radius", "height"],
+            Primitive::Disc { .. } => &["radius"],
+            Primitive::Cone { .. } => &["radius", "height"],
+            Primitive::Torus { .. } => &["major_radius", "minor_radius"],
+            Primitive::Plane { .. } => &["width", "depth"],
+        }
+    }
+
+    fn primitive_floats(primitive: &crate::Primitive) -> Vec<f32> {
+        use crate::Primitive;
+        match *primitive {
+            Primitive::Box {
+                width,
+                height,
+                depth,
+            } => vec![width, height, depth],
+            Primitive::Sphere { radius, .. } => vec![radius],
+            Primitive::Cylinder { radius, height, .. } => vec![radius, height],
+            Primitive::Capsule { radius, height, .. } => vec![radius, height],
+            Primitive::Disc { radius, .. } => vec![radius],
+            Primitive::Cone { radius, height, .. } => vec![radius, height],
+            Primitive::Torus {
+                major_radius,
+                minor_radius,
+                ..
+            } => vec![major_radius, minor_radius],
+            Primitive::Plane { width, depth, .. } => vec![width, depth],
+        }
+    }
+
+    #[test]
+    fn non_finite_primitive_dimensions_never_build_non_finite_geometry_on_load() {
+        // `1e39` is a finite JSON number that serde casts to f32 infinity.
+        // Every primitive variant must be repaired on load, not just the ones
+        // that happen to flow through a mesh-modelling operation later.
+        for primitive in primitive_variants() {
+            let mut doc = Document::empty();
+            let id = doc.append_node(
+                NodeKind::Mesh {
+                    geometry: crate::GeometrySource::from_primitive(primitive),
+                },
+                primitive.label(),
+                None,
+            );
+            let mut value = serde_json::to_value(&doc).unwrap();
+            {
+                let primitive_value =
+                    &mut value["scene"]["nodes"][id.to_string()]["kind"]["geometry"]["primitive"];
+                assert!(primitive_value.is_object(), "primitive JSON path");
+                for field in primitive_float_fields(&primitive) {
+                    primitive_value[*field] = serde_json::json!(1e39);
+                }
+            }
+            let loaded = from_json(&value.to_string()).expect("the crafted scene loads");
+
+            let evaluated = loaded.evaluate(0.0);
+            let mesh = evaluated
+                .node(id)
+                .and_then(|node| node.mesh())
+                .cloned()
+                .expect("the primitive evaluates");
+            assert!(
+                mesh.positions.iter().all(|position| position.is_finite()),
+                "{} built non-finite positions from a crafted dimension: {:?}",
+                primitive.label(),
+                mesh.positions
+            );
+            assert!(mesh.validate().is_ok(), "{}", primitive.label());
+            assert!(
+                evaluated.bounds.min.is_finite() && evaluated.bounds.max.is_finite(),
+                "{} produced non-finite scene bounds: {:?}",
+                primitive.label(),
+                evaluated.bounds
+            );
+
+            let stored = match &loaded.scene.get(id).unwrap().kind {
+                NodeKind::Mesh { geometry } => geometry
+                    .primitive()
+                    .copied()
+                    .expect("the node is still a primitive"),
+                _ => panic!("the node kind changed on load"),
+            };
+            assert!(
+                primitive_floats(&stored)
+                    .iter()
+                    .all(|value| value.is_finite()),
+                "{} kept a non-finite dimension after load: {:?}",
+                primitive.label(),
+                primitive_floats(&stored)
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_modifier_parameters_are_repaired_on_load() {
+        // `1e39` is a finite JSON number but overflows f32 to infinity. A
+        // modifier parameter is not mesh geometry, so `repair_mesh` never sees
+        // it; the load sanitize pass must repair it before evaluation.
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::from_primitive(crate::Primitive::Box {
+                    width: 1.0,
+                    height: 1.0,
+                    depth: 1.0,
+                }),
+            },
+            "Extruded Box",
+            None,
+        );
+        doc.scene
+            .get_mut(id)
+            .unwrap()
+            .modifiers
+            .push(crate::Modifier::ExtrudeFaces {
+                distance: 0.5,
+                individual: false,
+                faces: Vec::new(),
+            });
+
+        let mut value = serde_json::to_value(&doc).unwrap();
+        value["scene"]["nodes"][id.to_string()]["modifiers"][0]["distance"] =
+            serde_json::json!(1e39);
+        let loaded = from_json(&value.to_string()).unwrap();
+
+        let mesh = loaded
+            .evaluate(0.0)
+            .node(id)
+            .and_then(|node| node.mesh())
+            .cloned()
+            .expect("the box evaluates");
+        assert!(
+            mesh.positions.iter().all(|position| position.is_finite()),
+            "a loaded Extrude distance overflowed evaluated positions: {:?}",
+            mesh.positions
+        );
+        assert!(mesh.validate().is_ok());
+        assert!(
+            matches!(
+                loaded.scene.get(id).unwrap().modifiers.as_slice(),
+                [crate::Modifier::ExtrudeFaces { distance, .. }] if distance.is_finite()
+            ),
+            "the load sanitize pass left the modifier parameter non-finite"
+        );
+    }
 
     #[test]
     fn demo_roundtrips_exactly() {
@@ -853,6 +1254,650 @@ mod tests {
         assert_eq!(doc.signature(), back.signature());
         assert_eq!(doc.scene.len(), back.scene.len());
         assert_eq!(back.scene.roots, doc.scene.roots);
+    }
+
+    #[test]
+    fn a_spot_light_roundtrips_through_native_format() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Light {
+                light: crate::Light {
+                    kind: crate::LightKind::Spot {
+                        radius: 7.5,
+                        inner_deg: 20.0,
+                        outer_deg: 35.0,
+                    },
+                    color: glam::Vec3::new(0.2, 1.0, 0.6),
+                    intensity: 2.0,
+                    cast_shadows: false,
+                },
+            },
+            "Spot",
+            None,
+        );
+        let json = to_json(&doc).unwrap();
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(
+            loaded.scene.get(id).unwrap().kind,
+            doc.scene.get(id).unwrap().kind,
+            "spot cone, radius or colour changed across a save/load"
+        );
+    }
+
+    #[test]
+    fn creases_and_subdivision_schemes_roundtrip_through_native_format() {
+        let mut mesh = lc_geom::box_mesh(2.0, 2.0, 2.0);
+        lc_geom::box_projection(&mut mesh, 1.0);
+        assert!(mesh.set_crease(0, 1, true));
+        assert!(mesh.set_crease(1, 2, true));
+        assert!(mesh.set_seam(2, 3, true));
+        assert!(mesh.set_seam(3, 0, true));
+        assert!(mesh.set_uv_pinned(2, true));
+        assert!(mesh.set_uv_pinned(5, true));
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable { mesh, origin: None },
+            },
+            "Creased Mesh",
+            None,
+        );
+        doc.scene
+            .get_mut(id)
+            .unwrap()
+            .modifiers
+            .push(crate::Modifier::Subdivision {
+                levels: 3,
+                scheme: crate::SubdivisionScheme::StamLoop,
+            });
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains("\"creases\""));
+        assert!(json.contains("\"seams\""));
+        assert!(json.contains("\"pinned_uvs\""));
+        assert!(json.contains("stam_loop"));
+        let back = from_json(&json).unwrap();
+        assert_eq!(doc.signature(), back.signature());
+        let node = back.scene.get(id).unwrap();
+        assert!(matches!(
+            node.modifiers.first(),
+            Some(crate::Modifier::Subdivision {
+                levels: 3,
+                scheme: crate::SubdivisionScheme::StamLoop
+            })
+        ));
+        let NodeKind::Mesh {
+            geometry: crate::GeometrySource::Editable { mesh, .. },
+        } = &node.kind
+        else {
+            panic!("expected an editable mesh");
+        };
+        assert!(mesh.is_crease(0, 1));
+        assert!(mesh.is_crease(1, 2));
+        assert!(mesh.is_seam(2, 3));
+        assert!(mesh.is_seam(3, 0));
+        assert!(mesh.is_uv_pinned(2));
+        assert!(mesh.is_uv_pinned(5));
+    }
+
+    #[test]
+    fn a_filled_hole_roundtrips_through_the_native_format() {
+        let mut mesh = lc_geom::box_mesh(2.0, 2.0, 2.0);
+        lc_geom::box_projection(&mut mesh, 1.0);
+        mesh.polygons.remove(0);
+        let border = mesh.boundary_loops()[0].clone();
+        assert!(mesh.set_crease(border[0], border[1], true));
+        assert!(mesh.set_seam(border[1], border[2], true));
+        assert!(mesh.set_uv_pinned(0, true));
+        let holes = lc_geom::open_holes(&mesh, &border[..1]);
+        let filled = lc_geom::fill_holes(&mesh, &holes).unwrap();
+        assert!(filled.boundary_loops().is_empty());
+
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable {
+                    mesh: filled,
+                    origin: None,
+                },
+            },
+            "Filled Hole",
+            None,
+        );
+        let json = to_json(&doc).unwrap();
+        let back = from_json(&json).unwrap();
+        assert_eq!(doc.signature(), back.signature());
+        let NodeKind::Mesh { geometry } = &back.scene.get(id).unwrap().kind else {
+            panic!("expected a mesh node");
+        };
+        let crate::GeometrySource::Editable { mesh, .. } = geometry else {
+            panic!("expected an editable mesh");
+        };
+        assert_eq!(mesh.polygons.len(), 6);
+        assert!(
+            mesh.boundary_loops().is_empty(),
+            "the filled border survives loading"
+        );
+        assert_eq!(mesh.creases.len(), 1);
+        assert_eq!(mesh.seams.len(), 1);
+        assert_eq!(mesh.pinned_uvs, vec![0]);
+    }
+
+    #[test]
+    fn a_shelled_mesh_roundtrips_with_a_split_part_marks_and_a_filled_hole() {
+        let mut mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        lc_geom::box_projection(&mut mesh, 1.0);
+        let removed = mesh.polygons.remove(0);
+        let border: Vec<u32> = removed.corners.iter().map(|c| c.point).collect();
+        let holes = lc_geom::open_holes(&mesh, &border[..1]);
+        mesh = lc_geom::fill_holes(&mesh, &holes).unwrap();
+        mesh.toggle_crease(border[0], border[1]);
+        mesh.toggle_seam(border[1], border[2]);
+        mesh.set_uv_pinned(mesh.polygons[0].corners[0].uv, true);
+
+        let faces: Vec<u32> = (0..mesh.polygons.len() as u32).collect();
+        let shelled = lc_geom::shell_faces(&mesh, &faces, 0.1, true, 30.0, 0.0).unwrap();
+        assert_eq!(shelled.polygons.len(), 12);
+        let part = lc_geom::extract_faces(&shelled, &[0]).unwrap();
+
+        let mut doc = Document::empty();
+        let source = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable {
+                    mesh: shelled,
+                    origin: None,
+                },
+            },
+            "Shelled Source",
+            None,
+        );
+        let split = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable {
+                    mesh: part,
+                    origin: None,
+                },
+            },
+            "Shelled Source Split",
+            None,
+        );
+
+        let json = to_json(&doc).unwrap();
+        let back = from_json(&json).unwrap();
+        assert_eq!(doc.signature(), back.signature());
+
+        fn editable_mesh_of(doc: &Document, id: crate::NodeId) -> lc_geom::Mesh {
+            let NodeKind::Mesh { geometry } = &doc.scene.get(id).expect("node").kind else {
+                panic!("expected a mesh node");
+            };
+            let crate::GeometrySource::Editable { mesh, .. } = geometry else {
+                panic!("expected an editable mesh");
+            };
+            mesh.clone()
+        }
+
+        let source_mesh = editable_mesh_of(&back, source);
+        assert_eq!(source_mesh.polygons.len(), 12, "the shell survives loading");
+        assert_eq!(source_mesh.positions.len(), 16);
+        assert!(
+            source_mesh.boundary_loops().is_empty(),
+            "the filled hole and the shell stay closed"
+        );
+        assert_eq!(source_mesh.creases.len(), 1);
+        assert_eq!(source_mesh.seams.len(), 1);
+        assert_eq!(source_mesh.pinned_uvs.len(), 1);
+
+        let part_mesh = editable_mesh_of(&back, split);
+        assert_eq!(part_mesh.polygons.len(), 1);
+        assert!(part_mesh.validate().is_ok());
+    }
+
+    #[test]
+    fn a_split_part_roundtrips_beside_the_filled_source_mesh() {
+        let mut mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        lc_geom::box_projection(&mut mesh, 1.0);
+        let removed = mesh.polygons.remove(0);
+        let border: Vec<u32> = removed.corners.iter().map(|c| c.point).collect();
+        let holes = lc_geom::open_holes(&mesh, &border[..1]);
+        let mut filled = lc_geom::fill_holes(&mesh, &holes).unwrap();
+        filled.toggle_crease(border[0], border[1]);
+        filled.toggle_seam(border[1], border[2]);
+        let filled_face = filled.polygons.len() - 1;
+        filled.set_uv_pinned(filled.polygons[filled_face].corners[0].uv, true);
+        let part = lc_geom::extract_faces(&filled, &[filled_face as u32]).unwrap();
+        assert_eq!(part.polygons.len(), 1);
+        assert_eq!(part.positions.len(), border.len());
+
+        let mut doc = Document::empty();
+        let source = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable {
+                    mesh: filled,
+                    origin: None,
+                },
+            },
+            "Filled Source",
+            None,
+        );
+        let split = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable {
+                    mesh: part,
+                    origin: None,
+                },
+            },
+            "Filled Source Split",
+            None,
+        );
+        doc.scene
+            .get_mut(split)
+            .unwrap()
+            .tags
+            .push(crate::Tag::RenderOverride {
+                visible: true,
+                casts_shadow: true,
+            });
+
+        let json = to_json(&doc).unwrap();
+        let back = from_json(&json).unwrap();
+        assert_eq!(doc.signature(), back.signature());
+
+        fn editable_mesh_of(doc: &Document, id: crate::NodeId) -> lc_geom::Mesh {
+            let NodeKind::Mesh { geometry } = &doc.scene.get(id).expect("node").kind else {
+                panic!("expected a mesh node");
+            };
+            let crate::GeometrySource::Editable { mesh, .. } = geometry else {
+                panic!("expected an editable mesh");
+            };
+            mesh.clone()
+        }
+
+        let source_mesh = editable_mesh_of(&back, source);
+        assert_eq!(
+            source_mesh.polygons.len(),
+            6,
+            "the source keeps every polygon"
+        );
+        assert!(source_mesh.boundary_loops().is_empty());
+        assert_eq!(source_mesh.creases.len(), 1);
+        assert_eq!(source_mesh.seams.len(), 1);
+        assert_eq!(source_mesh.pinned_uvs.len(), 1);
+
+        let part_mesh = editable_mesh_of(&back, split);
+        assert_eq!(part_mesh.polygons.len(), 1);
+        assert_eq!(part_mesh.boundary_loops().len(), 1);
+        assert_eq!(part_mesh.creases.len(), 1);
+        assert_eq!(part_mesh.seams.len(), 1);
+        assert_eq!(part_mesh.pinned_uvs.len(), 1);
+        assert_eq!(back.scene.get(split).unwrap().tags.len(), 1);
+    }
+
+    #[test]
+    fn legacy_documents_without_creases_default_to_catmull_clark() {
+        fn strip_new_subdivision_fields(value: &mut serde_json::Value) {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("creases");
+                object.remove("seams");
+                object.remove("pinned_uvs");
+                object.remove("scheme");
+                for child in object.values_mut() {
+                    strip_new_subdivision_fields(child);
+                }
+            } else if let Some(array) = value.as_array_mut() {
+                for child in array {
+                    strip_new_subdivision_fields(child);
+                }
+            }
+        }
+
+        let mesh = lc_geom::box_mesh(2.0, 2.0, 2.0);
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable { mesh, origin: None },
+            },
+            "Legacy Mesh",
+            None,
+        );
+        doc.scene
+            .get_mut(id)
+            .unwrap()
+            .modifiers
+            .push(crate::Modifier::Subdivision {
+                levels: 2,
+                scheme: crate::SubdivisionScheme::StamLoop,
+            });
+        let mut legacy: serde_json::Value = serde_json::from_str(&to_json(&doc).unwrap()).unwrap();
+        strip_new_subdivision_fields(&mut legacy);
+        let back = from_json(&legacy.to_string()).unwrap();
+        let node = back.scene.get(id).unwrap();
+        assert!(matches!(
+            node.modifiers.first(),
+            Some(crate::Modifier::Subdivision {
+                levels: 2,
+                scheme: crate::SubdivisionScheme::CatmullClark
+            })
+        ));
+        let NodeKind::Mesh {
+            geometry: crate::GeometrySource::Editable { mesh, .. },
+        } = &node.kind
+        else {
+            panic!("expected an editable mesh");
+        };
+        assert!(mesh.creases.is_empty());
+        assert!(mesh.seams.is_empty());
+        assert!(mesh.pinned_uvs.is_empty());
+    }
+
+    #[test]
+    fn manual_tangents_roundtrip_through_native_format() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Tangent Null", None);
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.animation.set_key(
+                lc_anim::AnimProperty::TranslationX,
+                0.0,
+                0.0,
+                lc_anim::Interpolation::Smooth,
+            );
+            node.animation.set_key(
+                lc_anim::AnimProperty::TranslationX,
+                1.0,
+                1.0,
+                lc_anim::Interpolation::Smooth,
+            );
+            let curve = &mut node
+                .animation
+                .track_mut(lc_anim::AnimProperty::TranslationX)
+                .unwrap()
+                .curve;
+            assert!(curve.set_manual_tangents(0.0, 0.0, 2.0));
+            assert!(curve.set_manual_tangents(1.0, 0.0, 0.0));
+        }
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains("\"tangent_manual\""));
+        let back = from_json(&json).unwrap();
+        let curve = &back
+            .scene
+            .get(id)
+            .unwrap()
+            .animation
+            .track(lc_anim::AnimProperty::TranslationX)
+            .unwrap()
+            .curve;
+        assert!(curve.keys[0].tangent_manual);
+        assert!((curve.keys[0].tangent_out - 2.0).abs() < 1e-5);
+        assert!((curve.sample(0.5) - 0.75).abs() < 1e-4);
+        assert_eq!(doc.signature(), back.signature());
+    }
+
+    #[test]
+    fn retimed_animation_roundtrips_through_native_format() {
+        let mut mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        mesh.compact_points();
+        let base = mesh.positions.clone();
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable { mesh, origin: None },
+            },
+            "Retimed Mesh",
+            None,
+        );
+        doc.scene.get_mut(id).unwrap().morph = crate::MorphSet {
+            base: base.clone(),
+            targets: vec![crate::MorphTarget::new(
+                "Lift",
+                vec![glam::Vec3::Y * 0.25; base.len()],
+            )],
+        };
+        {
+            let animation = &mut doc.scene.get_mut(id).unwrap().animation;
+            animation.set_key(
+                lc_anim::AnimProperty::TranslationX,
+                1.0,
+                0.0,
+                lc_anim::Interpolation::Smooth,
+            );
+            animation.set_key(
+                lc_anim::AnimProperty::TranslationX,
+                3.0,
+                1.0,
+                lc_anim::Interpolation::Smooth,
+            );
+            let curve = &mut animation
+                .track_mut(lc_anim::AnimProperty::TranslationX)
+                .unwrap()
+                .curve;
+            assert!(curve.set_manual_tangents(1.0, 0.0, 2.0));
+            assert!(curve.set_manual_tangents(3.0, 0.0, 0.0));
+            animation.set_morph_weight_key(0, 1.0, 0.0, lc_anim::Interpolation::Linear);
+            animation.set_morph_weight_key(0, 3.0, 1.0, lc_anim::Interpolation::Linear);
+            animation.set_rotation_key(1.0, glam::Quat::IDENTITY, lc_anim::Interpolation::Linear);
+            animation.set_rotation_key(
+                3.0,
+                glam::Quat::from_rotation_y(1.0),
+                lc_anim::Interpolation::Linear,
+            );
+            assert!(animation.retime_all(0.0, 2.0));
+        }
+        let json = to_json(&doc).unwrap();
+        let back = from_json(&json).unwrap();
+        let animation = &back.scene.get(id).unwrap().animation;
+        let scalar = animation
+            .track(lc_anim::AnimProperty::TranslationX)
+            .unwrap();
+        assert!((scalar.curve.keys[0].time - 2.0).abs() < 1e-5);
+        assert!((scalar.curve.keys[1].time - 6.0).abs() < 1e-5);
+        assert!(scalar.curve.keys[0].tangent_manual);
+        assert!((scalar.curve.keys[0].tangent_out - 1.0).abs() < 1e-5);
+        assert!((animation.morph_weights.get(&0).unwrap().keys[1].time - 6.0).abs() < 1e-5);
+        assert!((animation.rotation.as_ref().unwrap().keys[1].time - 6.0).abs() < 1e-5);
+        assert_eq!(doc.signature(), back.signature());
+    }
+
+    #[test]
+    fn interpolation_and_tangent_types_roundtrip_through_native_format() {
+        let mut mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        mesh.compact_points();
+        let base = mesh.positions.clone();
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable { mesh, origin: None },
+            },
+            "Interpolation Mesh",
+            None,
+        );
+        doc.scene.get_mut(id).unwrap().morph = crate::MorphSet {
+            base: base.clone(),
+            targets: vec![crate::MorphTarget::new(
+                "Lift",
+                vec![glam::Vec3::Y * 0.25; base.len()],
+            )],
+        };
+        {
+            let animation = &mut doc.scene.get_mut(id).unwrap().animation;
+            let modes = [
+                lc_anim::Interpolation::Constant,
+                lc_anim::Interpolation::Linear,
+                lc_anim::Interpolation::Smooth,
+                lc_anim::Interpolation::Spline,
+            ];
+            for (index, mode) in modes.into_iter().enumerate() {
+                animation.set_key(
+                    lc_anim::AnimProperty::TranslationX,
+                    index as f32,
+                    index as f32,
+                    mode,
+                );
+            }
+            let curve = &mut animation
+                .track_mut(lc_anim::AnimProperty::TranslationX)
+                .unwrap()
+                .curve;
+            assert!(curve.set_tangent_type(0.0, lc_anim::TangentType::Smooth, true, true));
+            assert!(curve.set_tangent_type(2.0, lc_anim::TangentType::Constant, true, true));
+            assert!(curve.set_manual_tangents(3.0, -1.0, 0.0));
+
+            animation.set_morph_weight_key(0, 0.0, 0.0, lc_anim::Interpolation::Linear);
+            animation.set_morph_weight_key(0, 3.0, 1.0, lc_anim::Interpolation::Smooth);
+            animation.set_rotation_key(0.0, glam::Quat::IDENTITY, lc_anim::Interpolation::Constant);
+            animation.set_rotation_key(
+                3.0,
+                glam::Quat::from_rotation_y(1.0),
+                lc_anim::Interpolation::Spline,
+            );
+        }
+        let before = doc.signature();
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains("\"tangent_in_type\""));
+        assert!(json.contains("\"spline\""));
+        let back = from_json(&json).unwrap();
+        assert_eq!(before, back.signature());
+
+        let animation = &back.scene.get(id).unwrap().animation;
+        let curve = &animation
+            .track(lc_anim::AnimProperty::TranslationX)
+            .unwrap()
+            .curve;
+        assert_eq!(
+            curve.keys[0].interpolation,
+            lc_anim::Interpolation::Constant
+        );
+        assert_eq!(curve.keys[1].interpolation, lc_anim::Interpolation::Linear);
+        assert_eq!(curve.keys[2].interpolation, lc_anim::Interpolation::Smooth);
+        assert_eq!(curve.keys[3].interpolation, lc_anim::Interpolation::Spline);
+        assert_eq!(curve.keys[0].tangent_in_type, lc_anim::TangentType::Smooth);
+        assert_eq!(
+            curve.keys[2].tangent_out_type,
+            lc_anim::TangentType::Constant
+        );
+        assert!(curve.keys[3].tangent_manual);
+        assert_eq!(curve.keys[3].tangent_in_type, lc_anim::TangentType::Spline);
+        assert!((curve.sample(0.5) - 0.0).abs() < 1e-5);
+        assert!((curve.sample(1.5) - 1.5).abs() < 1e-4);
+        assert_eq!(
+            animation.morph_weights.get(&0).unwrap().keys[1].interpolation,
+            lc_anim::Interpolation::Smooth
+        );
+        assert_eq!(
+            animation.rotation.as_ref().unwrap().keys[0].interpolation,
+            lc_anim::Interpolation::Constant
+        );
+        assert_eq!(
+            animation.rotation.as_ref().unwrap().keys[1].interpolation,
+            lc_anim::Interpolation::Spline
+        );
+        let rotation = animation.rotation.as_ref().unwrap();
+        assert_eq!(
+            rotation.keys[0].tangent_out_type,
+            lc_anim::TangentType::Constant
+        );
+        assert_eq!(
+            rotation.keys[1].tangent_in_type,
+            lc_anim::TangentType::Spline
+        );
+    }
+
+    #[test]
+    fn legacy_smooth_keys_without_tangent_types_keep_catmull_sampling() {
+        fn strip_tangent_types(value: &mut serde_json::Value) {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("tangent_in_type");
+                object.remove("tangent_out_type");
+                for child in object.values_mut() {
+                    strip_tangent_types(child);
+                }
+            } else if let Some(array) = value.as_array_mut() {
+                for child in array {
+                    strip_tangent_types(child);
+                }
+            }
+        }
+
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Legacy Smooth Null", None);
+        {
+            let animation = &mut doc.scene.get_mut(id).unwrap().animation;
+            for (time, value) in [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)] {
+                animation.set_key(
+                    lc_anim::AnimProperty::TranslationX,
+                    time,
+                    value,
+                    lc_anim::Interpolation::Smooth,
+                );
+                animation.set_rotation_key(
+                    time,
+                    glam::Quat::from_rotation_y(value * 0.4),
+                    lc_anim::Interpolation::Smooth,
+                );
+            }
+        }
+        let json = to_json(&doc).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        strip_tangent_types(&mut legacy);
+        let back = from_json(&legacy.to_string()).unwrap();
+        let curve = &back
+            .scene
+            .get(id)
+            .unwrap()
+            .animation
+            .track(lc_anim::AnimProperty::TranslationX)
+            .unwrap()
+            .curve;
+        assert!(curve.keys.iter().all(|key| {
+            key.tangent_in_type == lc_anim::TangentType::Smooth
+                && key.tangent_out_type == lc_anim::TangentType::Smooth
+        }));
+        let sample = curve.sample(0.5);
+        assert!(
+            (sample - 0.625).abs() < 1e-4,
+            "legacy Smooth files must retain their Catmull-Rom shape; sampled {sample}"
+        );
+        let rotation = back
+            .scene
+            .get(id)
+            .unwrap()
+            .animation
+            .rotation
+            .as_ref()
+            .unwrap();
+        assert!(rotation.keys.iter().all(|key| {
+            key.tangent_in_type == lc_anim::TangentType::Smooth
+                && key.tangent_out_type == lc_anim::TangentType::Smooth
+        }));
+    }
+
+    #[test]
+    fn unsorted_and_duplicate_rotation_keys_are_repaired_on_load() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Rotation Null", None);
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            let mut track = lc_anim::RotationTrack::default();
+            for (time, angle) in [(2.0, 2.0), (1.0, 1.0), (1.0, 3.0), (-1.0, 0.5)] {
+                track.keys.push(lc_anim::RotationKey::new(
+                    time,
+                    glam::Quat::from_rotation_y(angle),
+                    lc_anim::Interpolation::Linear,
+                ));
+            }
+            node.animation.rotation = Some(track);
+        }
+
+        let back = from_json(&to_json(&doc).unwrap()).unwrap();
+        let rotation = back
+            .scene
+            .get(id)
+            .unwrap()
+            .animation
+            .rotation
+            .as_ref()
+            .unwrap();
+        let times: Vec<f32> = rotation.keys.iter().map(|key| key.time).collect();
+        assert_eq!(times, vec![0.0, 1.0, 2.0]);
+        assert!(rotation.sample(1.5).is_some());
     }
 
     #[test]
@@ -886,6 +1931,88 @@ mod tests {
     }
 
     #[test]
+    fn morph_targets_round_trip_and_sanitize_weights() {
+        let sphere = crate::Primitive::Sphere {
+            radius: 1.0,
+            segments: 12,
+            rings: 6,
+        };
+        // The format repairs editable meshes by compacting unused points, so
+        // record the base against the same topology a reload will produce.
+        let mut mesh = sphere.build();
+        mesh.compact_points();
+        let base = mesh.positions.clone();
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable {
+                    mesh,
+                    origin: Some(sphere),
+                },
+            },
+            "Morph Face",
+            None,
+        );
+        let mut target = crate::MorphTarget::new("Smile", vec![glam::Vec3::Y * 0.25; base.len()]);
+        target.weight = 2.0;
+        doc.scene.get_mut(id).unwrap().morph = crate::MorphSet {
+            base: base.clone(),
+            targets: vec![target],
+        };
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.animation
+                .set_morph_weight_key(0, 0.0, 0.0, lc_anim::Interpolation::Linear);
+            node.animation
+                .set_morph_weight_key(0, 1.0, 0.8, lc_anim::Interpolation::Linear);
+        }
+
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains("\"morph\""));
+        let back = from_json(&json).unwrap();
+        let morph = &back.scene.get(id).unwrap().morph;
+        assert_eq!(morph.base, base);
+        assert_eq!(morph.targets.len(), 1);
+        assert_eq!(morph.targets[0].name, "Smile");
+        assert_eq!(morph.targets[0].deltas.len(), base.len());
+        assert!((morph.targets[0].weight - 1.0).abs() < 1e-6);
+        let animation = &back.scene.get(id).unwrap().animation;
+        assert!((animation.sample_morph_weight(0, 0.5).unwrap() - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn stale_morph_targets_drop_shifted_weight_curves() {
+        let mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        let base = mesh.positions.clone();
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::editable(mesh),
+            },
+            "Stale Morph",
+            None,
+        );
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph = crate::MorphSet {
+                base: base.clone(),
+                targets: vec![
+                    crate::MorphTarget::new("Kept", vec![glam::Vec3::Y; base.len()]),
+                    crate::MorphTarget::new("Stale", vec![glam::Vec3::Z; 1]),
+                ],
+            };
+            node.animation
+                .set_morph_weight_key(0, 0.0, 1.0, lc_anim::Interpolation::Linear);
+            node.animation
+                .set_morph_weight_key(1, 0.0, 1.0, lc_anim::Interpolation::Linear);
+        }
+        doc.sanitize();
+        let node = doc.scene.get(id).unwrap();
+        assert_eq!(node.morph.targets.len(), 1);
+        assert!(node.animation.morph_weights.is_empty());
+    }
+
+    #[test]
     fn rejects_newer_versions() {
         let doc = Document::demo();
         let mut json = to_json(&doc).unwrap();
@@ -897,6 +2024,46 @@ mod tests {
     fn rejects_garbage() {
         assert!(from_json("not json").is_err());
         assert!(from_json("{}").is_err());
+    }
+
+    #[test]
+    fn loading_repairs_skin_lengths_indices_and_weights() {
+        let mut doc = Document::empty();
+        let joint = doc.append_node(
+            NodeKind::Joint {
+                length: 0.8,
+                width: 0.08,
+            },
+            "Joint",
+            None,
+        );
+        let mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        let vertex_count = mesh.positions.len();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::editable(mesh),
+            },
+            "Skinned Cube",
+            None,
+        );
+        let mut skin = crate::Skin::new(vec![joint], vec![glam::Mat4::IDENTITY]);
+        skin.joint_indices = vec![[0, 7, 0, 0]; vertex_count];
+        skin.weights = vec![[0.25, 0.75, -1.0, 0.0]; vertex_count];
+        doc.scene.get_mut(id).unwrap().skin = Some(skin);
+
+        let back = from_json(&to_json(&doc).unwrap()).unwrap();
+        let skin = back.scene.get(id).unwrap().skin.as_ref().unwrap();
+        assert_eq!(skin.joint_indices.len(), vertex_count);
+        assert_eq!(skin.weights.len(), vertex_count);
+        for (indices, weights) in skin.joint_indices.iter().zip(&skin.weights) {
+            let total: f32 = weights.iter().sum();
+            assert!((total - 1.0).abs() < 1e-6);
+            for (index, weight) in indices.iter().zip(weights) {
+                if *weight > 0.0 {
+                    assert_eq!(*index, 0);
+                }
+            }
+        }
     }
 
     #[test]

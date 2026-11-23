@@ -7,8 +7,12 @@
 
 use crate::common::preview_surface;
 use glam::{Mat4, Quat, Vec2, Vec3};
+use lc_anim::{AnimProperty, AnimationClip, Curve, Interpolation};
 use lc_geom::Mesh;
-use lc_scene::{Document, GeometrySource, NodeId, NodeKind};
+use lc_scene::{
+    Camera, Document, GeometrySource, Light, LightKind, MorphSet, MorphTarget, NodeId, NodeKind,
+    ProjectionMode, Skin,
+};
 use lc_shading::{Material, MaterialId, ShaderNodeKind, ShaderValue};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -17,6 +21,249 @@ use std::path::{Path, PathBuf};
 const GLB_MAGIC: u32 = 0x4654_6C67;
 const CHUNK_JSON: u32 = 0x4E4F_534A;
 const CHUNK_BIN: u32 = 0x004E_4942;
+const EXPORT_CREASE_DEG: f32 = 40.0;
+
+/// Authored glTF data the importer recognised but could not carry across. The
+/// geometry, materials, morph targets, cameras and punctual lights still import,
+/// but the caller must tell the user what was left behind instead of letting a
+/// rigged or animated file look like a complete import.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    pub skinned_meshes: usize,
+    pub animation_clips: usize,
+    /// glTF camera `aspectRatio` hints; LeopardCraft derives aspect from the
+    /// render output, not from the camera.
+    pub camera_aspect_ratios: usize,
+}
+
+impl ImportReport {
+    pub fn is_empty(&self) -> bool {
+        self.skinned_meshes == 0 && self.animation_clips == 0 && self.camera_aspect_ratios == 0
+    }
+
+    /// One actionable sentence naming what was skipped and what the user can do
+    /// about it, or `None` when the file lost nothing in import.
+    pub fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut skipped = Vec::new();
+        if self.skinned_meshes > 0 {
+            skipped.push(counted(
+                self.skinned_meshes,
+                "skinned mesh",
+                "skinned meshes",
+            ));
+        }
+        if self.animation_clips > 0 {
+            skipped.push(counted(
+                self.animation_clips,
+                "animation clip",
+                "animation clips",
+            ));
+        }
+        let mut ignored = Vec::new();
+        if self.camera_aspect_ratios > 0 {
+            ignored.push(counted(
+                self.camera_aspect_ratios,
+                "camera aspect ratio",
+                "camera aspect ratios",
+            ));
+        }
+        let mut message = String::new();
+        if !skipped.is_empty() {
+            message.push_str(&format!(
+                "Skipped {}: LeopardCraft's glTF import reads meshes, materials, morph targets, cameras and punctual lights, but not skinning or animation. Re-export without them, or recreate them in LeopardCraft.",
+                joined(&skipped)
+            ));
+        }
+        if !ignored.is_empty() {
+            if !message.is_empty() {
+                message.push(' ');
+            }
+            message.push_str(&format!(
+                "Ignored {}: LeopardCraft takes aspect from the render output, so set the output size instead.",
+                joined(&ignored)
+            ));
+        }
+        Some(message)
+    }
+}
+
+/// Per-node data resolved before the hierarchy walk, because a node's kind has
+/// to be chosen when the node is created.
+#[derive(Clone, Default)]
+struct NodeExtras {
+    camera: Option<Camera>,
+    light: Option<Light>,
+}
+
+/// Map a glTF camera onto LeopardCraft's camera. A missing optional field falls
+/// back to the LeopardCraft default rather than failing the import.
+fn import_camera(
+    camera: &Value,
+    node_index: usize,
+    report: &mut ImportReport,
+) -> Result<Camera, String> {
+    let number = |object: &Value, key: &str| object.get(key).and_then(Value::as_f64);
+    if let Some(perspective) = camera.get("perspective") {
+        let yfov = number(perspective, "yfov").ok_or_else(|| {
+            format!(
+                "glTF camera on node {node_index} has no perspective.yfov; export the camera again or remove it"
+            )
+        })? as f32;
+        if !yfov.is_finite() || yfov <= 0.0 || yfov >= std::f32::consts::PI {
+            return Err(format!(
+                "glTF camera on node {node_index} has a vertical field of view of {yfov} rad, which must be between 0 and 180 degrees; fix the camera angle in the source file"
+            ));
+        }
+        if perspective.get("aspectRatio").is_some() {
+            report.camera_aspect_ratios += 1;
+        }
+        let near = number(perspective, "znear").unwrap_or(0.05) as f32;
+        let far = number(perspective, "zfar").unwrap_or(1000.0) as f32;
+        let mut imported = Camera::default();
+        imported.fov_y_deg = yfov.to_degrees();
+        imported.near = near.max(0.0001);
+        imported.far = far.max(imported.near + 0.001);
+        return Ok(imported);
+    }
+    if let Some(ortho) = camera.get("orthographic") {
+        let ymag = number(ortho, "ymag").ok_or_else(|| {
+            format!(
+                "glTF camera on node {node_index} has no orthographic.ymag; export the camera again or remove it"
+            )
+        })? as f32;
+        if !ymag.is_finite() || ymag <= 0.0 {
+            return Err(format!(
+                "glTF camera on node {node_index} has an orthographic half-height of {ymag}; it must be greater than zero"
+            ));
+        }
+        let near = number(ortho, "znear").unwrap_or(0.05) as f32;
+        let far = number(ortho, "zfar").unwrap_or(1000.0) as f32;
+        let mut imported = Camera::default();
+        imported.projection = ProjectionMode::Orthographic;
+        imported.ortho_scale = ymag * 2.0;
+        imported.near = near.max(0.0001);
+        imported.far = far.max(imported.near + 0.001);
+        return Ok(imported);
+    }
+    let declared = camera
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("no type");
+    Err(format!(
+        "glTF camera on node {node_index} declares {declared:?} but has no perspective or orthographic block; fix the camera in the source file or remove it"
+    ))
+}
+
+/// glTF `range` is a distance cutoff; LeopardCraft's point and spot lights carry
+/// a shadow/falloff radius instead, so the authored distance is kept there. glTF
+/// omits `range` for an unlimited light, which maps to our 1 m default.
+fn import_light_range(light: &Value) -> f32 {
+    light
+        .get("range")
+        .and_then(Value::as_f64)
+        .map(|range| range as f32)
+        .filter(|range| range.is_finite() && *range > 0.0)
+        .unwrap_or(1.0)
+}
+
+/// Map a `KHR_lights_punctual` light. glTF cone angles are radians and our spot
+/// light stores degrees, so the import converts them.
+fn import_light(light: &Value, node_index: usize) -> Result<Light, String> {
+    let kind = match light.get("type").and_then(Value::as_str) {
+        Some("directional") => LightKind::Directional,
+        Some("point") => LightKind::Point {
+            radius: import_light_range(light),
+        },
+        Some("spot") => {
+            let spot = light.get("spot");
+            let angle = |key: &str, fallback: f32| {
+                spot.and_then(|spot| spot.get(key))
+                    .and_then(Value::as_f64)
+                    .map(|value| value as f32)
+                    .unwrap_or(fallback)
+            };
+            let inner = angle("innerConeAngle", 0.0);
+            let outer = angle("outerConeAngle", std::f32::consts::FRAC_PI_4);
+            let limit = std::f32::consts::FRAC_PI_2;
+            if !inner.is_finite()
+                || !outer.is_finite()
+                || inner < 0.0
+                || outer <= 0.0
+                || outer > limit + 1e-6
+                || inner > outer + 1e-6
+            {
+                return Err(format!(
+                    "glTF spot light on node {node_index} has cone angles of {inner} rad inner and {outer} rad outer; KHR_lights_punctual requires 0 <= inner <= outer <= 90 degrees (1.5708 rad), so fix the cone in the source file"
+                ));
+            }
+            LightKind::Spot {
+                radius: import_light_range(light),
+                inner_deg: inner.to_degrees(),
+                outer_deg: outer.to_degrees(),
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "glTF light type {other:?} is not part of KHR_lights_punctual (directional, point or spot); fix the light in the source file"
+            ))
+        }
+        None => {
+            return Err(
+                "glTF light has no type; KHR_lights_punctual requires directional, point or spot"
+                    .into(),
+            )
+        }
+    };
+    let color = light
+        .get("color")
+        .and_then(Value::as_array)
+        .filter(|color| color.len() >= 3)
+        .map(|color| {
+            Vec3::new(
+                color[0].as_f64().unwrap_or(1.0) as f32,
+                color[1].as_f64().unwrap_or(1.0) as f32,
+                color[2].as_f64().unwrap_or(1.0) as f32,
+            )
+        })
+        .unwrap_or(Vec3::ONE);
+    let intensity = light
+        .get("intensity")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0) as f32;
+    Ok(Light {
+        kind,
+        color: if color.is_finite() { color } else { Vec3::ONE },
+        intensity: if intensity.is_finite() && intensity > 0.0 {
+            intensity
+        } else {
+            1.0
+        },
+        cast_shadows: true,
+    })
+}
+
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn joined(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        rest => {
+            let (last, head) = rest.split_last().expect("non-empty list");
+            format!("{} and {last}", head.join(", "))
+        }
+    }
+}
 
 pub fn export_glb(path: impl AsRef<Path>, doc: &Document) -> Result<(), String> {
     let (json_value, binary) = build(doc)?;
@@ -57,24 +304,34 @@ pub fn export_gltf(path: impl AsRef<Path>, doc: &Document) -> Result<(), String>
 }
 
 pub fn import_glb(path: impl AsRef<Path>) -> Result<Document, String> {
+    import_glb_with_report(path).map(|(doc, _)| doc)
+}
+
+pub fn import_gltf(path: impl AsRef<Path>) -> Result<Document, String> {
+    import_gltf_with_report(path).map(|(doc, _)| doc)
+}
+
+/// Import a GLB and report the authored features the importer had to skip, so
+/// callers can warn the user instead of presenting a lossy import as complete.
+pub fn import_glb_with_report(path: impl AsRef<Path>) -> Result<(Document, ImportReport), String> {
     let path = path.as_ref();
     let bytes =
         std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let (gltf, bin) = parse_glb(&bytes)?;
-    import_value(
+    import_value_with_report(
         gltf,
         bin.as_deref(),
         path.parent().unwrap_or(Path::new(".")),
     )
 }
 
-pub fn import_gltf(path: impl AsRef<Path>) -> Result<Document, String> {
+pub fn import_gltf_with_report(path: impl AsRef<Path>) -> Result<(Document, ImportReport), String> {
     let path = path.as_ref();
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let gltf: Value = serde_json::from_str(&text).map_err(|e| format!("invalid glTF JSON: {e}"))?;
     let buffers = load_buffers(&gltf, None, path.parent().unwrap_or(Path::new(".")))?;
-    import_value_with_buffers(gltf, buffers)
+    import_value_with_buffers_and_report(gltf, buffers)
 }
 
 #[derive(Default)]
@@ -99,18 +356,36 @@ impl GltfBuild {
         target: u32,
         bounds: bool,
     ) -> usize {
+        self.add_f32_values(values, ty, components, Some(target), bounds)
+    }
+
+    fn add_animation_input(&mut self, times: &[f32]) -> usize {
+        self.add_f32_values(times, "SCALAR", 1, None, true)
+    }
+
+    fn add_f32_values(
+        &mut self,
+        values: &[f32],
+        ty: &str,
+        components: usize,
+        target: Option<u32>,
+        bounds: bool,
+    ) -> usize {
         self.align();
         let view_index = self.views.len();
         let byte_offset = self.binary.len();
         for value in values {
             self.binary.extend_from_slice(&value.to_le_bytes());
         }
-        self.views.push(json!({
+        let mut view = json!({
             "buffer": 0,
             "byteOffset": byte_offset,
             "byteLength": values.len() * 4,
-            "target": target,
-        }));
+        });
+        if let Some(target) = target {
+            view["target"] = json!(target);
+        }
+        self.views.push(view);
         let accessor_index = self.accessors.len();
         let count = values.len().checked_div(components).unwrap_or(0);
         let mut accessor = json!({
@@ -120,11 +395,11 @@ impl GltfBuild {
             "count": count,
             "type": ty,
         });
-        if bounds && components == 3 && !values.is_empty() {
-            let mut min = [f32::INFINITY; 3];
-            let mut max = [f32::NEG_INFINITY; 3];
-            for chunk in values.as_chunks::<3>().0 {
-                for i in 0..3 {
+        if bounds && components > 0 && !values.is_empty() {
+            let mut min = vec![f32::INFINITY; components];
+            let mut max = vec![f32::NEG_INFINITY; components];
+            for chunk in values.chunks(components) {
+                for i in 0..components {
                     min[i] = min[i].min(chunk[i]);
                     max[i] = max[i].max(chunk[i]);
                 }
@@ -133,6 +408,57 @@ impl GltfBuild {
             accessor["max"] = json!(max);
         }
         self.accessors.push(accessor);
+        accessor_index
+    }
+
+    fn add_u16_vec4(&mut self, values: &[[u16; 4]], target: u32) -> usize {
+        self.align();
+        let view_index = self.views.len();
+        let byte_offset = self.binary.len();
+        for value in values {
+            for component in value {
+                self.binary.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        self.views.push(json!({
+            "buffer": 0,
+            "byteOffset": byte_offset,
+            "byteLength": values.len() * 8,
+            "target": target,
+        }));
+        let accessor_index = self.accessors.len();
+        self.accessors.push(json!({
+            "bufferView": view_index,
+            "byteOffset": 0,
+            "componentType": 5123,
+            "count": values.len(),
+            "type": "VEC4",
+        }));
+        accessor_index
+    }
+
+    fn add_mat4(&mut self, matrices: &[Mat4]) -> usize {
+        self.align();
+        let view_index = self.views.len();
+        let byte_offset = self.binary.len();
+        for matrix in matrices {
+            for value in matrix.to_cols_array() {
+                self.binary.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.views.push(json!({
+            "buffer": 0,
+            "byteOffset": byte_offset,
+            "byteLength": matrices.len() * 64,
+        }));
+        let accessor_index = self.accessors.len();
+        self.accessors.push(json!({
+            "bufferView": view_index,
+            "byteOffset": 0,
+            "componentType": 5126,
+            "count": matrices.len(),
+            "type": "MAT4",
+        }));
         accessor_index
     }
 
@@ -168,59 +494,204 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
     for (i, id) in order.iter().enumerate() {
         index_of_node.insert(*id, i);
     }
+    // glTF stores the bind mesh, not the evaluated deformation. Record the
+    // absolute bind world for every joint first so joint nodes can be exported
+    // in the pose their inverse-bind matrices expect.
+    let mut joint_bind_world: HashMap<NodeId, Mat4> = HashMap::new();
+    for node in doc.scene.nodes.values() {
+        let Some(skin) = &node.skin else {
+            continue;
+        };
+        if skin.joints.is_empty()
+            || skin.joints.len() > u16::MAX as usize
+            || skin.inverse_bind.len() != skin.joints.len()
+            || !skin
+                .joints
+                .iter()
+                .all(|joint| doc.scene.nodes.contains_key(joint))
+            || !skin.inverse_bind.iter().all(affine_bind_matrix)
+            || !joints_share_common_root(doc, &skin.joints)
+        {
+            continue;
+        }
+        for (i, joint) in skin.joints.iter().enumerate() {
+            if !doc.scene.nodes.contains_key(joint) {
+                continue;
+            }
+            let Some(inverse) = skin.inverse_bind.get(i).copied() else {
+                continue;
+            };
+            if !affine_bind_matrix(&inverse) || inverse.determinant().abs() <= 1e-8 {
+                continue;
+            }
+            let world = inverse.inverse();
+            if world.is_finite() {
+                joint_bind_world.entry(*joint).or_insert(world);
+            }
+        }
+    }
+    let mut bind_doc = doc.clone();
+    for node in bind_doc.scene.nodes.values_mut() {
+        if let NodeKind::Mesh {
+            geometry: GeometrySource::Editable { mesh, .. },
+        } = &mut node.kind
+        {
+            if node.morph.has_base() && node.morph.base.len() == mesh.positions.len() {
+                mesh.positions = node.morph.base.clone();
+            }
+        }
+        node.skin = None;
+        node.morph = MorphSet::default();
+        node.animation.morph_weights.clear();
+    }
+    let bind = bind_doc.evaluate(0.0);
+    let mut export_locals: HashMap<NodeId, lc_core::Transform> = HashMap::new();
+    let mut export_worlds: HashMap<NodeId, Mat4> = HashMap::new();
+    for id in &order {
+        let Some(raw) = doc.scene.get(*id) else {
+            continue;
+        };
+        let parent_world = raw
+            .parent
+            .and_then(|parent| export_worlds.get(&parent).copied())
+            .unwrap_or(Mat4::IDENTITY);
+        let evaluated_local = evaluated
+            .node(*id)
+            .map(|node| node.local)
+            .unwrap_or(raw.transform);
+        let local = if let Some(bind_world) = joint_bind_world.get(id).copied() {
+            let from_bind = parent_world.inverse() * bind_world;
+            if from_bind.is_finite() {
+                let (scale, rotation, translation) = from_bind.to_scale_rotation_translation();
+                lc_core::Transform {
+                    translation,
+                    rotation,
+                    scale,
+                }
+            } else {
+                evaluated_local
+            }
+        } else {
+            evaluated_local
+        };
+        export_worlds.insert(*id, parent_world * local.matrix());
+        export_locals.insert(*id, local);
+    }
     let mut builder = GltfBuild::default();
     let mut nodes_json: Vec<Value> = Vec::with_capacity(order.len());
     let mut meshes_json: Vec<Value> = Vec::new();
-    let mut mesh_index_by_node: HashMap<NodeId, usize> = HashMap::new();
+    let mut skins_json: Vec<Value> = Vec::new();
+    let mut morph_target_count: HashMap<NodeId, usize> = HashMap::new();
     let mut materials_json: Vec<Value> = Vec::new();
     let mut material_indices: BTreeMap<MaterialId, usize> = BTreeMap::new();
 
     for id in &order {
-        let Some(node) = evaluated.node(*id) else {
+        let Some(raw) = doc.scene.get(*id) else {
             continue;
         };
+        let Some(node) = bind.node(*id) else {
+            continue;
+        };
+        let local = export_locals.get(id).copied().unwrap_or(raw.transform);
         let mut node_json = Map::new();
-        node_json.insert("name".into(), Value::String(node.name.clone()));
+        node_json.insert("name".into(), Value::String(raw.name.clone()));
         node_json.insert(
             "translation".into(),
             json!([
-                node.local.translation.x,
-                node.local.translation.y,
-                node.local.translation.z
+                local.translation.x,
+                local.translation.y,
+                local.translation.z
             ]),
         );
         node_json.insert(
             "rotation".into(),
             json!([
-                node.local.rotation.x,
-                node.local.rotation.y,
-                node.local.rotation.z,
-                node.local.rotation.w
+                local.rotation.x,
+                local.rotation.y,
+                local.rotation.z,
+                local.rotation.w
             ]),
         );
         node_json.insert(
             "scale".into(),
-            json!([node.local.scale.x, node.local.scale.y, node.local.scale.z]),
+            json!([local.scale.x, local.scale.y, local.scale.z]),
         );
-        let children: Vec<usize> = doc
-            .scene
-            .get(*id)
-            .map(|n| {
-                n.children
-                    .iter()
-                    .filter_map(|c| index_of_node.get(c).copied())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let children: Vec<usize> = raw
+            .children
+            .iter()
+            .filter_map(|child| index_of_node.get(child).copied())
+            .collect();
         if !children.is_empty() {
             node_json.insert("children".into(), json!(children));
         }
 
         if let Some(mesh) = node.mesh() {
             if !mesh.is_empty() {
+                let skin_export = raw.skin.as_ref().and_then(|skin| {
+                    (skin.joints.len() <= u16::MAX as usize
+                        && skin.inverse_bind.len() == skin.joints.len()
+                        && skin.joints.iter().all(|joint| {
+                            index_of_node.contains_key(joint)
+                                && joint_bind_world.contains_key(joint)
+                        })
+                        && joints_share_common_root(doc, &skin.joints)
+                        && skin.inverse_bind.iter().all(affine_bind_matrix))
+                    .then(|| normalized_skin(skin, mesh.positions.len()))
+                    .flatten()
+                });
+                if let (Some(_), Some(skin)) = (skin_export.as_ref(), raw.skin.as_ref()) {
+                    let joints: Vec<usize> = skin
+                        .joints
+                        .iter()
+                        .filter_map(|joint| index_of_node.get(joint).copied())
+                        .collect();
+                    // Stored inverse binds are relative to world space. glTF
+                    // expects mesh-local bind space, so include the mesh node's
+                    // bind world when the mesh is not at the origin.
+                    let inverse_bind: Vec<Mat4> = skin
+                        .inverse_bind
+                        .iter()
+                        .map(|inverse| *inverse * node.world)
+                        .collect();
+                    let inverse_bind_accessor = builder.add_mat4(&inverse_bind);
+                    let skin_index = skins_json.len();
+                    skins_json.push(json!({
+                        "name": format!("{} Skin", raw.name),
+                        "joints": joints,
+                        "inverseBindMatrices": inverse_bind_accessor,
+                    }));
+                    node_json.insert("skin".into(), json!(skin_index));
+                }
+
+                let morph_ready = morph_export_ready(raw, mesh);
+                let target_normals: Vec<Vec<Vec<Vec3>>> = if morph_ready {
+                    raw.morph
+                        .targets
+                        .iter()
+                        .map(|target| target_corner_normals(mesh, target))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if morph_ready {
+                    morph_target_count.insert(*id, raw.morph.targets.len());
+                    let weights: Vec<f32> = raw
+                        .morph
+                        .targets
+                        .iter()
+                        .map(|target| {
+                            if target.weight.is_finite() {
+                                target.weight.clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    node_json.insert("weights".into(), json!(weights));
+                }
                 let mut groups: BTreeMap<MaterialId, Vec<lc_geom::RenderTriangle>> =
                     BTreeMap::new();
-                for tri in mesh.render_triangles(40.0) {
+                for tri in mesh.render_triangles(EXPORT_CREASE_DEG) {
                     let material = node.material_for_slot(tri.material_slot).unwrap_or(0);
                     groups.entry(material).or_default().push(tri);
                 }
@@ -233,6 +704,18 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
                     let mut normals = Vec::with_capacity(tris.len() * 9);
                     let mut uvs = Vec::with_capacity(tris.len() * 6);
                     let mut indices = Vec::with_capacity(tris.len() * 3);
+                    let mut joints = Vec::new();
+                    let mut weights = Vec::new();
+                    let mut target_positions: Vec<Vec<f32>> = if morph_ready {
+                        vec![Vec::with_capacity(tris.len() * 9); raw.morph.targets.len()]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut target_normals_out: Vec<Vec<f32>> = if morph_ready {
+                        vec![Vec::with_capacity(tris.len() * 9); raw.morph.targets.len()]
+                    } else {
+                        Vec::new()
+                    };
                     for tri in &tris {
                         for v in &tri.v {
                             positions.extend_from_slice(&[
@@ -242,6 +725,34 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
                             ]);
                             normals.extend_from_slice(&[v.normal.x, v.normal.y, v.normal.z]);
                             uvs.extend_from_slice(&[v.uv.x, v.uv.y]);
+                            if let Some(skin) = &skin_export {
+                                let point = v.point as usize;
+                                joints.push(skin.joints[point]);
+                                weights.extend_from_slice(&skin.weights[point]);
+                            }
+                            if morph_ready {
+                                for (target_index, target) in raw.morph.targets.iter().enumerate() {
+                                    let delta = target
+                                        .deltas
+                                        .get(v.point as usize)
+                                        .copied()
+                                        .unwrap_or(Vec3::ZERO);
+                                    target_positions[target_index]
+                                        .extend_from_slice(&[delta.x, delta.y, delta.z]);
+                                    let normal = target_normals
+                                        .get(target_index)
+                                        .and_then(|normals| normals.get(tri.polygon as usize))
+                                        .and_then(|corners| corners.get(v.corner as usize))
+                                        .copied()
+                                        .unwrap_or(v.normal);
+                                    let normal_delta = normal - v.normal;
+                                    target_normals_out[target_index].extend_from_slice(&[
+                                        normal_delta.x,
+                                        normal_delta.y,
+                                        normal_delta.z,
+                                    ]);
+                                }
+                            }
                             indices.push(indices.len() as u32);
                         }
                     }
@@ -252,31 +763,260 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
                     let normal_accessor = builder.add_f32(&normals, "VEC3", 3, 34962, false);
                     let uv_accessor = builder.add_f32(&uvs, "VEC2", 2, 34962, false);
                     let index_accessor = builder.add_u32(&indices, 34963);
+                    let mut attributes = json!({
+                        "POSITION": pos_accessor,
+                        "NORMAL": normal_accessor,
+                        "TEXCOORD_0": uv_accessor,
+                    });
+                    if skin_export.is_some() && !joints.is_empty() {
+                        let joint_accessor = builder.add_u16_vec4(&joints, 34962);
+                        let weight_accessor = builder.add_f32(&weights, "VEC4", 4, 34962, false);
+                        attributes["JOINTS_0"] = json!(joint_accessor);
+                        attributes["WEIGHTS_0"] = json!(weight_accessor);
+                    }
+                    let mut targets = Vec::new();
+                    if morph_ready {
+                        for target_index in 0..raw.morph.targets.len() {
+                            let position_accessor = builder.add_f32(
+                                &target_positions[target_index],
+                                "VEC3",
+                                3,
+                                34962,
+                                true,
+                            );
+                            let normal_accessor = builder.add_f32(
+                                &target_normals_out[target_index],
+                                "VEC3",
+                                3,
+                                34962,
+                                false,
+                            );
+                            targets.push(json!({
+                                "POSITION": position_accessor,
+                                "NORMAL": normal_accessor,
+                            }));
+                        }
+                    }
                     let material_index =
                         material_json(doc, material_id, &mut materials_json, &mut material_indices);
-                    primitives.push(json!({
-                        "attributes": {
-                            "POSITION": pos_accessor,
-                            "NORMAL": normal_accessor,
-                            "TEXCOORD_0": uv_accessor,
-                        },
+                    let mut primitive = json!({
+                        "attributes": attributes,
                         "indices": index_accessor,
                         "material": material_index,
                         "mode": 4,
-                    }));
+                    });
+                    if !targets.is_empty() {
+                        primitive["targets"] = json!(targets);
+                    }
+                    primitives.push(primitive);
+                }
+                if primitives.is_empty() {
+                    node_json.remove("skin");
+                    node_json.remove("weights");
+                    morph_target_count.remove(id);
                 }
                 if !primitives.is_empty() {
                     let mesh_index = meshes_json.len();
-                    meshes_json.push(json!({
-                        "name": node.name,
+                    let mut mesh_json = json!({
+                        "name": raw.name,
                         "primitives": primitives,
-                    }));
-                    mesh_index_by_node.insert(*id, mesh_index);
+                    });
+                    if morph_ready {
+                        let names: Vec<String> = raw
+                            .morph
+                            .targets
+                            .iter()
+                            .enumerate()
+                            .map(|(index, target)| {
+                                if target.name.trim().is_empty() {
+                                    format!("Morph {}", index + 1)
+                                } else {
+                                    target.name.clone()
+                                }
+                            })
+                            .collect();
+                        mesh_json["extras"] = json!({ "targetNames": names });
+                    }
+                    meshes_json.push(mesh_json);
                     node_json.insert("mesh".into(), json!(mesh_index));
                 }
             }
         }
         nodes_json.push(Value::Object(node_json));
+    }
+
+    let mut animations_json: Vec<Value> = Vec::new();
+    let times = take_times(doc);
+    if !times.is_empty() {
+        let mut samplers_json: Vec<Value> = Vec::new();
+        let mut channels_json: Vec<Value> = Vec::new();
+        let mut input_accessor: Option<usize> = None;
+        for id in &order {
+            let Some(raw) = doc.scene.get(*id) else {
+                continue;
+            };
+            let clip = &raw.animation;
+            if clip.is_empty() {
+                continue;
+            }
+            let Some(node_index) = index_of_node.get(id).copied() else {
+                continue;
+            };
+            let base = export_locals.get(id).copied().unwrap_or(raw.transform);
+            let translation_curves = [
+                clip.track(AnimProperty::TranslationX)
+                    .map(|track| &track.curve),
+                clip.track(AnimProperty::TranslationY)
+                    .map(|track| &track.curve),
+                clip.track(AnimProperty::TranslationZ)
+                    .map(|track| &track.curve),
+            ];
+            let scale_curves = [
+                clip.track(AnimProperty::ScaleX).map(|track| &track.curve),
+                clip.track(AnimProperty::ScaleY).map(|track| &track.curve),
+                clip.track(AnimProperty::ScaleZ).map(|track| &track.curve),
+            ];
+            let has_rotation = clip
+                .rotation
+                .as_ref()
+                .is_some_and(|rotation| !rotation.is_empty())
+                || [
+                    AnimProperty::RotationX,
+                    AnimProperty::RotationY,
+                    AnimProperty::RotationZ,
+                ]
+                .iter()
+                .any(|property| clip.track(*property).is_some());
+            let target_count = morph_target_count.get(id).copied().unwrap_or(0);
+            let morph_curves: Vec<Option<&Curve>> = (0..target_count)
+                .map(|target| clip.morph_weights.get(&(target as u32)))
+                .collect();
+            let has_morph = morph_curves.iter().any(Option::is_some);
+            let has_translation = translation_curves.iter().any(Option::is_some);
+            let has_scale = scale_curves.iter().any(Option::is_some);
+            if !(has_translation || has_rotation || has_scale || has_morph) {
+                continue;
+            }
+            if input_accessor.is_none() {
+                input_accessor = Some(builder.add_animation_input(&times));
+            }
+            let input = input_accessor.unwrap();
+
+            if has_translation {
+                let present: Vec<&Curve> = translation_curves.iter().flatten().copied().collect();
+                let interpolation = sampled_scalar_interpolation(&present, times.len());
+                let values = sampled_vector(
+                    translation_curves,
+                    base.translation,
+                    &times,
+                    interpolation == "CUBICSPLINE",
+                );
+                let output = builder.add_f32_values(&values, "VEC3", 3, None, false);
+                let sampler = samplers_json.len();
+                samplers_json.push(json!({
+                    "input": input,
+                    "output": output,
+                    "interpolation": interpolation,
+                }));
+                channels_json.push(json!({
+                    "sampler": sampler,
+                    "target": { "node": node_index, "path": "translation" },
+                }));
+            }
+            if has_rotation {
+                let interpolation = rotation_interpolation(clip);
+                let mut values = Vec::with_capacity(times.len() * 4);
+                for &time in &times {
+                    let rotation = clip.apply_transform(base, time).rotation;
+                    values.extend_from_slice(&[rotation.x, rotation.y, rotation.z, rotation.w]);
+                }
+                let output = builder.add_f32_values(&values, "VEC4", 4, None, false);
+                let sampler = samplers_json.len();
+                samplers_json.push(json!({
+                    "input": input,
+                    "output": output,
+                    "interpolation": interpolation,
+                }));
+                channels_json.push(json!({
+                    "sampler": sampler,
+                    "target": { "node": node_index, "path": "rotation" },
+                }));
+            }
+            if has_scale {
+                let present: Vec<&Curve> = scale_curves.iter().flatten().copied().collect();
+                let interpolation = sampled_scalar_interpolation(&present, times.len());
+                let values = sampled_vector(
+                    scale_curves,
+                    base.scale,
+                    &times,
+                    interpolation == "CUBICSPLINE",
+                );
+                let output = builder.add_f32_values(&values, "VEC3", 3, None, false);
+                let sampler = samplers_json.len();
+                samplers_json.push(json!({
+                    "input": input,
+                    "output": output,
+                    "interpolation": interpolation,
+                }));
+                channels_json.push(json!({
+                    "sampler": sampler,
+                    "target": { "node": node_index, "path": "scale" },
+                }));
+            }
+            if has_morph {
+                let present: Vec<&Curve> = morph_curves.iter().flatten().copied().collect();
+                let interpolation = sampled_scalar_interpolation(&present, times.len());
+                let cubic = interpolation == "CUBICSPLINE";
+                let mut values =
+                    Vec::with_capacity(times.len() * target_count * if cubic { 3 } else { 1 });
+                for &time in &times {
+                    if cubic {
+                        for curve in &morph_curves {
+                            values
+                                .push(curve.map(|curve| curve_tangent(curve, time)).unwrap_or(0.0));
+                        }
+                    }
+                    for (target, curve) in morph_curves.iter().enumerate() {
+                        let fallback = raw
+                            .morph
+                            .targets
+                            .get(target)
+                            .map(|target| target.weight)
+                            .unwrap_or(0.0);
+                        values.push(
+                            curve
+                                .map(|curve| curve.sample(time))
+                                .unwrap_or(fallback)
+                                .clamp(0.0, 1.0),
+                        );
+                    }
+                    if cubic {
+                        for curve in &morph_curves {
+                            values
+                                .push(curve.map(|curve| curve_tangent(curve, time)).unwrap_or(0.0));
+                        }
+                    }
+                }
+                let output = builder.add_f32_values(&values, "SCALAR", 1, None, false);
+                let sampler = samplers_json.len();
+                samplers_json.push(json!({
+                    "input": input,
+                    "output": output,
+                    "interpolation": interpolation,
+                }));
+                channels_json.push(json!({
+                    "sampler": sampler,
+                    "target": { "node": node_index, "path": "weights" },
+                }));
+            }
+        }
+        if !channels_json.is_empty() {
+            animations_json.push(json!({
+                "name": "Take",
+                "samplers": samplers_json,
+                "channels": channels_json,
+            }));
+        }
     }
 
     let root_indices: Vec<usize> = doc
@@ -309,7 +1049,260 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
     if !materials_json.is_empty() {
         root["materials"] = json!(materials_json);
     }
+    if !skins_json.is_empty() {
+        root["skins"] = json!(skins_json);
+    }
+    if !animations_json.is_empty() {
+        root["animations"] = json!(animations_json);
+    }
     Ok((root, builder.binary))
+}
+
+struct SkinExport {
+    joints: Vec<[u16; 4]>,
+    weights: Vec<[f32; 4]>,
+}
+
+fn affine_bind_matrix(matrix: &Mat4) -> bool {
+    if !matrix.is_finite() {
+        return false;
+    }
+    let row = matrix.row(3);
+    row.x.abs() <= 1e-6 && row.y.abs() <= 1e-6 && row.z.abs() <= 1e-6 && (row.w - 1.0).abs() <= 1e-6
+}
+
+/// glTF requires every joint of a skin to share a common ancestor. A rig whose
+/// joints live in disconnected branches cannot be represented as one skin.
+fn joints_share_common_root(doc: &Document, joints: &[NodeId]) -> bool {
+    let mut common: Option<HashSet<NodeId>> = None;
+    for joint in joints {
+        let mut ancestors = HashSet::new();
+        let mut current = Some(*joint);
+        while let Some(id) = current {
+            if !ancestors.insert(id) {
+                break;
+            }
+            current = doc.scene.get(id).and_then(|node| node.parent);
+        }
+        common = Some(match common {
+            Some(previous) => previous.intersection(&ancestors).copied().collect(),
+            None => ancestors,
+        });
+        if common.as_ref().is_some_and(HashSet::is_empty) {
+            return false;
+        }
+    }
+    common.is_some()
+}
+
+/// Normalise a skin to glTF's four-influence, unit-weight representation.
+/// Returns `None` when any vertex has no usable influence, so an incomplete
+/// skin is skipped instead of exporting a corrupt one.
+fn normalized_skin(skin: &Skin, point_count: usize) -> Option<SkinExport> {
+    if skin.joints.is_empty()
+        || skin.joints.len() > u16::MAX as usize
+        || skin.inverse_bind.len() != skin.joints.len()
+        || skin.joint_indices.len() != point_count
+        || skin.weights.len() != point_count
+    {
+        return None;
+    }
+    let mut joints = Vec::with_capacity(point_count);
+    let mut weights = Vec::with_capacity(point_count);
+    for point in 0..point_count {
+        let mut j = [0u16; 4];
+        let mut w = [0.0f32; 4];
+        let mut total = 0.0f32;
+        for influence in 0..4 {
+            let index = skin.joint_indices[point][influence];
+            let weight = skin.weights[point][influence];
+            if (index as usize) < skin.joints.len() && weight.is_finite() && weight > 0.0 {
+                j[influence] = index as u16;
+                w[influence] = weight;
+                total += weight;
+            }
+        }
+        if !total.is_finite() || total <= 1e-8 {
+            return None;
+        }
+        for weight in &mut w {
+            *weight /= total;
+        }
+        joints.push(j);
+        weights.push(w);
+    }
+    Some(SkinExport { joints, weights })
+}
+
+fn morph_export_ready(node: &lc_scene::Node, mesh: &Mesh) -> bool {
+    node.modifiers.is_empty()
+        && !node.morph.targets.is_empty()
+        && node.morph.has_base()
+        && node.morph.base.len() == mesh.positions.len()
+        && node.morph.base.iter().all(|position| position.is_finite())
+        && node
+            .morph
+            .base
+            .iter()
+            .zip(&mesh.positions)
+            .all(|(base, position)| (*base - *position).length() <= 1e-5)
+        && node.morph.targets.iter().all(|target| {
+            target.deltas.len() == mesh.positions.len()
+                && target.deltas.iter().all(|delta| delta.is_finite())
+                && target
+                    .deltas
+                    .iter()
+                    .zip(&node.morph.base)
+                    .all(|(delta, base)| (*base + *delta).is_finite())
+        })
+}
+
+fn target_corner_normals(mesh: &Mesh, target: &MorphTarget) -> Vec<Vec<Vec3>> {
+    let mut target_mesh = mesh.clone();
+    target_mesh.positions = mesh
+        .positions
+        .iter()
+        .zip(&target.deltas)
+        .map(|(position, delta)| *position + *delta)
+        .collect();
+    target_mesh.corner_normals(EXPORT_CREASE_DEG)
+}
+
+fn scalar_interpolation(curves: &[&Curve]) -> &'static str {
+    let (mut step, mut linear, mut cubic) = (true, true, true);
+    let mut any = false;
+    for curve in curves {
+        for key in &curve.keys {
+            any = true;
+            step &= key.interpolation == Interpolation::Constant;
+            linear &= key.interpolation == Interpolation::Linear;
+            cubic &= matches!(
+                key.interpolation,
+                Interpolation::Smooth | Interpolation::Spline
+            );
+        }
+    }
+    if !any {
+        "LINEAR"
+    } else if step {
+        "STEP"
+    } else if linear {
+        "LINEAR"
+    } else if cubic {
+        "CUBICSPLINE"
+    } else {
+        "LINEAR"
+    }
+}
+
+/// CUBICSPLINE requires at least two keyframes. A single sampled time uses
+/// LINEAR so an isolated key still exports a valid sampler.
+fn sampled_scalar_interpolation(curves: &[&Curve], time_count: usize) -> &'static str {
+    if time_count < 2 {
+        "LINEAR"
+    } else {
+        scalar_interpolation(curves)
+    }
+}
+
+/// Tangents for a sampled CUBICSPLINE channel. A central difference matches
+/// the curve locally; the endpoints use the available one-sided span.
+fn curve_tangent(curve: &Curve, time: f32) -> f32 {
+    let h = 1e-3;
+    let before_time = (time - h).max(0.0);
+    let after_time = time + h;
+    let span = after_time - before_time;
+    if span <= 1e-9 {
+        return 0.0;
+    }
+    (curve.sample(after_time) - curve.sample(before_time)) / span
+}
+
+fn take_times(doc: &Document) -> Vec<f32> {
+    let mut times: Vec<f32> = doc
+        .scene
+        .nodes
+        .values()
+        .filter(|node| !node.animation.is_empty())
+        .flat_map(|node| node.animation.key_times())
+        .filter(|time| time.is_finite() && *time >= 0.0)
+        .collect();
+    if times.is_empty() {
+        return times;
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+    let start = times[0].max(0.0);
+    let end = *times.last().unwrap_or(&start);
+    let fps = if doc.settings.fps.is_finite() && doc.settings.fps > 0.0 {
+        doc.settings.fps
+    } else {
+        24.0
+    };
+    let frames = (((end - start) * fps).ceil() as usize).min(100_000);
+    for frame in 0..=frames {
+        times.push(start + frame as f32 / fps);
+    }
+    times.push(end);
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+    times
+}
+
+fn sampled_vector(curves: [Option<&Curve>; 3], base: Vec3, times: &[f32], cubic: bool) -> Vec<f32> {
+    let mut values = Vec::with_capacity(times.len() * 3 * if cubic { 3 } else { 1 });
+    let base = [base.x, base.y, base.z];
+    for &time in times {
+        let tangents = [
+            curves[0]
+                .map(|curve| curve_tangent(curve, time))
+                .unwrap_or(0.0),
+            curves[1]
+                .map(|curve| curve_tangent(curve, time))
+                .unwrap_or(0.0),
+            curves[2]
+                .map(|curve| curve_tangent(curve, time))
+                .unwrap_or(0.0),
+        ];
+        if cubic {
+            values.extend_from_slice(&tangents);
+        }
+        for (axis, curve) in curves.iter().enumerate() {
+            values.push(curve.map(|curve| curve.sample(time)).unwrap_or(base[axis]));
+        }
+        if cubic {
+            values.extend_from_slice(&tangents);
+        }
+    }
+    values
+}
+
+fn rotation_interpolation(clip: &AnimationClip) -> &'static str {
+    let mut any = false;
+    let mut step = true;
+    if let Some(rotation) = &clip.rotation {
+        for key in &rotation.keys {
+            any = true;
+            step &= key.interpolation == Interpolation::Constant;
+        }
+    }
+    for property in [
+        AnimProperty::RotationX,
+        AnimProperty::RotationY,
+        AnimProperty::RotationZ,
+    ] {
+        if let Some(track) = clip.track(property) {
+            for key in &track.curve.keys {
+                any = true;
+                step &= key.interpolation == Interpolation::Constant;
+            }
+        }
+    }
+    if any && step {
+        "STEP"
+    } else {
+        "LINEAR"
+    }
 }
 
 fn material_json(
@@ -431,18 +1424,41 @@ fn load_buffers(
     Ok(out)
 }
 
-fn import_value(gltf: Value, embedded: Option<&[u8]>, base_dir: &Path) -> Result<Document, String> {
+fn import_value_with_report(
+    gltf: Value,
+    embedded: Option<&[u8]>,
+    base_dir: &Path,
+) -> Result<(Document, ImportReport), String> {
     let buffers = load_buffers(&gltf, embedded, base_dir)?;
-    import_value_with_buffers(gltf, buffers)
+    import_value_with_buffers_and_report(gltf, buffers)
 }
 
 #[derive(Clone)]
 struct ImportedMesh {
     mesh: Mesh,
     slots: BTreeMap<u16, MaterialId>,
+    /// Morph base and targets read from the glTF mesh, with mesh-level default
+    /// weights. A node's own `weights` array overrides those per instance.
+    morph: MorphSet,
 }
 
+/// Convenience wrapper for tests that only assert on the document.
+#[cfg(test)]
 fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Document, String> {
+    import_value_with_buffers_and_report(gltf, buffers).map(|(doc, _)| doc)
+}
+
+fn import_value_with_buffers_and_report(
+    gltf: Value,
+    buffers: Vec<Vec<u8>>,
+) -> Result<(Document, ImportReport), String> {
+    let mut report = ImportReport {
+        animation_clips: gltf
+            .get("animations")
+            .and_then(|animations| animations.as_array())
+            .map_or(0, Vec::len),
+        ..ImportReport::default()
+    };
     let mut doc = Document::empty();
     let mut material_map: BTreeMap<usize, MaterialId> = BTreeMap::new();
     if let Some(materials) = gltf.get("materials").and_then(|m| m.as_array()) {
@@ -517,6 +1533,10 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
                 .unwrap_or("Mesh");
             let mut mesh = Mesh::new(mesh_name);
             let mut slots: BTreeMap<u16, MaterialId> = BTreeMap::new();
+            let mut morph = MorphSet::default();
+            // Every imported primitive of one glTF mesh shares the target list;
+            // a primitive that disagrees cannot be merged into one morph set.
+            let mut target_count: Option<usize> = None;
             let mut next_slot = 0u16;
             let primitives = mesh_value
                 .get("primitives")
@@ -542,6 +1562,47 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
                     .transpose()?
                     .map(|(v, _)| v)
                     .unwrap_or_default();
+                let primitive_targets = primitive
+                    .get("targets")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                match target_count {
+                    Some(expected) if expected != primitive_targets.len() => {
+                        return Err(format!(
+                            "glTF mesh {mesh_name:?} has primitives with {expected} and {} morph targets; merged primitives must declare the same targets",
+                            primitive_targets.len()
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        target_count = Some(primitive_targets.len());
+                        if !primitive_targets.is_empty() {
+                            let names = mesh_value
+                                .get("extras")
+                                .and_then(|extras| extras.get("targetNames"))
+                                .and_then(Value::as_array);
+                            if let Some(names) = names {
+                                if names.len() != primitive_targets.len() {
+                                    return Err(format!(
+                                        "glTF mesh {mesh_name:?} names {} morph targets but declares {}",
+                                        names.len(),
+                                        primitive_targets.len()
+                                    ));
+                                }
+                            }
+                            morph.targets = (0..primitive_targets.len())
+                                .map(|index| {
+                                    let name = names
+                                        .and_then(|names| names.get(index))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    MorphTarget::new(name, Vec::new())
+                                })
+                                .collect();
+                        }
+                    }
+                }
                 let indices = if let Some(index) = primitive.get("indices").and_then(|i| i.as_u64())
                 {
                     read_accessor_u32(&gltf, index as usize, &buffers)?
@@ -566,6 +1627,35 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
                 let point_base = mesh.positions.len() as u32;
                 for chunk in positions.as_chunks::<3>().0 {
                     mesh.positions.push(Vec3::new(chunk[0], chunk[1], chunk[2]));
+                }
+                if !primitive_targets.is_empty() {
+                    let vertex_count = positions.len() / 3;
+                    for (target_index, target) in primitive_targets.iter().enumerate() {
+                        let deltas = match target.get("POSITION").and_then(Value::as_u64) {
+                            Some(index) => {
+                                let (values, _) =
+                                    read_accessor_f32(&gltf, index as usize, &buffers)?;
+                                if values.len() != vertex_count * 3 {
+                                    return Err(format!(
+                                        "glTF morph target {} of mesh {mesh_name:?} has {} positions for {vertex_count} vertices",
+                                        target_index + 1,
+                                        values.len() / 3
+                                    ));
+                                }
+                                values
+                                    .as_chunks::<3>()
+                                    .0
+                                    .iter()
+                                    .map(|chunk| Vec3::new(chunk[0], chunk[1], chunk[2]))
+                                    .collect::<Vec<Vec3>>()
+                            }
+                            // A target may carry only normal or tangent deltas.
+                            None => vec![Vec3::ZERO; vertex_count],
+                        };
+                        if let Some(entry) = morph.targets.get_mut(target_index) {
+                            entry.deltas.extend(deltas);
+                        }
+                    }
                 }
                 let has_uv = uvs.len() >= (positions.len() / 3) * 2;
                 for tri in indices.chunks(3) {
@@ -601,8 +1691,24 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
                     }
                 }
             }
+            if target_count.unwrap_or(0) > 0 {
+                if let Some(weights) = mesh_value.get("weights").and_then(Value::as_array) {
+                    if weights.len() != morph.targets.len() {
+                        return Err(format!(
+                            "glTF mesh {mesh_name:?}: morph weights ({}) do not match morph targets ({})",
+                            weights.len(),
+                            morph.targets.len()
+                        ));
+                    }
+                    for (target, weight) in morph.targets.iter_mut().zip(weights) {
+                        target.weight = weight.as_f64().unwrap_or(0.0) as f32;
+                    }
+                }
+                morph.base = mesh.positions.clone();
+                morph.sanitize(Some(mesh.positions.len()));
+            }
             if !mesh.positions.is_empty() {
-                imported_meshes.push(ImportedMesh { mesh, slots });
+                imported_meshes.push(ImportedMesh { mesh, slots, morph });
             }
         }
     }
@@ -612,6 +1718,44 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
         .and_then(|n| n.as_array())
         .cloned()
         .unwrap_or_default();
+    // Resolve cameras and lights before the walk so node kinds are known when
+    // nodes are created; unusable ones fail here with a message naming the node.
+    let mut node_extras: Vec<NodeExtras> = vec![NodeExtras::default(); nodes.len()];
+    {
+        let cameras = gltf.get("cameras").and_then(Value::as_array);
+        let lights = gltf
+            .get("extensions")
+            .and_then(|extensions| extensions.get("KHR_lights_punctual"))
+            .and_then(|lights| lights.get("lights"))
+            .and_then(Value::as_array);
+        for (index, node) in nodes.iter().enumerate() {
+            if let Some(camera_index) = node.get("camera").and_then(Value::as_u64) {
+                let camera = cameras
+                    .and_then(|cameras| cameras.get(camera_index as usize))
+                    .ok_or_else(|| {
+                        format!(
+                            "glTF node {index} references camera {camera_index}, which the file does not define; fix or remove the camera"
+                        )
+                    })?;
+                node_extras[index].camera = Some(import_camera(camera, index, &mut report)?);
+            }
+            if let Some(light_index) = node
+                .get("extensions")
+                .and_then(|extensions| extensions.get("KHR_lights_punctual"))
+                .and_then(|light| light.get("light"))
+                .and_then(Value::as_u64)
+            {
+                let light = lights
+                    .and_then(|lights| lights.get(light_index as usize))
+                    .ok_or_else(|| {
+                        format!(
+                            "glTF node {index} references light {light_index}, which the file does not define; fix or remove the light"
+                        )
+                    })?;
+                node_extras[index].light = Some(import_light(light, index)?);
+            }
+        }
+    }
     let mut created: BTreeMap<usize, NodeId> = BTreeMap::new();
     let mut visited = HashSet::new();
     let mut scene_roots: Vec<usize> = Vec::new();
@@ -645,28 +1789,33 @@ fn import_value_with_buffers(gltf: Value, buffers: Vec<Vec<u8>>) -> Result<Docum
         import_node(
             &nodes,
             &imported_meshes,
+            &node_extras,
             root,
             None,
             &mut doc,
             &mut created,
             &mut visited,
+            &mut report,
         )?;
     }
     doc.settings.ensure_valid_layers();
     doc.sanitize();
     doc.validate()
         .map_err(|errors| format!("imported glTF is invalid:\n{}", errors.join("\n")))?;
-    Ok(doc)
+    Ok((doc, report))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_node(
     nodes: &[Value],
     meshes: &[ImportedMesh],
+    extras: &[NodeExtras],
     index: usize,
     parent: Option<NodeId>,
     doc: &mut Document,
     created: &mut BTreeMap<usize, NodeId>,
     visited: &mut HashSet<usize>,
+    report: &mut ImportReport,
 ) -> Result<NodeId, String> {
     if let Some(id) = created.get(&index) {
         return Ok(*id);
@@ -677,6 +1826,9 @@ fn import_node(
     let Some(value) = nodes.get(index) else {
         return Err(format!("glTF references missing node {index}"));
     };
+    if value.get("skin").is_some() {
+        report.skinned_meshes += 1;
+    }
     let name = value
         .get("name")
         .and_then(|n| n.as_str())
@@ -687,11 +1839,17 @@ fn import_node(
         .and_then(|m| m.as_u64())
         .and_then(|m| meshes.get(m as usize))
         .cloned();
-    let kind = match &mesh {
-        Some(imported) => NodeKind::Mesh {
+    let node_extras = extras.get(index).cloned().unwrap_or_default();
+    let kind = if let Some(camera) = node_extras.camera {
+        NodeKind::Camera { camera }
+    } else if let Some(light) = node_extras.light {
+        NodeKind::Light { light }
+    } else if let Some(imported) = &mesh {
+        NodeKind::Mesh {
             geometry: GeometrySource::editable(imported.mesh.clone()),
-        },
-        None => NodeKind::Null,
+        }
+    } else {
+        NodeKind::Null
     };
     let node = doc.create_node(kind, &name);
     let id = node.id;
@@ -703,6 +1861,20 @@ fn import_node(
         if let Some(imported) = &mesh {
             node.material_slots = imported.slots.clone();
             node.material = imported.slots.values().next().copied();
+            node.morph = imported.morph.clone();
+            if let Some(weights) = value.get("weights").and_then(|w| w.as_array()) {
+                if weights.len() != node.morph.targets.len() {
+                    return Err(format!(
+                        "glTF node {name:?}: morph weights ({}) do not match morph targets ({})",
+                        weights.len(),
+                        node.morph.targets.len()
+                    ));
+                }
+                for (target, weight) in node.morph.targets.iter_mut().zip(weights) {
+                    target.weight = weight.as_f64().unwrap_or(0.0) as f32;
+                }
+                node.morph.sanitize(Some(imported.mesh.positions.len()));
+            }
         }
     }
     created.insert(index, id);
@@ -711,11 +1883,13 @@ fn import_node(
             import_node(
                 nodes,
                 meshes,
+                extras,
                 child as usize,
                 Some(id),
                 doc,
                 created,
                 visited,
+                report,
             )?;
         }
     }
@@ -832,17 +2006,28 @@ fn read_accessor_f32(
         5125 | 5126 => 4,
         _ => return Err(format!("unsupported glTF component type {component_type}")),
     };
+    let element_size = components * comp_size;
     let stride = view
         .get("byteStride")
         .and_then(|s| s.as_u64())
         .map(|s| s as usize)
-        .unwrap_or(components * comp_size);
+        .unwrap_or(element_size);
+    // The glTF spec requires a stride of at least one element. A smaller one
+    // makes the per-component reads of the last element run past `needed`, so
+    // reject it instead of panicking while slicing the buffer.
+    if count > 0 && stride < element_size {
+        return Err(format!(
+            "glTF bufferView stride {stride} is smaller than its {element_size}-byte accessor element"
+        ));
+    }
     let view_offset = view.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
     let accessor_offset = accessor
         .get("byteOffset")
         .and_then(|o| o.as_u64())
         .unwrap_or(0) as usize;
-    let base = view_offset + accessor_offset;
+    let base = view_offset
+        .checked_add(accessor_offset)
+        .ok_or_else(|| "glTF accessor offset overflow".to_string())?;
     let needed = count
         .checked_mul(stride)
         .and_then(|n| n.checked_add(base))
@@ -930,3 +2115,1349 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
 
 #[allow(dead_code)]
 fn _kind(_: NodeKind) {}
+
+#[cfg(test)]
+mod animation_export_tests {
+    use super::*;
+    use lc_scene::{GeometrySource, NodeKind};
+
+    fn quad_mesh() -> Mesh {
+        let mut mesh = Mesh::new("MorphQuad");
+        mesh.positions = vec![
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ];
+        mesh.add_face(&[0, 1, 2, 3]);
+        mesh
+    }
+
+    fn rigged_document() -> Document {
+        let mut doc = Document::empty();
+        doc.settings.fps = 10.0;
+        let root = doc.append_node(
+            NodeKind::Joint {
+                length: 0.5,
+                width: 0.1,
+            },
+            "Root",
+            None,
+        );
+        let child = doc.append_node(
+            NodeKind::Joint {
+                length: 0.5,
+                width: 0.1,
+            },
+            "Child",
+            Some(root),
+        );
+        doc.scene.get_mut(child).unwrap().transform = lc_core::Transform::from_translation(Vec3::Y);
+        let mesh = quad_mesh();
+        let base = mesh.positions.clone();
+        let mesh_id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(mesh),
+            },
+            "MorphMesh",
+            None,
+        );
+        let evaluated = doc.evaluate(0.0);
+        let mut skin = Skin::new(
+            vec![root, child],
+            vec![
+                evaluated.node(root).unwrap().world.inverse(),
+                evaluated.node(child).unwrap().world.inverse(),
+            ],
+        );
+        skin.joint_indices = vec![[0, 1, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0]];
+        skin.weights = vec![
+            [0.75, 0.25, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.5, 0.5, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ];
+        let mut smile = MorphTarget::new(
+            "Smile",
+            vec![Vec3::Z * 0.5, Vec3::Z * 0.25, Vec3::ZERO, Vec3::ZERO],
+        );
+        smile.weight = 0.25;
+        let mut brow = MorphTarget::new(
+            "Brow",
+            vec![Vec3::X * 0.25, Vec3::ZERO, Vec3::ZERO, Vec3::X * 0.1],
+        );
+        brow.weight = 0.5;
+        {
+            let node = doc.scene.get_mut(mesh_id).unwrap();
+            node.skin = Some(skin);
+            node.morph = MorphSet {
+                base,
+                targets: vec![smile, brow],
+            };
+            node.animation
+                .set_morph_weight_key(0, 0.0, 0.0, Interpolation::Linear);
+            node.animation
+                .set_morph_weight_key(0, 1.0, 1.0, Interpolation::Linear);
+            node.animation
+                .set_morph_weight_key(1, 0.0, 0.5, Interpolation::Linear);
+            node.animation
+                .set_morph_weight_key(1, 1.0, 0.5, Interpolation::Linear);
+        }
+        {
+            let node = doc.scene.get_mut(root).unwrap();
+            node.animation.set_key(
+                AnimProperty::TranslationX,
+                0.0,
+                0.0,
+                Interpolation::Constant,
+            );
+            node.animation.set_key(
+                AnimProperty::TranslationX,
+                1.0,
+                1.5,
+                Interpolation::Constant,
+            );
+        }
+        {
+            let node = doc.scene.get_mut(child).unwrap();
+            node.animation
+                .set_rotation_key(0.0, Quat::IDENTITY, Interpolation::Linear);
+            node.animation
+                .set_rotation_key(1.0, Quat::from_rotation_z(0.5), Interpolation::Linear);
+            node.animation
+                .set_key(AnimProperty::ScaleY, 0.0, 1.0, Interpolation::Linear);
+            node.animation
+                .set_key(AnimProperty::ScaleY, 1.0, 1.5, Interpolation::Linear);
+        }
+        doc
+    }
+
+    fn export_glb_value(doc: &Document) -> (Value, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scene.glb");
+        export_glb(&path, doc).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let (gltf, bin) = parse_glb(&bytes).unwrap();
+        (gltf, bin.unwrap_or_default())
+    }
+
+    fn node_index(gltf: &Value, name: &str) -> usize {
+        gltf["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|node| node["name"].as_str() == Some(name))
+            .unwrap()
+    }
+
+    fn accessor(gltf: &Value, index: u64, buffers: &[Vec<u8>]) -> (Vec<f32>, usize) {
+        read_accessor_f32(gltf, index as usize, buffers).unwrap()
+    }
+
+    fn accessor_index(value: &Value) -> usize {
+        value.as_u64().expect("accessor index") as usize
+    }
+
+    fn accessor_count(gltf: &Value, index: usize) -> usize {
+        gltf["accessors"][index]["count"]
+            .as_u64()
+            .expect("accessor count") as usize
+    }
+
+    fn accessor_components(accessor: &Value) -> usize {
+        match accessor["type"].as_str().expect("accessor type") {
+            "SCALAR" => 1,
+            "VEC2" => 2,
+            "VEC3" => 3,
+            "VEC4" => 4,
+            "MAT4" => 16,
+            other => panic!("unexpected accessor type {other}"),
+        }
+    }
+
+    fn assert_close(label: &str, actual: f32, expected: f32) {
+        let tolerance = 1e-5_f32.max(1e-5 * actual.abs().max(expected.abs()));
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label}: {actual} != {expected}"
+        );
+    }
+
+    fn assert_accessor_bounds(gltf: &Value, index: usize, buffers: &[Vec<u8>], label: &str) {
+        let accessor_json = &gltf["accessors"][index];
+        let components = accessor_components(accessor_json);
+        let (values, read_components) = accessor(gltf, index as u64, buffers);
+        assert_eq!(read_components, components, "{label}: component count");
+        assert!(!values.is_empty(), "{label}: empty accessor");
+        let min = accessor_json
+            .get("min")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{label}: missing min"));
+        let max = accessor_json
+            .get("max")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{label}: missing max"));
+        assert_eq!(min.len(), components, "{label}: min length");
+        assert_eq!(max.len(), components, "{label}: max length");
+        for component in 0..components {
+            let mut actual_min = f32::INFINITY;
+            let mut actual_max = f32::NEG_INFINITY;
+            for chunk in values.chunks_exact(components) {
+                actual_min = actual_min.min(chunk[component]);
+                actual_max = actual_max.max(chunk[component]);
+            }
+            let declared_min = min[component].as_f64().expect("min value") as f32;
+            let declared_max = max[component].as_f64().expect("max value") as f32;
+            assert_close(
+                &format!("{label}: min[{component}]"),
+                declared_min,
+                actual_min,
+            );
+            assert_close(
+                &format!("{label}: max[{component}]"),
+                declared_max,
+                actual_max,
+            );
+        }
+    }
+
+    fn mesh_target_count(gltf: &Value, mesh_index: u64) -> usize {
+        gltf["meshes"][mesh_index as usize]["primitives"][0]
+            .get("targets")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    }
+
+    fn node_mesh_target_count(gltf: &Value, node_index: usize) -> Option<usize> {
+        let mesh = gltf["nodes"][node_index].get("mesh")?.as_u64()?;
+        Some(mesh_target_count(gltf, mesh))
+    }
+
+    fn assert_morph_conformance(gltf: &Value, buffers: &[Vec<u8>]) {
+        let Some(meshes) = gltf.get("meshes").and_then(Value::as_array) else {
+            return;
+        };
+        for (mesh_index, mesh) in meshes.iter().enumerate() {
+            let primitives = mesh["primitives"].as_array().expect("primitives");
+            assert!(!primitives.is_empty());
+            let target_count = mesh_target_count(gltf, mesh_index as u64);
+            let target_names = mesh
+                .get("extras")
+                .and_then(|extras| extras.get("targetNames"))
+                .and_then(Value::as_array);
+            if target_count > 0 {
+                let names = target_names
+                    .unwrap_or_else(|| panic!("mesh {mesh_index}: targets without targetNames"));
+                assert_eq!(names.len(), target_count);
+                assert!(names.iter().all(|name| name.is_string()));
+            } else {
+                assert!(
+                    target_names.is_none(),
+                    "mesh {mesh_index}: targetNames without targets"
+                );
+            }
+            for (primitive_index, primitive) in primitives.iter().enumerate() {
+                let attributes = primitive["attributes"].as_object().expect("attributes");
+                let position = attributes
+                    .get("POSITION")
+                    .unwrap_or_else(|| panic!("mesh {mesh_index}: missing POSITION"));
+                let position_index = accessor_index(position);
+                let position_count = accessor_count(gltf, position_index);
+                assert_eq!(gltf["accessors"][position_index]["type"], "VEC3");
+                assert_eq!(gltf["accessors"][position_index]["componentType"], 5126);
+                assert_accessor_bounds(
+                    gltf,
+                    position_index,
+                    buffers,
+                    &format!("mesh {mesh_index} primitive {primitive_index} POSITION"),
+                );
+                let targets = primitive
+                    .get("targets")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                assert_eq!(targets, target_count);
+                for (target_index, target) in primitive
+                    .get("targets")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    let target_position = target
+                        .get("POSITION")
+                        .unwrap_or_else(|| panic!("mesh {mesh_index}: target POSITION"));
+                    let target_position_index = accessor_index(target_position);
+                    let target_accessor = &gltf["accessors"][target_position_index];
+                    assert_eq!(target_accessor["type"], "VEC3");
+                    assert_eq!(target_accessor["componentType"], 5126);
+                    assert_eq!(accessor_count(gltf, target_position_index), position_count);
+                    assert_accessor_bounds(
+                        gltf,
+                        target_position_index,
+                        buffers,
+                        &format!(
+                            "mesh {mesh_index} primitive {primitive_index} target {target_index} POSITION"
+                        ),
+                    );
+                    if let Some(normal) = target.get("NORMAL") {
+                        let normal_index = accessor_index(normal);
+                        assert_eq!(gltf["accessors"][normal_index]["type"], "VEC3");
+                        assert_eq!(gltf["accessors"][normal_index]["componentType"], 5126);
+                        assert_eq!(accessor_count(gltf, normal_index), position_count);
+                    }
+                }
+            }
+        }
+        let nodes = gltf["nodes"].as_array().expect("nodes");
+        for (node_index, node) in nodes.iter().enumerate() {
+            let Some(mesh_index) = node.get("mesh").and_then(Value::as_u64) else {
+                continue;
+            };
+            let target_count = mesh_target_count(gltf, mesh_index);
+            if target_count > 0 {
+                let weights = node
+                    .get("weights")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| panic!("node {node_index}: missing morph weights"));
+                assert_eq!(weights.len(), target_count);
+                assert!(weights.iter().all(|weight| weight.as_f64().is_some()));
+            } else {
+                assert!(node.get("weights").is_none());
+            }
+        }
+    }
+
+    fn assert_skin_conformance(gltf: &Value, buffers: &[Vec<u8>]) {
+        let nodes = gltf["nodes"].as_array().expect("nodes");
+        let skins = gltf
+            .get("skins")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for (skin_index, skin) in skins.iter().enumerate() {
+            let joints = skin["joints"].as_array().expect("skin joints");
+            assert!(!joints.is_empty());
+            for joint in joints {
+                assert!(
+                    (joint.as_u64().expect("joint index") as usize) < nodes.len(),
+                    "skin {skin_index}: joint out of range"
+                );
+            }
+            if let Some(skeleton) = skin.get("skeleton") {
+                assert!(
+                    (skeleton.as_u64().expect("skeleton index") as usize) < nodes.len(),
+                    "skin {skin_index}: skeleton out of range"
+                );
+            }
+            if let Some(ibm) = skin.get("inverseBindMatrices") {
+                let index = accessor_index(ibm);
+                let accessor_json = &gltf["accessors"][index];
+                assert_eq!(accessor_json["type"], "MAT4");
+                assert_eq!(accessor_json["componentType"], 5126);
+                assert!(accessor_count(gltf, index) >= joints.len());
+                let (values, components) = accessor(gltf, index as u64, buffers);
+                assert_eq!(components, 16);
+                for matrix in 0..joints.len() {
+                    let offset = matrix * 16;
+                    assert_close(
+                        &format!("skin {skin_index} inverse bind row"),
+                        values[offset + 3],
+                        0.0,
+                    );
+                    assert_close(
+                        &format!("skin {skin_index} inverse bind row"),
+                        values[offset + 7],
+                        0.0,
+                    );
+                    assert_close(
+                        &format!("skin {skin_index} inverse bind row"),
+                        values[offset + 11],
+                        0.0,
+                    );
+                    assert_close(
+                        &format!("skin {skin_index} inverse bind row"),
+                        values[offset + 15],
+                        1.0,
+                    );
+                }
+            }
+        }
+        for (node_index, node) in nodes.iter().enumerate() {
+            let Some(skin_index) = node.get("skin").and_then(Value::as_u64) else {
+                continue;
+            };
+            let skin = skins
+                .get(skin_index as usize)
+                .unwrap_or_else(|| panic!("node {node_index}: skin out of range"));
+            let joints_count = skin["joints"].as_array().unwrap().len();
+            let mesh_index = node["mesh"].as_u64().expect("skinned node mesh");
+            let mesh = &gltf["meshes"][mesh_index as usize];
+            for (primitive_index, primitive) in
+                mesh["primitives"].as_array().unwrap().iter().enumerate()
+            {
+                let attributes = primitive["attributes"].as_object().unwrap();
+                let position_count = accessor_count(
+                    gltf,
+                    accessor_index(attributes.get("POSITION").expect("POSITION")),
+                );
+                let mut set = 0usize;
+                loop {
+                    let joint = attributes.get(&format!("JOINTS_{set}"));
+                    let weight = attributes.get(&format!("WEIGHTS_{set}"));
+                    match (joint, weight) {
+                        (None, None) => break,
+                        (Some(joint), Some(weight)) => {
+                            let joint_index = accessor_index(joint);
+                            let weight_index = accessor_index(weight);
+                            assert_eq!(gltf["accessors"][joint_index]["type"], "VEC4");
+                            assert_eq!(gltf["accessors"][joint_index]["componentType"], 5123);
+                            assert_eq!(gltf["accessors"][weight_index]["type"], "VEC4");
+                            assert_eq!(gltf["accessors"][weight_index]["componentType"], 5126);
+                            let (joint_values, joint_components) =
+                                accessor(gltf, joint_index as u64, buffers);
+                            let (weight_values, weight_components) =
+                                accessor(gltf, weight_index as u64, buffers);
+                            assert_eq!(joint_components, 4);
+                            assert_eq!(weight_components, 4);
+                            assert_eq!(joint_values.len(), position_count * 4);
+                            assert_eq!(weight_values.len(), position_count * 4);
+                            for joint in &joint_values {
+                                assert_eq!(*joint, joint.floor());
+                                assert!(*joint >= 0.0 && (*joint as usize) < joints_count);
+                            }
+                            for weights in weight_values.as_chunks::<4>().0 {
+                                assert!(weights
+                                    .iter()
+                                    .all(|weight| (0.0..=1.0).contains(weight)));
+                                assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+                            }
+                            set += 1;
+                            assert!(set <= 8, "too many joint sets");
+                        }
+                        _ => panic!(
+                            "node {node_index} primitive {primitive_index}: incomplete joint set {set}"
+                        ),
+                    }
+                }
+                assert!(set > 0, "skinned primitive lacks JOINTS_0/WEIGHTS_0");
+            }
+        }
+    }
+
+    fn assert_animation_conformance(gltf: &Value, buffers: &[Vec<u8>]) {
+        let animations = gltf["animations"].as_array().expect("animations");
+        let nodes = gltf["nodes"].as_array().expect("nodes");
+        for (animation_index, animation) in animations.iter().enumerate() {
+            let samplers = animation["samplers"].as_array().expect("samplers");
+            let channels = animation["channels"].as_array().expect("channels");
+            assert!(!channels.is_empty());
+            let mut input_counts = Vec::with_capacity(samplers.len());
+            for (sampler_index, sampler) in samplers.iter().enumerate() {
+                let input_index = accessor_index(sampler.get("input").expect("sampler input"));
+                let input = &gltf["accessors"][input_index];
+                assert_eq!(input["type"], "SCALAR");
+                assert_eq!(input["componentType"], 5126);
+                let (times, components) = accessor(gltf, input_index as u64, buffers);
+                assert_eq!(components, 1);
+                assert!(!times.is_empty());
+                assert!(times[0] >= 0.0);
+                assert!(times.windows(2).all(|pair| pair[0] < pair[1]));
+                assert_accessor_bounds(
+                    gltf,
+                    input_index,
+                    buffers,
+                    &format!("animation {animation_index} sampler {sampler_index} input"),
+                );
+                let interpolation = sampler
+                    .get("interpolation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("LINEAR");
+                assert!(matches!(interpolation, "LINEAR" | "STEP" | "CUBICSPLINE"));
+                if interpolation == "CUBICSPLINE" {
+                    assert!(times.len() >= 2, "CUBICSPLINE needs two keys");
+                }
+                input_counts.push(times.len());
+            }
+            for (channel_index, channel) in channels.iter().enumerate() {
+                let sampler_index = channel["sampler"].as_u64().expect("channel sampler") as usize;
+                let sampler = samplers
+                    .get(sampler_index)
+                    .unwrap_or_else(|| panic!("animation {animation_index}: sampler out of range"));
+                let target = channel["target"].as_object().expect("channel target");
+                let node_index = target
+                    .get("node")
+                    .and_then(Value::as_u64)
+                    .expect("channel target node") as usize;
+                assert!(node_index < nodes.len());
+                let path = target["path"].as_str().expect("channel target path");
+                let input_count = input_counts[sampler_index];
+                let interpolation = sampler
+                    .get("interpolation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("LINEAR");
+                let multiplier = if interpolation == "CUBICSPLINE" { 3 } else { 1 };
+                let (expected_count, expected_type, components) = match path {
+                    "translation" | "scale" => (input_count * multiplier, "VEC3", 3),
+                    "rotation" => (input_count * multiplier, "VEC4", 4),
+                    "weights" => {
+                        let target_count =
+                            node_mesh_target_count(gltf, node_index).unwrap_or_else(|| {
+                                panic!("animation {animation_index}: weights node has no mesh")
+                            });
+                        assert!(target_count > 0);
+                        (input_count * target_count * multiplier, "SCALAR", 1)
+                    }
+                    other => panic!("animation {animation_index}: bad path {other}"),
+                };
+                let output_index = accessor_index(sampler.get("output").expect("sampler output"));
+                let output = &gltf["accessors"][output_index];
+                assert_eq!(
+                    output["type"], expected_type,
+                    "animation {animation_index} channel {channel_index}"
+                );
+                assert_eq!(output["componentType"], 5126);
+                assert_eq!(accessor_count(gltf, output_index), expected_count);
+                let (values, output_components) = accessor(gltf, output_index as u64, buffers);
+                assert_eq!(output_components, components);
+                assert_eq!(values.len(), expected_count * components);
+            }
+        }
+    }
+
+    fn assert_gltf_conformance(gltf: &Value, buffers: &[Vec<u8>], animated: bool) {
+        assert_eq!(gltf["asset"]["version"], "2.0");
+        assert!(!gltf["nodes"].as_array().unwrap().is_empty());
+        assert_morph_conformance(gltf, buffers);
+        assert_skin_conformance(gltf, buffers);
+        if animated {
+            assert!(gltf.get("animations").is_some());
+            assert_animation_conformance(gltf, buffers);
+        } else {
+            assert!(gltf.get("skins").is_none());
+            assert!(gltf.get("animations").is_none());
+            assert!(gltf["meshes"].as_array().unwrap().iter().all(|mesh| {
+                mesh.get("extras").is_none()
+                    && mesh["primitives"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|primitive| {
+                            primitive.get("targets").is_none()
+                                && !primitive["attributes"]
+                                    .as_object()
+                                    .unwrap()
+                                    .contains_key("JOINTS_0")
+                        })
+            }));
+        }
+    }
+
+    fn channel<'a>(gltf: &'a Value, node: usize, path: &str) -> &'a Value {
+        let animation = &gltf["animations"][0];
+        animation["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|channel| {
+                channel["target"]["node"].as_u64() == Some(node as u64)
+                    && channel["target"]["path"].as_str() == Some(path)
+            })
+            .unwrap_or_else(|| panic!("missing {path} channel for node {node}"))
+    }
+
+    fn sampler_output<'a>(
+        gltf: &'a Value,
+        channel: &Value,
+        buffers: &[Vec<u8>],
+    ) -> (Vec<f32>, usize, &'a Value) {
+        let animation = &gltf["animations"][0];
+        let sampler_index = channel["sampler"].as_u64().unwrap() as usize;
+        let sampler = &animation["samplers"][sampler_index];
+        let (values, components) = accessor(gltf, sampler["output"].as_u64().unwrap(), buffers);
+        (values, components, sampler)
+    }
+
+    #[test]
+    fn exports_rigged_morphed_animated_glb() {
+        let doc = rigged_document();
+        let (gltf, bin) = export_glb_value(&doc);
+        let buffers = vec![bin];
+        let skins = gltf["skins"].as_array().unwrap();
+        assert_eq!(skins.len(), 1);
+        let skin = &skins[0];
+        let skin_joints = skin["joints"].as_array().unwrap();
+        assert_eq!(skin_joints.len(), 2);
+        assert_eq!(
+            skin_joints[0].as_u64().unwrap(),
+            node_index(&gltf, "Root") as u64
+        );
+        assert_eq!(
+            skin_joints[1].as_u64().unwrap(),
+            node_index(&gltf, "Child") as u64
+        );
+
+        let (inverse_bind, components) = accessor(
+            &gltf,
+            skin["inverseBindMatrices"].as_u64().unwrap(),
+            &buffers,
+        );
+        assert_eq!(components, 16);
+        assert_eq!(inverse_bind.len(), 32);
+        let inverse_bind_accessor =
+            &gltf["accessors"][skin["inverseBindMatrices"].as_u64().unwrap() as usize];
+        assert_eq!(inverse_bind_accessor["type"], "MAT4");
+        assert_eq!(inverse_bind_accessor["count"], 2);
+        let root_node = &gltf["nodes"][node_index(&gltf, "Root")];
+        let child_node = &gltf["nodes"][node_index(&gltf, "Child")];
+        assert_eq!(root_node["translation"], json!([0.0, 0.0, 0.0]));
+        assert_eq!(child_node["translation"], json!([0.0, 1.0, 0.0]));
+        let expected = doc
+            .scene
+            .get(doc.scene.find_by_name("MorphMesh").unwrap())
+            .unwrap();
+        for (joint, matrix) in expected
+            .skin
+            .as_ref()
+            .unwrap()
+            .inverse_bind
+            .iter()
+            .enumerate()
+        {
+            for (offset, expected) in matrix.to_cols_array().into_iter().enumerate() {
+                assert!(
+                    (inverse_bind[joint * 16 + offset] - expected).abs() < 1e-6,
+                    "inverse bind mismatch for joint {joint}"
+                );
+            }
+        }
+
+        let mesh_node_index = node_index(&gltf, "MorphMesh");
+        let mesh_node = &gltf["nodes"][mesh_node_index];
+        assert_eq!(mesh_node["skin"].as_u64(), Some(0));
+        assert_eq!(
+            mesh_node["weights"].as_array().unwrap(),
+            &vec![json!(0.25), json!(0.5)]
+        );
+        let mesh = &gltf["meshes"][mesh_node["mesh"].as_u64().unwrap() as usize];
+        assert_eq!(
+            mesh["extras"]["targetNames"].as_array().unwrap(),
+            &vec![json!("Smile"), json!("Brow")]
+        );
+        let primitive = &mesh["primitives"][0];
+        let attributes = primitive["attributes"].as_object().unwrap();
+        assert!(attributes.contains_key("JOINTS_0"));
+        assert!(attributes.contains_key("WEIGHTS_0"));
+        assert_eq!(
+            gltf["accessors"][attributes["JOINTS_0"].as_u64().unwrap() as usize]["componentType"],
+            5123
+        );
+        assert_eq!(
+            gltf["accessors"][attributes["JOINTS_0"].as_u64().unwrap() as usize]["type"],
+            "VEC4"
+        );
+        assert_eq!(
+            gltf["accessors"][attributes["WEIGHTS_0"].as_u64().unwrap() as usize]["type"],
+            "VEC4"
+        );
+        let base_count = gltf["accessors"][attributes["POSITION"].as_u64().unwrap() as usize]
+            ["count"]
+            .as_u64()
+            .unwrap() as usize;
+        let (joints, joint_components) =
+            accessor(&gltf, attributes["JOINTS_0"].as_u64().unwrap(), &buffers);
+        assert_eq!(joint_components, 4);
+        assert_eq!(joints.len(), base_count * 4);
+        assert!(joints.iter().all(|joint| *joint < 2.0));
+        let (weights, weight_components) =
+            accessor(&gltf, attributes["WEIGHTS_0"].as_u64().unwrap(), &buffers);
+        assert_eq!(weight_components, 4);
+        assert_eq!(weights.len(), base_count * 4);
+        assert!(joints
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(weights.as_chunks::<4>().0)
+            .any(|(joints, weights)| joints == &[0.0, 1.0, 0.0, 0.0]
+                && weights == &[0.75, 0.25, 0.0, 0.0]));
+        for row in weights.as_chunks::<4>().0 {
+            assert!(row.iter().all(|weight| (0.0..=1.0).contains(weight)));
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+
+        let targets = primitive["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        let (smile_positions, smile_components) =
+            accessor(&gltf, targets[0]["POSITION"].as_u64().unwrap(), &buffers);
+        assert_eq!(smile_components, 3);
+        assert_eq!(smile_positions.len(), base_count * 3);
+        assert!(smile_positions
+            .iter()
+            .skip(2)
+            .step_by(3)
+            .any(|z| (*z - 0.5).abs() < 1e-5));
+        let smile_accessor = &gltf["accessors"][targets[0]["POSITION"].as_u64().unwrap() as usize];
+        let min = smile_accessor["min"].as_array().unwrap();
+        let max = smile_accessor["max"].as_array().unwrap();
+        assert!((max[2].as_f64().unwrap() - 0.5).abs() < 1e-5);
+        assert!((min[2].as_f64().unwrap() - 0.0).abs() < 1e-5);
+        let (smile_normals, _) = accessor(&gltf, targets[0]["NORMAL"].as_u64().unwrap(), &buffers);
+        assert!(smile_normals.iter().any(|normal| normal.abs() > 1e-4));
+        let (brow_positions, _) =
+            accessor(&gltf, targets[1]["POSITION"].as_u64().unwrap(), &buffers);
+        assert!(brow_positions
+            .iter()
+            .step_by(3)
+            .any(|x| (*x - 0.25).abs() < 1e-5));
+
+        let animation = &gltf["animations"][0];
+        assert_eq!(animation["name"], "Take");
+        assert_eq!(animation["channels"].as_array().unwrap().len(), 4);
+        assert_eq!(animation["samplers"].as_array().unwrap().len(), 4);
+        let inputs: std::collections::BTreeSet<u64> = animation["samplers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sampler| sampler["input"].as_u64().unwrap())
+            .collect();
+        assert_eq!(inputs.len(), 1, "channels must share one time base");
+        let input = animation["samplers"][0]["input"].as_u64().unwrap();
+        let input_accessor = &gltf["accessors"][input as usize];
+        assert_eq!(input_accessor["min"][0].as_f64(), Some(0.0));
+        assert_eq!(input_accessor["max"][0].as_f64(), Some(1.0));
+        let (times, components) = accessor(&gltf, input, &buffers);
+        assert_eq!(components, 1);
+        assert!(times.first().is_some_and(|time| *time >= 0.0));
+        assert!(times.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let root_index = node_index(&gltf, "Root");
+        let translation = channel(&gltf, root_index, "translation");
+        let (values, components, sampler) = sampler_output(&gltf, translation, &buffers);
+        assert_eq!(components, 3);
+        assert_eq!(sampler["interpolation"], "STEP");
+        let last = values.len() - 3;
+        assert!((values[last] - 1.5).abs() < 1e-5);
+        let mid = (values.len() / 3) / 2 * 3;
+        assert!(values[mid].abs() < 1e-5, "STEP should hold before the key");
+
+        let child_index = node_index(&gltf, "Child");
+        let rotation = channel(&gltf, child_index, "rotation");
+        let (values, components, sampler) = sampler_output(&gltf, rotation, &buffers);
+        assert_eq!(components, 4);
+        assert_eq!(sampler["interpolation"], "LINEAR");
+        let last = values.len() - 4;
+        let expected = Quat::from_rotation_z(0.5);
+        assert!((values[last] - expected.x).abs() < 1e-5);
+        assert!((values[last + 1] - expected.y).abs() < 1e-5);
+        assert!((values[last + 2] - expected.z).abs() < 1e-5);
+        assert!((values[last + 3] - expected.w).abs() < 1e-5);
+
+        let scale = channel(&gltf, child_index, "scale");
+        let (values, components, _) = sampler_output(&gltf, scale, &buffers);
+        assert_eq!(components, 3);
+        let last = values.len() - 3;
+        assert!((values[last + 1] - 1.5).abs() < 1e-5);
+
+        let weights_channel = channel(&gltf, mesh_node_index, "weights");
+        let (values, components, sampler) = sampler_output(&gltf, weights_channel, &buffers);
+        assert_eq!(components, 1);
+        assert_eq!(sampler["interpolation"], "LINEAR");
+        assert_eq!(values.len(), times.len() * 2);
+        assert!((values[0] - 0.0).abs() < 1e-5);
+        assert!((values[1] - 0.5).abs() < 1e-5);
+        let last = values.len() - 2;
+        assert!((values[last] - 1.0).abs() < 1e-5);
+        assert!((values[last + 1] - 0.5).abs() < 1e-5);
+
+        let base_positions = accessor(&gltf, attributes["POSITION"].as_u64().unwrap(), &buffers).0;
+        assert!(base_positions
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .any(
+                |position| (Vec3::from_slice(position) - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-5
+            ));
+        let position_accessor =
+            &gltf["accessors"][attributes["POSITION"].as_u64().unwrap() as usize];
+        assert!(position_accessor["min"].is_array());
+        assert!(position_accessor["max"].is_array());
+        assert_gltf_conformance(&gltf, &buffers, true);
+    }
+
+    #[test]
+    fn exports_cubic_spline_translation_with_tangent_layout() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Animated Null", None);
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.animation
+                .set_key(AnimProperty::TranslationZ, 0.0, 0.0, Interpolation::Smooth);
+            node.animation
+                .set_key(AnimProperty::TranslationZ, 2.0, 2.0, Interpolation::Smooth);
+        }
+        let (gltf, bin) = export_glb_value(&doc);
+        let buffers = vec![bin];
+        let node = node_index(&gltf, "Animated Null");
+        let channel = channel(&gltf, node, "translation");
+        let (values, components, sampler) = sampler_output(&gltf, channel, &buffers);
+        assert_eq!(components, 3);
+        assert_eq!(sampler["interpolation"], "CUBICSPLINE");
+        let input = sampler["input"].as_u64().unwrap();
+        let (times, _) = accessor(&gltf, input, &buffers);
+        let output = sampler["output"].as_u64().unwrap();
+        assert_eq!(
+            gltf["accessors"][output as usize]["count"]
+                .as_u64()
+                .unwrap() as usize,
+            times.len() * 3
+        );
+        assert_eq!(values.len(), times.len() * 9);
+        let last = values.len() - 9;
+        assert!((values[last + 3 + 2] - 2.0).abs() < 1e-5);
+        assert_gltf_conformance(&gltf, &buffers, true);
+    }
+
+    #[test]
+    fn single_bezier_key_falls_back_to_a_valid_linear_sampler() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "One Key", None);
+        doc.scene.get_mut(id).unwrap().animation.set_key(
+            AnimProperty::TranslationZ,
+            0.0,
+            1.0,
+            Interpolation::Smooth,
+        );
+        let (gltf, bin) = export_glb_value(&doc);
+        let buffers = vec![bin];
+        let channel = channel(&gltf, node_index(&gltf, "One Key"), "translation");
+        let (values, _, sampler) = sampler_output(&gltf, channel, &buffers);
+        assert_eq!(sampler["interpolation"], "LINEAR");
+        assert_eq!(values.len(), 3);
+        assert!((values[2] - 1.0).abs() < 1e-5);
+        assert_gltf_conformance(&gltf, &buffers, true);
+    }
+
+    #[test]
+    fn cameras_and_spot_lights_are_imported_while_skips_are_reported() {
+        let doc = rigged_document();
+        let (mut gltf, bin) = export_glb_value(&doc);
+        // The exporter writes neither cameras nor lights, so add the nodes and
+        // definitions a camera/light-bearing file carries (public glTF spec).
+        gltf["cameras"] = json!([
+            {"type": "perspective", "perspective": {"yfov": 0.7, "znear": 0.2, "zfar": 60.0, "aspectRatio": 1.5}},
+            {"type": "orthographic", "orthographic": {"xmag": 2.0, "ymag": 3.0, "znear": 0.1, "zfar": 50.0}},
+        ]);
+        gltf["extensions"] = json!({"KHR_lights_punctual": {"lights": [
+            {"type": "directional", "color": [1.0, 0.5, 0.25], "intensity": 4.5},
+            {"type": "point", "color": [0.25, 0.5, 1.0], "intensity": 20.0, "range": 12.0},
+            {"type": "spot", "color": [0.2, 1.0, 0.6], "intensity": 2.0, "range": 7.5, "spot": {"innerConeAngle": 0.3, "outerConeAngle": 0.5}},
+        ]}});
+        let added = [
+            json!({"name": "Shot Camera", "camera": 0}),
+            json!({"name": "Plan Camera", "camera": 1}),
+            json!({"name": "Key Light", "extensions": {"KHR_lights_punctual": {"light": 0}}}),
+            json!({"name": "Fill Light", "extensions": {"KHR_lights_punctual": {"light": 1}}}),
+            json!({"name": "Spot Light", "extensions": {"KHR_lights_punctual": {"light": 2}}}),
+        ];
+        let nodes = gltf["nodes"].as_array_mut().expect("nodes");
+        let first_index = nodes.len();
+        let added_count = added.len();
+        nodes.extend(added);
+        let roots = gltf["scenes"][0]["nodes"]
+            .as_array_mut()
+            .expect("scene roots");
+        for index in first_index..first_index + added_count {
+            roots.push(json!(index));
+        }
+
+        let (imported, report) = import_value_with_buffers_and_report(gltf, vec![bin]).unwrap();
+        assert_eq!(report.skinned_meshes, 1, "skinned mesh not counted");
+        assert_eq!(report.animation_clips, 1, "animation clip not counted");
+        assert_eq!(
+            report.camera_aspect_ratios, 1,
+            "camera aspect ratio not counted"
+        );
+        let summary = report.summary().expect("skipped data without a message");
+        for expected in [
+            "1 skinned mesh",
+            "1 animation clip",
+            "1 camera aspect ratio",
+            "Re-export without them, or recreate them in LeopardCraft",
+        ] {
+            assert!(
+                summary.contains(expected),
+                "missing {expected:?}: {summary}"
+            );
+        }
+
+        // Authored cameras are honoured, not reported as skipped.
+        let camera_id = imported.scene.find_by_name("Shot Camera").unwrap();
+        let NodeKind::Camera { camera } = &imported.scene.get(camera_id).unwrap().kind else {
+            panic!("perspective camera imported as the wrong node kind");
+        };
+        assert!(
+            (camera.fov_y_deg - 0.7_f32.to_degrees()).abs() < 1e-4,
+            "fov {} != {} degrees",
+            camera.fov_y_deg,
+            0.7_f32.to_degrees()
+        );
+        assert!((camera.near - 0.2).abs() < 1e-5, "near clip lost");
+        assert!((camera.far - 60.0).abs() < 1e-4, "far clip lost");
+        let plan_id = imported.scene.find_by_name("Plan Camera").unwrap();
+        let NodeKind::Camera { camera } = &imported.scene.get(plan_id).unwrap().kind else {
+            panic!("orthographic camera imported as the wrong node kind");
+        };
+        assert_eq!(camera.projection, ProjectionMode::Orthographic);
+        assert!(
+            (camera.ortho_scale - 6.0).abs() < 1e-4,
+            "ortho scale {} does not match ymag 3",
+            camera.ortho_scale
+        );
+
+        // Authored lights are honoured too: type, colour and intensity.
+        let key_id = imported.scene.find_by_name("Key Light").unwrap();
+        let NodeKind::Light { light } = &imported.scene.get(key_id).unwrap().kind else {
+            panic!("directional light imported as the wrong node kind");
+        };
+        assert_eq!(light.kind, LightKind::Directional);
+        assert!((light.intensity - 4.5).abs() < 1e-5, "intensity lost");
+        assert!(
+            (light.color - Vec3::new(1.0, 0.5, 0.25)).length() < 1e-5,
+            "colour {:?} lost",
+            light.color
+        );
+        let fill_id = imported.scene.find_by_name("Fill Light").unwrap();
+        let NodeKind::Light { light } = &imported.scene.get(fill_id).unwrap().kind else {
+            panic!("point light imported as the wrong node kind");
+        };
+        let LightKind::Point { radius } = light.kind else {
+            panic!("point light imported as {}", light.kind.label());
+        };
+        assert!(
+            (radius - 12.0).abs() < 1e-5,
+            "authored range {radius} is not the 12.0 the file declares"
+        );
+        assert!((light.intensity - 20.0).abs() < 1e-5);
+
+        // A spot light keeps its authored cone and falloff distance.
+        let spot_id = imported.scene.find_by_name("Spot Light").unwrap();
+        let NodeKind::Light { light } = &imported.scene.get(spot_id).unwrap().kind else {
+            panic!("spot light imported as the wrong node kind");
+        };
+        let LightKind::Spot {
+            radius,
+            inner_deg,
+            outer_deg,
+        } = light.kind
+        else {
+            panic!("spot light imported as {}", light.kind.label());
+        };
+        assert!(
+            (radius - 7.5).abs() < 1e-5,
+            "spot range {radius} is not the 7.5 the file declares"
+        );
+        assert!(
+            (inner_deg - 0.3_f32.to_degrees()).abs() < 1e-4,
+            "inner cone {inner_deg} != {} degrees",
+            0.3_f32.to_degrees()
+        );
+        assert!(
+            (outer_deg - 0.5_f32.to_degrees()).abs() < 1e-4,
+            "outer cone {outer_deg} != {} degrees",
+            0.5_f32.to_degrees()
+        );
+        assert!((light.intensity - 2.0).abs() < 1e-5, "spot intensity lost");
+        assert!(
+            (light.color - Vec3::new(0.2, 1.0, 0.6)).length() < 1e-5,
+            "spot colour {:?} lost",
+            light.color
+        );
+
+        // The geometry and morph targets still import: skips are reported, not fatal.
+        let id = imported.scene.find_by_name("MorphMesh").unwrap();
+        let node = imported.scene.get(id).unwrap();
+        assert_eq!(node.morph.targets.len(), 2, "morph targets were lost");
+        assert!(
+            node.skin.is_none(),
+            "a skin LeopardCraft cannot read leaked in"
+        );
+    }
+
+    #[test]
+    fn spot_light_import_refuses_an_inverted_cone() {
+        let mut doc = Document::empty();
+        doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(lc_geom::box_mesh(1.0, 1.0, 1.0)),
+            },
+            "Box",
+            None,
+        );
+        let (mut gltf, bin) = export_glb_value(&doc);
+        gltf["extensions"] = json!({"KHR_lights_punctual": {"lights": [
+            {"type": "spot", "spot": {"innerConeAngle": 0.9, "outerConeAngle": 0.4}},
+        ]}});
+        let nodes = gltf["nodes"].as_array_mut().expect("nodes");
+        let index = nodes.len();
+        nodes
+            .push(json!({"name": "Bad Cone", "extensions": {"KHR_lights_punctual": {"light": 0}}}));
+        gltf["scenes"][0]["nodes"]
+            .as_array_mut()
+            .expect("scene roots")
+            .push(json!(index));
+        let Err(error) = import_value_with_buffers_and_report(gltf, vec![bin]) else {
+            panic!("an inverted spot cone was accepted");
+        };
+        assert!(
+            error.contains("cone angles") && error.contains("90 degrees"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn camera_import_refuses_a_camera_without_projection_parameters() {
+        let mut doc = Document::empty();
+        doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(lc_geom::box_mesh(1.0, 1.0, 1.0)),
+            },
+            "Box",
+            None,
+        );
+        let (mut gltf, bin) = export_glb_value(&doc);
+        gltf["cameras"] = json!([{"type": "perspective", "perspective": {"znear": 0.1}}]);
+        let nodes = gltf["nodes"].as_array_mut().expect("nodes");
+        let index = nodes.len();
+        nodes.push(json!({"name": "Broken Camera", "camera": 0}));
+        gltf["scenes"][0]["nodes"]
+            .as_array_mut()
+            .expect("scene roots")
+            .push(json!(index));
+        let Err(error) = import_value_with_buffers_and_report(gltf, vec![bin]) else {
+            panic!("a camera without yfov was accepted");
+        };
+        assert!(
+            error.contains("perspective.yfov"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn accessor_stride_smaller_than_its_element_is_rejected() {
+        // A hand-edited file can declare a byteStride smaller than one VEC3
+        // element. The last component read then runs past the buffer view and
+        // used to panic instead of failing the import.
+        let gltf = json!({
+            "asset": {"version": "2.0"},
+            "buffers": [{"byteLength": 12}],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 12, "byteStride": 4}],
+            "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}],
+            "meshes": [{"name": "Tight", "primitives": [{"attributes": {"POSITION": 0}}]}],
+            "nodes": [{"name": "Tight", "mesh": 0}],
+            "scenes": [{"nodes": [0]}],
+            "scene": 0
+        });
+        let Err(error) = import_value_with_buffers_and_report(gltf, vec![vec![0; 12]]) else {
+            panic!("a short accessor stride was accepted");
+        };
+        assert!(error.contains("stride"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn mesh_only_glb_imports_without_a_skip_report() {
+        let mut doc = Document::empty();
+        let mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        let vertices = mesh.positions.len();
+        doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(mesh),
+            },
+            "Plain Box",
+            None,
+        );
+        let (gltf, bin) = export_glb_value(&doc);
+        let (imported, report) = import_value_with_buffers_and_report(gltf, vec![bin]).unwrap();
+        assert!(
+            report.is_empty(),
+            "mesh-only file reported skips: {report:?}"
+        );
+        assert!(report.summary().is_none());
+        let id = imported.scene.find_by_name("Plain Box").unwrap();
+        let node = imported.scene.get(id).unwrap();
+        let NodeKind::Mesh { geometry } = &node.kind else {
+            panic!("plain mesh did not import as a mesh");
+        };
+        assert!(!geometry.mesh().unwrap().positions.is_empty());
+        assert!(geometry.mesh().unwrap().positions.len() >= vertices);
+    }
+
+    #[test]
+    fn imports_morph_targets_names_and_weights() {
+        let mut doc = Document::empty();
+        let mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        let base = mesh.positions.clone();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(mesh),
+            },
+            "Morph Import",
+            None,
+        );
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            let mut lift = MorphTarget::new("Lift", vec![Vec3::Y; base.len()]);
+            lift.weight = 0.25;
+            let mut wide = MorphTarget::new("Wide", vec![Vec3::X * 0.5; base.len()]);
+            wide.weight = 0.5;
+            node.morph = MorphSet {
+                base: base.clone(),
+                targets: vec![lift, wide],
+            };
+        }
+        let (gltf, bin) = export_glb_value(&doc);
+        let imported = import_value_with_buffers(gltf, vec![bin]).unwrap();
+        let id = imported.scene.find_by_name("Morph Import").unwrap();
+        let node = imported.scene.get(id).unwrap();
+        assert!(node.morph.has_base(), "imported node has no morph base");
+        let names: Vec<&str> = node
+            .morph
+            .targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect();
+        assert_eq!(names, ["Lift", "Wide"]);
+        let weights: Vec<f32> = node
+            .morph
+            .targets
+            .iter()
+            .map(|target| target.weight)
+            .collect();
+        assert_eq!(weights, [0.25, 0.5]);
+        let NodeKind::Mesh { geometry } = &node.kind else {
+            panic!("imported morph source is not a mesh");
+        };
+        let mesh = geometry.mesh().expect("editable mesh");
+        assert_eq!(node.morph.base.len(), mesh.positions.len());
+        assert!(!node.morph.base.is_empty());
+        for target in &node.morph.targets {
+            assert_eq!(target.deltas.len(), mesh.positions.len());
+        }
+        assert!(
+            node.morph.targets[0]
+                .deltas
+                .iter()
+                .all(|delta| (*delta - Vec3::Y).length() < 1e-5),
+            "lift deltas were not imported as offsets"
+        );
+        assert!(
+            node.morph.targets[1]
+                .deltas
+                .iter()
+                .all(|delta| (*delta - Vec3::X * 0.5).length() < 1e-5),
+            "wide deltas were not imported as offsets"
+        );
+        let posed = imported.evaluate(0.0);
+        let positions = &posed.node(id).unwrap().mesh().unwrap().positions;
+        let expected = base[0] + Vec3::Y * 0.25 + Vec3::X * 0.5 * 0.5;
+        assert!(
+            (positions[0] - expected).length() < 1e-4,
+            "posed {:?} expected {expected:?}",
+            positions[0]
+        );
+    }
+
+    #[test]
+    fn morph_import_refuses_mismatched_weight_counts() {
+        let mut doc = Document::empty();
+        let mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        let base = mesh.positions.clone();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(mesh),
+            },
+            "Morph Weights",
+            None,
+        );
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            let mut lift = MorphTarget::new("Lift", vec![Vec3::Y; base.len()]);
+            lift.weight = 0.25;
+            node.morph = MorphSet {
+                base,
+                targets: vec![lift],
+            };
+        }
+        let (mut gltf, bin) = export_glb_value(&doc);
+        let index = node_index(&gltf, "Morph Weights");
+        gltf["nodes"][index]["weights"] = json!([0.25, 0.5]);
+        let Err(error) = import_value_with_buffers(gltf, vec![bin]) else {
+            panic!("mismatched morph weights were accepted");
+        };
+        assert!(
+            error.contains("morph weights (2) do not match morph targets (1)"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn exports_cubic_spline_morph_weights_with_target_stride() {
+        let mut doc = Document::empty();
+        let mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        let base = mesh.positions.clone();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(mesh),
+            },
+            "Cubic Morph",
+            None,
+        );
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph = MorphSet {
+                base: base.clone(),
+                targets: vec![
+                    MorphTarget::new("Lift", vec![Vec3::Y; base.len()]),
+                    MorphTarget::new("Wide", vec![Vec3::X * 0.5; base.len()]),
+                ],
+            };
+            node.animation
+                .set_morph_weight_key(0, 0.0, 0.0, Interpolation::Smooth);
+            node.animation
+                .set_morph_weight_key(0, 2.0, 1.0, Interpolation::Smooth);
+            node.animation
+                .set_morph_weight_key(1, 0.0, 1.0, Interpolation::Smooth);
+            node.animation
+                .set_morph_weight_key(1, 2.0, 0.0, Interpolation::Smooth);
+        }
+        let (gltf, bin) = export_glb_value(&doc);
+        let buffers = vec![bin];
+        let weights = channel(&gltf, node_index(&gltf, "Cubic Morph"), "weights");
+        let (values, components, sampler) = sampler_output(&gltf, weights, &buffers);
+        assert_eq!(components, 1);
+        assert_eq!(sampler["interpolation"], "CUBICSPLINE");
+        let input = sampler["input"].as_u64().unwrap();
+        let (times, _) = accessor(&gltf, input, &buffers);
+        assert!(times.len() >= 2);
+        assert_eq!(
+            gltf["accessors"][sampler["output"].as_u64().unwrap() as usize]["count"]
+                .as_u64()
+                .unwrap() as usize,
+            times.len() * 2 * 3
+        );
+        assert_eq!(values.len(), times.len() * 2 * 3);
+        assert_gltf_conformance(&gltf, &buffers, true);
+    }
+
+    #[test]
+    fn morph_targets_are_skipped_when_a_modifier_stack_must_be_baked() {
+        let mut doc = Document::empty();
+        let mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        let base = mesh.positions.clone();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(mesh),
+            },
+            "Modified Morph",
+            None,
+        );
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph = MorphSet {
+                base: base.clone(),
+                targets: vec![MorphTarget::new("Lift", vec![Vec3::Y; base.len()])],
+            };
+            node.modifiers.push(lc_scene::Modifier::Subdivision {
+                levels: 1,
+                scheme: lc_scene::SubdivisionScheme::CatmullClark,
+            });
+        }
+        let (gltf, _) = export_glb_value(&doc);
+        let mesh_node = &gltf["nodes"][node_index(&gltf, "Modified Morph")];
+        assert!(mesh_node.get("weights").is_none());
+        let mesh = &gltf["meshes"][mesh_node["mesh"].as_u64().unwrap() as usize];
+        assert!(mesh.get("extras").is_none());
+        assert!(mesh["primitives"][0].get("targets").is_none());
+    }
+
+    #[test]
+    fn invalid_skin_and_stale_morph_are_skipped_without_panicking() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(lc_geom::box_mesh(1.0, 1.0, 1.0)),
+            },
+            "BrokenRig",
+            None,
+        );
+        {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.morph = MorphSet {
+                base: vec![Vec3::ZERO],
+                targets: vec![MorphTarget::new("Stale", vec![Vec3::ONE; 3])],
+            };
+            let mut skin = Skin::new(vec![999_999], vec![Mat4::IDENTITY]);
+            skin.bind_all_to_first(1);
+            node.skin = Some(skin);
+        }
+        let (gltf, _) = export_glb_value(&doc);
+        assert!(gltf.get("skins").is_none());
+        assert!(gltf.get("animations").is_none());
+        let mesh_node = &gltf["nodes"][node_index(&gltf, "BrokenRig")];
+        assert!(mesh_node.get("skin").is_none());
+        assert!(mesh_node.get("weights").is_none());
+        let mesh = &gltf["meshes"][mesh_node["mesh"].as_u64().unwrap() as usize];
+        assert!(mesh.get("extras").is_none());
+        let primitive = &mesh["primitives"][0];
+        assert!(primitive.get("targets").is_none());
+        assert!(!primitive["attributes"]
+            .as_object()
+            .unwrap()
+            .contains_key("JOINTS_0"));
+    }
+
+    #[test]
+    fn rig_free_export_keeps_the_static_mesh_shape() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(lc_geom::box_mesh(2.0, 1.0, 3.0)),
+            },
+            "Box",
+            None,
+        );
+        doc.scene.get_mut(id).unwrap().transform =
+            lc_core::Transform::from_translation(Vec3::new(1.0, 2.0, 3.0));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("static.gltf");
+        export_gltf(&path, &doc).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let gltf: Value = serde_json::from_str(&text).unwrap();
+        assert!(gltf.get("skins").is_none());
+        assert!(gltf.get("animations").is_none());
+        let mesh = &gltf["meshes"][0];
+        assert!(mesh.get("extras").is_none());
+        let primitive = &mesh["primitives"][0];
+        assert!(primitive.get("targets").is_none());
+        let attributes = primitive["attributes"].as_object().unwrap();
+        assert_eq!(attributes.len(), 3);
+        assert!(attributes.contains_key("POSITION"));
+        assert!(attributes.contains_key("NORMAL"));
+        assert!(attributes.contains_key("TEXCOORD_0"));
+        assert!(!attributes.contains_key("JOINTS_0"));
+        assert!(!attributes.contains_key("WEIGHTS_0"));
+        let node = &gltf["nodes"][0];
+        assert!(node.get("skin").is_none());
+        assert!(node.get("weights").is_none());
+        assert_eq!(node["translation"], json!([1.0, 2.0, 3.0]));
+        let buffers = load_buffers(&gltf, None, dir.path()).unwrap();
+        let (positions, _) = accessor(
+            &gltf,
+            primitive["attributes"]["POSITION"].as_u64().unwrap(),
+            &buffers,
+        );
+        assert!(!positions.is_empty());
+        assert!(positions.as_chunks::<3>().0.iter().any(|position| {
+            (Vec3::from_slice(position) - Vec3::new(-1.0, -0.5, -1.5)).length() < 1e-5
+        }));
+        assert_gltf_conformance(&gltf, &buffers, false);
+    }
+}

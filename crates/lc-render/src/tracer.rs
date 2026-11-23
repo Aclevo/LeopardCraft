@@ -255,6 +255,42 @@ fn direct_light(
             let f = evaluate_bsdf(surface, wo, wi, n_dot_l);
             f * light.emission * (n_dot_l / dist2) / count
         }
+        SceneLightKind::Spot {
+            position,
+            direction,
+            cos_inner,
+            cos_outer,
+            ..
+        } => {
+            let to_light = *position - hit.position;
+            let dist2 = to_light.length_squared().max(1e-6);
+            let dist = dist2.sqrt();
+            let wi = to_light / dist;
+            let n_dot_l = n.dot(wi);
+            if n_dot_l <= 0.0 {
+                return Vec3::ZERO;
+            }
+            // The cone axis points away from the light, so the ray that reaches
+            // this surface must travel along it.
+            let cos_theta = (-wi).dot(*direction);
+            if cos_theta <= *cos_outer {
+                return Vec3::ZERO;
+            }
+            let falloff = if cos_theta >= *cos_inner {
+                1.0
+            } else {
+                let span = (*cos_inner - *cos_outer).max(1e-5);
+                ((cos_theta - *cos_outer) / span).clamp(0.0, 1.0)
+            };
+            if light.casts_shadow {
+                let ray = Ray::new(hit.position + n * shadow_eps, wi);
+                if scene.occluded(&ray, dist - shadow_eps) {
+                    return Vec3::ZERO;
+                }
+            }
+            let f = evaluate_bsdf(surface, wo, wi, n_dot_l);
+            f * light.emission * (n_dot_l / dist2) * falloff / count
+        }
         SceneLightKind::Area {
             center,
             u,

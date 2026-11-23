@@ -1,0 +1,13 @@
+[package]
+name = "lc-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lc-core = { path = "../lc-core" }
+lc-scene = { path = "../lc-scene" }
+lc-render = { path = "../lc-render" }
+lc-io = { path = "../lc-io" }
+glam.workspace = true
+serde_json.workspace = true

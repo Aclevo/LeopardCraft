@@ -5,7 +5,8 @@
 //! and ordering.
 
 use crate::{
-    Document, DocumentSettings, Modifier, Node, NodeId, NodeKind, NodeProps, Skin, Subtree,
+    Document, DocumentSettings, Modifier, MorphSet, Node, NodeId, NodeKind, NodeProps, Skin,
+    Subtree,
 };
 use lc_anim::AnimationClip;
 use lc_core::Transform;
@@ -143,6 +144,32 @@ impl Command for AddNodeCmd {
 
     fn undo(&mut self, doc: &mut Document) {
         doc.scene.remove_subtree(self.node.id);
+    }
+}
+
+/// One undo step for an action that inserts several objects at once, such as
+/// splitting a component selection into new meshes.
+pub struct AddNodesCmd {
+    pub label: String,
+    /// Nodes paired with the parent each one is appended to.
+    pub nodes: Vec<(Node, Option<NodeId>)>,
+}
+
+impl Command for AddNodesCmd {
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        for (node, parent) in &self.nodes {
+            let _ = doc.scene.insert_node(node.clone(), *parent, None);
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        for (node, _) in self.nodes.iter().rev() {
+            doc.scene.remove_subtree(node.id);
+        }
     }
 }
 
@@ -345,6 +372,7 @@ pub struct Shape {
     pub kind: NodeKind,
     pub modifiers: Vec<Modifier>,
     pub skin: Option<Skin>,
+    pub morph: MorphSet,
 }
 
 impl Shape {
@@ -353,6 +381,7 @@ impl Shape {
             kind: node.kind.clone(),
             modifiers: node.modifiers.clone(),
             skin: node.skin.clone(),
+            morph: node.morph.clone(),
         }
     }
 }
@@ -373,6 +402,7 @@ impl Command for SetShapeCmd {
             n.kind = self.after.kind.clone();
             n.modifiers = self.after.modifiers.clone();
             n.skin = self.after.skin.clone();
+            n.morph = self.after.morph.clone();
         }
     }
 
@@ -381,6 +411,32 @@ impl Command for SetShapeCmd {
             n.kind = self.before.kind.clone();
             n.modifiers = self.before.modifiers.clone();
             n.skin = self.before.skin.clone();
+            n.morph = self.before.morph.clone();
+        }
+    }
+}
+
+/// One undo step for morph targets, names and weights.
+pub struct SetMorphCmd {
+    pub id: NodeId,
+    pub before: MorphSet,
+    pub after: MorphSet,
+}
+
+impl Command for SetMorphCmd {
+    fn label(&self) -> String {
+        "Edit Morph".into()
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        if let Some(node) = doc.scene.get_mut(self.id) {
+            node.morph = self.after.clone();
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        if let Some(node) = doc.scene.get_mut(self.id) {
+            node.morph = self.before.clone();
         }
     }
 }
@@ -405,6 +461,7 @@ impl Command for SetShapesCmd {
                 n.kind = after.kind.clone();
                 n.modifiers = after.modifiers.clone();
                 n.skin = after.skin.clone();
+                n.morph = after.morph.clone();
             }
         }
     }
@@ -415,6 +472,7 @@ impl Command for SetShapesCmd {
                 n.kind = before.kind.clone();
                 n.modifiers = before.modifiers.clone();
                 n.skin = before.skin.clone();
+                n.morph = before.morph.clone();
             }
         }
     }
@@ -782,6 +840,57 @@ mod tests {
         assert_eq!(doc.materials.get(0).unwrap().name, "Edited Grey");
         history.undo(&mut doc);
         assert_eq!(doc.signature(), before);
+    }
+
+    #[test]
+    fn removing_a_tag_keeps_per_tag_clips_aligned_and_undoable() {
+        use crate::Tag;
+        use lc_anim::{AnimProperty, Interpolation};
+
+        let mut doc = demo();
+        let id = doc.scene.find_by_name("Cube").unwrap();
+        let clip = {
+            let node = doc.scene.get_mut(id).unwrap();
+            node.tags = vec![
+                Tag::RenderOverride {
+                    visible: true,
+                    casts_shadow: true,
+                },
+                Tag::CopyLocation {
+                    source: id,
+                    offset: glam::Vec3::ZERO,
+                    weight: 1.0,
+                },
+            ];
+            node.tag_animations.clear();
+            let mut clip = AnimationClip::default();
+            clip.set_key(
+                AnimProperty::CopyLocationWeight,
+                0.0,
+                0.25,
+                Interpolation::Linear,
+            );
+            node.tag_animations.insert(1, clip.clone());
+            clip
+        };
+
+        // The inspector edits a clone and commits through NodeProps, so the
+        // remapped clip map has to travel with the tag list.
+        let mut edited = doc.scene.get(id).unwrap().clone();
+        assert!(edited.remove_tag(0).is_some());
+        let mut history = History::new(4);
+        let cmd = SetNodePropsCmd::new(&doc, id, NodeProps::of(&edited)).unwrap();
+        history.execute(&mut doc, Box::new(cmd));
+
+        let node = doc.scene.get(id).unwrap();
+        assert_eq!(node.tags.len(), 1);
+        assert_eq!(node.tag_animations.get(&0), Some(&clip));
+        assert!(!node.tag_animations.contains_key(&1));
+
+        history.undo(&mut doc);
+        let node = doc.scene.get(id).unwrap();
+        assert_eq!(node.tags.len(), 2);
+        assert_eq!(node.tag_animations.get(&1), Some(&clip));
     }
 
     #[test]

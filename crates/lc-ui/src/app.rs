@@ -15,22 +15,23 @@ use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use glam::{Mat4, Quat, Vec2 as V2, Vec3};
 use lc_anim::{
     AnimChannel, AnimProperty, AnimationClip, ChannelAppliesTo, ChannelKind, Interpolation,
-    Playback,
+    Playback, TangentType,
 };
 use lc_core::{look_at_quat, ray_triangle, Pcg32, Transform};
 use lc_geom::Mesh;
 use lc_render::{PathTracer, RenderScene};
 use lc_scene::{
-    AddNodeCmd, Camera, Command, Document, Environment, EvaluatedScene, GeometrySource, History,
-    Light, LightKind, Modifier, Node, NodeId, NodeKind, NodeProps, Primitive, ProjectionMode,
+    bake_ik_range_edits, ik_chain_joints, AddNodeCmd, Camera, Command, Document, Environment,
+    EvaluatedScene, GeometrySource, History, Light, LightKind, Modifier, MorphSet, MorphTarget,
+    Node, NodeId, NodeKind, NodeProps, Primitive, ProjectionMode, ProximityWeightOptions,
     RenameNodeCmd, ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetAnimationsCmd,
-    SetMaterialCmd, SetNodePropsCmd, SetNodesPropsCmd, SetShapeCmd, SetShapesCmd,
+    SetMaterialCmd, SetMorphCmd, SetNodePropsCmd, SetNodesPropsCmd, SetShapeCmd, SetShapesCmd,
     SetTagAnimationCmd, SetTransformsCmd, Shape, Skin, Tag,
 };
 use lc_shading::{Material, MaterialId, ShaderNodeKind, ShaderValue, TextureCache};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -308,8 +309,30 @@ enum MeshAction {
     Bevel,
     RingCut,
     Weld,
+    Collapse,
+    Optimize,
+    PointSlide,
     Bridge,
+    ToggleCrease,
+    ToggleSeam,
+    TogglePinnedUv,
+    FillHole,
+    Split,
+    Shell,
+    Triangulate,
+    FlipNormal,
+    Disconnect,
+    Cover,
+    CreatePolygon,
     AssignMaterial,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum MorphAction {
+    RecordBase,
+    Capture,
+    Restore,
+    Remove(usize),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -562,6 +585,7 @@ const KEY_TIME_EPSILON: f32 = 1e-3;
 pub(super) enum CurveTrackId {
     Scalar(AnimProperty),
     Rotation,
+    MorphWeight(u32),
 }
 
 /// The object, tag or material whose animation the F-curve editor is editing.
@@ -578,6 +602,7 @@ pub(super) enum AnimTarget {
 pub(super) struct CurveRow {
     pub(super) channel: AnimChannel,
     pub(super) property: Option<AnimProperty>,
+    pub(super) morph_target: Option<u32>,
 }
 
 /// A single F-curve key identified by its target, track and time.
@@ -596,6 +621,21 @@ pub(super) struct CurveKeyDrag {
     original_time: f32,
     current_time: f32,
     original_selection: Vec<SelectedKey>,
+}
+
+/// In-flight drag of one Bézier tangent handle. The key's screen-space
+/// time/value anchor and the signed time offset to the handle are kept so the
+/// pointer's vertical position can be converted back into a slope.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CurveTangentDrag {
+    pub(super) target: AnimTarget,
+    pub(super) track: CurveTrackId,
+    pub(super) time: f32,
+    pub(super) incoming: bool,
+    pub(super) key_value: f32,
+    pub(super) time_offset: f32,
+    pub(super) original_slope: f32,
+    pub(super) current_slope: f32,
 }
 
 /// In-flight marquee over the curve canvas.
@@ -674,11 +714,14 @@ pub struct LeopardApp {
     anim_target: Option<AnimTarget>,
     /// Selected F-curve keys, on whichever target owns them.
     selected_keys: Vec<SelectedKey>,
+    /// Shared numeric factor used by selected-key and whole-take retiming.
+    retime_factor: f32,
     curve_key_drag: Option<CurveKeyDrag>,
+    curve_tangent_drag: Option<CurveTangentDrag>,
     curve_box_select: Option<CurveBoxSelect>,
     curve_clipboard: CurveClipboard,
-    /// Registry channel selected in the F-curve row list, for keying.
-    selected_curve_channel: Option<(AnimTarget, AnimChannel)>,
+    /// Registry row selected in the F-curve list, for keying.
+    selected_curve_channel: Option<(AnimTarget, CurveRow)>,
     /// A native clipboard paste was handled and its V-key release still needs
     /// to be swallowed so the same chord is not pasted twice.
     native_paste_pending: bool,
@@ -727,6 +770,20 @@ pub struct LeopardApp {
     mesh_depth: f32,
     mesh_offset: f32,
     mesh_extrude_individual: bool,
+    mesh_shell_thickness: f32,
+    mesh_shell_inside: bool,
+    mesh_shell_angle: f32,
+    mesh_shell_quantize: f32,
+    mesh_optimize_tolerance: f32,
+    mesh_slide_fraction: f32,
+    weight_paint: bool,
+    weight_joint: Option<usize>,
+    weight_brush: WeightBrush,
+    bind_joints: Option<BTreeSet<NodeId>>,
+    bind_auto_weights: bool,
+    bind_dropoff: f32,
+    bind_strength: f32,
+    bind_max_influences: usize,
     last_viewport_rect: Rect,
     last_viewport_size: Vec2,
     /// Actual row rectangles and highlight decisions from the last Object
@@ -769,7 +826,9 @@ impl LeopardApp {
             selected_uv: None,
             anim_target: None,
             selected_keys: Vec::new(),
+            retime_factor: 1.0,
             curve_key_drag: None,
+            curve_tangent_drag: None,
             curve_box_select: None,
             curve_clipboard: CurveClipboard::default(),
             selected_curve_channel: None,
@@ -825,6 +884,20 @@ impl LeopardApp {
             mesh_depth: 0.05,
             mesh_offset: 0.0,
             mesh_extrude_individual: false,
+            mesh_shell_thickness: 0.1,
+            mesh_shell_inside: true,
+            mesh_shell_angle: 30.0,
+            mesh_shell_quantize: 0.0,
+            mesh_optimize_tolerance: 0.001,
+            mesh_slide_fraction: 0.5,
+            weight_paint: false,
+            weight_joint: None,
+            weight_brush: WeightBrush::default(),
+            bind_joints: None,
+            bind_auto_weights: true,
+            bind_dropoff: 2.0,
+            bind_strength: 0.6,
+            bind_max_influences: 4,
             last_viewport_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
             last_viewport_size: Vec2::splat(100.0),
             #[cfg(test)]
@@ -936,21 +1009,30 @@ impl LeopardApp {
         self.sync_selection_material();
     }
 
+    /// Adopt the loaded document's frame range. Documents store frames and
+    /// fps; the playback clock runs in seconds, so both bounds are divided.
+    fn sync_playback_to_document(&mut self) {
+        self.playback.fps = self.doc.settings.fps.max(1.0);
+        self.playback.start = self.doc.settings.frame_start / self.playback.fps;
+        self.playback.end = self.doc.settings.frame_end / self.playback.fps;
+        self.playback.time = self.playback.start;
+    }
+
     pub fn load_scene(&mut self, doc: Document, path: Option<PathBuf>) {
         if let Some(active) = self.active_render.take() {
             active.cancel.store(true, Ordering::Relaxed);
         }
-        self.playback.fps = doc.settings.fps.max(1.0);
-        self.playback.start = doc.settings.frame_start / self.playback.fps;
-        self.playback.end = doc.settings.frame_end / self.playback.fps;
-        self.playback.time = self.playback.start;
-        let initial = doc.scene.find_by_name("Cube").or_else(|| {
-            doc.scene
-                .depth_first()
-                .into_iter()
-                .find(|id| doc.scene.get(*id).map(|n| n.is_mesh()).unwrap_or(false))
-        });
         self.doc = doc;
+        self.sync_playback_to_document();
+        let initial = self.doc.scene.find_by_name("Cube").or_else(|| {
+            self.doc.scene.depth_first().into_iter().find(|id| {
+                self.doc
+                    .scene
+                    .get(*id)
+                    .map(|n| n.is_mesh())
+                    .unwrap_or(false)
+            })
+        });
         self.selection.clear();
         if let Some(id) = initial {
             self.selection.select_one(id);
@@ -1098,6 +1180,53 @@ impl LeopardApp {
     fn add_null(&mut self) {
         let node = self.doc.create_node(NodeKind::Null, "Null");
         self.add_node(node, None);
+    }
+
+    /// Bake the selected tip's solved chain over the playback range as one undo
+    /// step, keying every frame like Cheetah3D's IK bake command.
+    fn bake_ik_chain(&mut self, tip: NodeId) -> bool {
+        let Some(chain) = self
+            .doc
+            .scene
+            .get(tip)
+            .and_then(|node| node.ik.as_ref())
+            .cloned()
+        else {
+            self.status = "This joint has no IK chain to bake".into();
+            return false;
+        };
+        if !chain.enabled {
+            self.status = "Enable the IK chain before baking".into();
+            return false;
+        }
+        let joints: BTreeSet<NodeId> = ik_chain_joints(&self.doc.scene, tip, &chain)
+            .into_iter()
+            .collect();
+        if joints.is_empty() {
+            self.status = "The IK chain has no movable joints to bake".into();
+            return false;
+        }
+        let start = self.playback.start;
+        let end = self.playback.end.max(start);
+        let edits: Vec<_> = bake_ik_range_edits(&self.doc, start, end, self.playback.fps)
+            .into_iter()
+            .filter(|(id, _, _)| joints.contains(id))
+            .collect();
+        if edits.is_empty() {
+            self.status =
+                "The IK bake range is empty, too long, or already has this pose keyed".into();
+            return false;
+        }
+        let count = edits.len();
+        self.history
+            .execute(&mut self.doc, Box::new(SetAnimationsCmd { edits }));
+        self.status = format!(
+            "Baked IK on {count} joint{} over frames {}–{}",
+            if count == 1 { "" } else { "s" },
+            (start * self.playback.fps).round(),
+            (end * self.playback.fps).round()
+        );
+        true
     }
 
     fn add_joint(&mut self) {
@@ -1497,12 +1626,15 @@ impl LeopardApp {
 
     fn open_file(&mut self, path: PathBuf) -> bool {
         reconcile_native_scene(&path);
-        let opened = match lc_io::import(&path) {
-            Ok(doc) => {
+        let opened = match lc_io::import_with_report(&path) {
+            Ok((doc, report)) => {
                 let name = path.display().to_string();
                 self.load_scene(doc, Some(path));
                 self.lifecycle.discard_recovery();
-                self.status = format!("Opened {name}");
+                self.status = match report.summary() {
+                    Some(summary) => format!("Opened {name} — {summary}"),
+                    None => format!("Opened {name}"),
+                };
                 true
             }
             Err(e) => {
@@ -1516,8 +1648,8 @@ impl LeopardApp {
 
     fn import_file(&mut self, path: PathBuf) {
         reconcile_native_scene(&path);
-        match lc_io::import(&path) {
-            Ok(mut doc) => {
+        match lc_io::import_with_report(&path) {
+            Ok((mut doc, report)) => {
                 doc.sanitize();
                 let before = self.doc.clone();
                 let after = doc;
@@ -1530,10 +1662,11 @@ impl LeopardApp {
                     }),
                 );
                 self.selection.set(self.doc.scene.roots.first().copied());
-                self.playback.start = self.doc.settings.frame_start;
-                self.playback.end = self.doc.settings.frame_end;
-                self.playback.fps = self.doc.settings.fps;
-                self.status = format!("Imported {}", path.display());
+                self.sync_playback_to_document();
+                self.status = match report.summary() {
+                    Some(summary) => format!("Imported {} — {summary}", path.display()),
+                    None => format!("Imported {}", path.display()),
+                };
             }
             Err(e) => self.status = format!("Import failed: {e}"),
         }
@@ -1950,12 +2083,22 @@ impl LeopardApp {
         if let Some((id, before)) = self.pending_shape.take() {
             if let Some(node) = self.doc.scene.get(id) {
                 let after = Shape::of(node);
-                if after.kind != before.kind
+                let shape_changed = after.kind != before.kind
                     || after.modifiers != before.modifiers
-                    || after.skin != before.skin
-                {
+                    || after.skin != before.skin;
+                let morph_changed = after.morph != before.morph;
+                if shape_changed {
                     self.history
                         .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
+                } else if morph_changed {
+                    self.history.execute(
+                        &mut self.doc,
+                        Box::new(SetMorphCmd {
+                            id,
+                            before: before.morph,
+                            after: after.morph,
+                        }),
+                    );
                 }
             }
         }
@@ -2045,8 +2188,55 @@ impl LeopardApp {
         true
     }
 
-    /// The skin this object would receive from binding every mesh vertex to the
-    /// first joint. `None` when there is no mesh, no joint or no vertex.
+    fn all_joint_ids(&self) -> Vec<NodeId> {
+        self.doc
+            .scene
+            .depth_first()
+            .into_iter()
+            .filter(|id| {
+                matches!(
+                    self.doc.scene.get(*id).map(|node| &node.kind),
+                    Some(NodeKind::Joint { .. })
+                )
+            })
+            .collect()
+    }
+
+    /// The joints selected for binding. `None` means every joint in the scene.
+    fn bind_joint_ids(&self) -> Vec<NodeId> {
+        self.all_joint_ids()
+            .into_iter()
+            .filter(|id| {
+                self.bind_joints
+                    .as_ref()
+                    .is_none_or(|joints| joints.contains(id))
+            })
+            .collect()
+    }
+
+    fn set_all_bind_joints(&mut self, all: bool) {
+        self.bind_joints = if all { None } else { Some(BTreeSet::new()) };
+    }
+
+    fn set_bind_joint(&mut self, id: NodeId, enabled: bool) {
+        let all = self.all_joint_ids();
+        let mut joints = self
+            .bind_joints
+            .clone()
+            .unwrap_or_else(|| all.iter().copied().collect());
+        if enabled {
+            joints.insert(id);
+        } else {
+            joints.remove(&id);
+        }
+        self.bind_joints = if joints.len() == all.len() {
+            None
+        } else {
+            Some(joints)
+        };
+    }
+
+    /// The evaluated mesh and chosen joints a bind operation would use.
     fn skin_target(&self) -> Option<SkinTarget> {
         let id = self.selection.primary()?;
         let node = self.doc.scene.get(id)?;
@@ -2059,38 +2249,114 @@ impl LeopardApp {
             .and_then(|node| node.mesh())
             .map(|mesh| mesh.positions.len())
             .unwrap_or(0);
-        let joints: Vec<(NodeId, Mat4)> = self
-            .doc
-            .scene
-            .depth_first()
+        let positions = evaluated
+            .node(id)
+            .and_then(|node| node.mesh())
+            .map(|mesh| mesh.positions.clone())
+            .unwrap_or_default();
+        let mesh_inverse = evaluated
+            .node(id)
+            .map(|node| node.world.inverse())
+            .unwrap_or(Mat4::IDENTITY);
+        let joints: Vec<(NodeId, Mat4, f32)> = self
+            .bind_joint_ids()
             .into_iter()
             .filter_map(|joint_id| {
-                if !matches!(
-                    self.doc.scene.get(joint_id).map(|node| &node.kind),
-                    Some(NodeKind::Joint { .. })
-                ) {
-                    return None;
-                }
+                let node = self.doc.scene.get(joint_id)?;
+                let length = match &node.kind {
+                    NodeKind::Joint { length, .. } => *length,
+                    _ => return None,
+                };
                 let world = evaluated.node(joint_id)?.world;
-                Some((joint_id, world))
+                Some((joint_id, world, length.max(0.0)))
             })
             .collect();
-        let skin = (vertex_count > 0 && !joints.is_empty()).then(|| {
-            let mut skin = Skin::new(
-                joints.iter().map(|(joint_id, _)| *joint_id).collect(),
-                joints.iter().map(|(_, world)| world.inverse()).collect(),
-            );
-            skin.bind_all_to_first(vertex_count);
-            skin
-        });
         Some(SkinTarget {
             vertex_count,
-            joint_count: joints.len(),
-            skin,
+            joints: joints.iter().map(|(joint, _, _)| *joint).collect(),
+            inverse_bind: joints.iter().map(|(_, world, _)| world.inverse()).collect(),
+            segments: joints
+                .iter()
+                .map(|(_, world, length)| {
+                    (
+                        mesh_inverse.transform_point3(world.transform_point3(Vec3::ZERO)),
+                        mesh_inverse.transform_point3(world.transform_point3(Vec3::Y * *length)),
+                    )
+                })
+                .collect(),
+            positions,
+            existing: node.skin.clone(),
         })
     }
 
-    fn bind_skin_to_all_joints(&mut self) -> bool {
+    fn build_bound_skin(&self, target: &SkinTarget) -> Option<Skin> {
+        if target.vertex_count == 0 || target.joints.is_empty() {
+            return None;
+        }
+        let mut skin = Skin::new(target.joints.clone(), target.inverse_bind.clone());
+        skin.clear_weights(target.vertex_count);
+        let auto: Option<Skin> = if self.bind_auto_weights {
+            let mut auto = Skin::new(target.joints.clone(), target.inverse_bind.clone());
+            if auto.auto_weight_proximity(
+                &target.positions,
+                &target.segments,
+                ProximityWeightOptions {
+                    dropoff: self.bind_dropoff,
+                    strength: self.bind_strength,
+                    max_influences: self.bind_max_influences,
+                },
+            ) {
+                Some(auto)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        for vertex in 0..target.vertex_count {
+            let mut carried: Vec<(usize, f32)> = Vec::new();
+            if let Some(existing) = &target.existing {
+                let old_indices = existing.joint_indices.get(vertex);
+                let old_weights = existing.weights.get(vertex);
+                if let (Some(old_indices), Some(old_weights)) = (old_indices, old_weights) {
+                    for (old_index, weight) in old_indices.iter().zip(old_weights) {
+                        if *weight <= 0.0 || !weight.is_finite() {
+                            continue;
+                        }
+                        let Some(old_joint) = existing.joints.get(*old_index as usize) else {
+                            continue;
+                        };
+                        let Some(new_index) =
+                            target.joints.iter().position(|joint| joint == old_joint)
+                        else {
+                            continue;
+                        };
+                        if let Some((_, total)) =
+                            carried.iter_mut().find(|(index, _)| *index == new_index)
+                        {
+                            *total += *weight;
+                        } else {
+                            carried.push((new_index, *weight));
+                        }
+                    }
+                }
+            }
+            if !carried.is_empty() {
+                for (slot, (index, weight)) in carried.into_iter().take(4).enumerate() {
+                    skin.joint_indices[vertex][slot] = index as u32;
+                    skin.weights[vertex][slot] = weight;
+                }
+                skin.compact_vertex(vertex);
+                skin.normalize_vertex(vertex);
+            } else if let Some(auto) = &auto {
+                skin.joint_indices[vertex] = auto.joint_indices[vertex];
+                skin.weights[vertex] = auto.weights[vertex];
+            }
+        }
+        Some(skin)
+    }
+
+    fn bind_skin_to_joints(&mut self) -> bool {
         let Some(id) = self.selection.primary() else {
             return false;
         };
@@ -2101,20 +2367,36 @@ impl LeopardApp {
         let Some(node) = self.doc.scene.get(id) else {
             return false;
         };
-        let Some(skin) = skin_binding_candidate(node, &target) else {
-            self.status = if target.skin.is_some() {
-                "Skin is already bound to the current joints".into()
-            } else {
-                "Add a Joint object and a non-empty mesh first".into()
-            };
+        let Some(skin) = self.build_bound_skin(&target) else {
+            self.status = "Choose at least one joint and a non-empty mesh first".into();
             return false;
         };
+        let active_joint = self
+            .weight_joint
+            .and_then(|index| target.existing.as_ref()?.joints.get(index).copied());
+        let next_weight_joint = active_joint.map(|joint| {
+            skin.joints
+                .iter()
+                .position(|candidate| *candidate == joint)
+                .unwrap_or(0)
+        });
+        if node.skin.as_ref() == Some(&skin) {
+            self.status = "Skin already matches the selected joints and weights".into();
+            return false;
+        }
         let before = Shape::of(node);
         let mut after = before.clone();
-        after.skin = Some(skin.clone());
+        after.skin = Some(skin);
         self.history
             .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
-        self.status = "Bound skin to all joints".into();
+        self.status = if target.existing.is_some() {
+            "Rebound skin, preserving covered weights".into()
+        } else {
+            "Bound skin to the selected joints".into()
+        };
+        if active_joint.is_some() {
+            self.weight_joint = next_weight_joint;
+        }
         true
     }
 
@@ -2135,6 +2417,305 @@ impl LeopardApp {
         self.history
             .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
         self.status = "Unbound skin".into();
+        true
+    }
+
+    fn active_weight_joint(&self) -> Option<usize> {
+        let id = self.selection.primary()?;
+        let skin = self.doc.scene.get(id)?.skin.as_ref()?;
+        if skin.joints.is_empty() {
+            return None;
+        }
+        Some(self.weight_joint.unwrap_or(0).min(skin.joints.len() - 1))
+    }
+
+    fn weight_paint_ready(&self) -> bool {
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        let Some(skin) = node.skin.as_ref() else {
+            return false;
+        };
+        node.modifiers.is_empty()
+            && skin.vertex_count() == mesh.positions.len()
+            && !skin.joints.is_empty()
+    }
+
+    fn set_weight_paint(&mut self, enabled: bool) {
+        if enabled && !self.weight_paint_ready() {
+            self.status = "Weight painting needs a bound, modifier-free editable mesh".into();
+            self.weight_paint = false;
+            return;
+        }
+        self.weight_paint = enabled;
+        if enabled {
+            self.mesh_edit = false;
+            self.clear_mesh_component_selection();
+            self.gizmo_drag = None;
+            self.status = "Weight paint mode".into();
+        }
+    }
+
+    fn begin_weight_stroke(&mut self) -> bool {
+        if !self.weight_paint_ready() {
+            return false;
+        }
+        let Some(id) = self.selection.primary() else {
+            return false;
+        };
+        if self.pending_shape.is_none() {
+            if let Some(node) = self.doc.scene.get(id) {
+                self.pending_shape = Some((id, Shape::of(node)));
+            }
+        }
+        true
+    }
+
+    fn paint_weight_brush(
+        &mut self,
+        evaluated: &EvaluatedScene,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+        pointer: Pos2,
+    ) -> bool {
+        if !self.weight_paint_ready() {
+            return false;
+        }
+        let Some(id) = self.selection.primary() else {
+            return false;
+        };
+        let Some(joint) = self.active_weight_joint() else {
+            return false;
+        };
+        let Some(node) = evaluated.node(id) else {
+            return false;
+        };
+        let Some(mesh) = node.mesh() else {
+            return false;
+        };
+        let Some(mut skin) = self.doc.scene.get(id).and_then(|node| node.skin.clone()) else {
+            return false;
+        };
+        if skin.vertex_count() < mesh.positions.len() {
+            return false;
+        }
+        let radius = self.weight_brush.radius.max(1.0);
+        let strength = self.weight_brush.strength.clamp(0.0, 1.0);
+        let mode = self.weight_brush.mode;
+        let falloff = self.weight_brush.falloff;
+        let before_weights: Vec<f32> = (0..mesh.positions.len())
+            .map(|vertex| skin.influence(vertex, joint))
+            .collect();
+        let adjacency: Vec<Vec<u32>> = if mode == WeightBrushMode::Smooth {
+            let mut adjacency = vec![Vec::new(); mesh.positions.len()];
+            for edge in mesh.edges() {
+                let a = edge.a as usize;
+                let b = edge.b as usize;
+                if a < adjacency.len() && b < adjacency.len() {
+                    adjacency[a].push(edge.b);
+                    adjacency[b].push(edge.a);
+                }
+            }
+            adjacency
+        } else {
+            Vec::new()
+        };
+        let mut painted = 0usize;
+        for (vertex, position) in mesh.positions.iter().enumerate() {
+            let Some(screen) = self.project(
+                node.world.transform_point3(*position),
+                rect,
+                pixel_w,
+                pixel_h,
+            ) else {
+                continue;
+            };
+            let distance = (screen - pointer).length();
+            if distance > radius {
+                continue;
+            }
+            let factor = strength * falloff.factor(distance, radius);
+            if factor <= 0.0 {
+                continue;
+            }
+            let current = before_weights[vertex];
+            let changed = match mode {
+                WeightBrushMode::Add => skin.set_influence(vertex, joint, current + factor),
+                WeightBrushMode::Subtract => skin.set_influence(vertex, joint, current - factor),
+                WeightBrushMode::Replace => skin.set_exclusive_influence(vertex, joint, factor),
+                WeightBrushMode::Smooth => {
+                    let neighbours = &adjacency[vertex];
+                    let average = if neighbours.is_empty() {
+                        current
+                    } else {
+                        neighbours
+                            .iter()
+                            .map(|neighbour| before_weights[*neighbour as usize])
+                            .sum::<f32>()
+                            / neighbours.len() as f32
+                    };
+                    skin.set_influence(vertex, joint, current + (average - current) * factor)
+                }
+            };
+            painted += usize::from(changed);
+        }
+        if painted == 0 {
+            return false;
+        }
+        if let Some(node) = self.doc.scene.get_mut(id) {
+            node.skin = Some(skin);
+        }
+        self.status = format!("Painted {painted} weight vertices");
+        true
+    }
+
+    fn perform_morph_action(&mut self, id: NodeId, action: MorphAction) {
+        if self.selection.primary() != Some(id) {
+            return;
+        }
+        match action {
+            MorphAction::RecordBase => {
+                self.record_morph_base();
+            }
+            MorphAction::Capture => {
+                self.capture_morph_target();
+            }
+            MorphAction::Restore => {
+                self.restore_morph_base();
+            }
+            MorphAction::Remove(index) => {
+                self.remove_morph_target(index);
+            }
+        }
+    }
+
+    fn record_morph_base(&mut self) -> bool {
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Morph targets need an editable mesh".into();
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        if node.morph.has_base() || !node.morph.targets.is_empty() {
+            self.status = "This mesh already has a morph base".into();
+            return false;
+        }
+        if mesh.positions.is_empty() {
+            self.status = "The mesh has no vertices to record".into();
+            return false;
+        }
+        let before = node.morph.clone();
+        let vertices = mesh.positions.len();
+        self.history.execute(
+            &mut self.doc,
+            Box::new(SetMorphCmd {
+                id,
+                before,
+                after: MorphSet {
+                    base: mesh.positions,
+                    targets: Vec::new(),
+                },
+            }),
+        );
+        self.status = format!("Recorded morph base ({vertices} vertices)");
+        true
+    }
+
+    fn capture_morph_target(&mut self) -> bool {
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Morph targets need an editable mesh".into();
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        if !node.morph.has_base() {
+            self.status = "Record a morph base before capturing a target".into();
+            return false;
+        }
+        if node.morph.base.len() != mesh.positions.len() {
+            self.status = "The morph base does not match the current mesh topology".into();
+            return false;
+        }
+        let deltas: Vec<Vec3> = mesh
+            .positions
+            .iter()
+            .zip(&node.morph.base)
+            .map(|(position, base)| *position - *base)
+            .collect();
+        if deltas.iter().all(|delta| delta.length_squared() < 1e-10) {
+            self.status = "Move mesh vertices before capturing a morph target".into();
+            return false;
+        }
+        let name = node.morph.unique_target_name();
+        let before = node.morph.clone();
+        let mut after = before.clone();
+        after.targets.push(MorphTarget::new(name.clone(), deltas));
+        self.history
+            .execute(&mut self.doc, Box::new(SetMorphCmd { id, before, after }));
+        self.status = format!("Captured morph target {name}");
+        true
+    }
+
+    fn restore_morph_base(&mut self) -> bool {
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Morph targets need an editable mesh".into();
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        if !node.morph.has_base() {
+            self.status = "Record a morph base first".into();
+            return false;
+        }
+        let mut positions = mesh.positions.clone();
+        if !node.morph.restore_base(&mut positions) {
+            self.status = "The morph base does not match the current mesh topology".into();
+            return false;
+        }
+        if positions == mesh.positions {
+            self.status = "The mesh is already at the morph base".into();
+            return false;
+        }
+        let before = Shape::of(node);
+        let mut after = before.clone();
+        let NodeKind::Mesh {
+            geometry: GeometrySource::Editable { mesh, .. },
+        } = &mut after.kind
+        else {
+            return false;
+        };
+        mesh.positions = positions;
+        self.history
+            .execute(&mut self.doc, Box::new(SetShapeCmd { id, before, after }));
+        self.status = "Restored morph base".into();
+        true
+    }
+
+    fn remove_morph_target(&mut self, index: usize) -> bool {
+        let Some((id, _)) = self.selected_editable_mesh() else {
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        let Some(removed) = node.morph.targets.get(index) else {
+            self.status = "That morph target no longer exists".into();
+            return false;
+        };
+        let name = removed.name.clone();
+        let before = node.morph.clone();
+        let mut after = before.clone();
+        after.targets.remove(index);
+        self.history
+            .execute(&mut self.doc, Box::new(SetMorphCmd { id, before, after }));
+        self.status = format!("Removed morph target {name}");
         true
     }
 
@@ -2164,6 +2745,7 @@ impl LeopardApp {
         if before_shape.kind != after_shape.kind
             || before_shape.modifiers != after_shape.modifiers
             || before_shape.skin != after_shape.skin
+            || before_shape.morph != after_shape.morph
         {
             if self.pending_shape.is_none() {
                 self.pending_shape = Some((id, before_shape.clone()));
@@ -2172,6 +2754,7 @@ impl LeopardApp {
                 node.kind = edited.kind.clone();
                 node.modifiers = edited.modifiers.clone();
                 node.skin = edited.skin.clone();
+                node.morph = edited.morph.clone();
             }
         }
         if edited.transform != original.transform {
@@ -2258,6 +2841,56 @@ impl LeopardApp {
                     })
                     .unwrap_or(false)
             })
+    }
+
+    /// Optimize welds the selected points that sit within the tolerance, so it
+    /// needs point mode, a positive tolerance and at least one cluster on every
+    /// selected mesh.
+    pub(super) fn mesh_optimize_ready(&self) -> bool {
+        self.mesh_component_selection_ready()
+            && self.mesh_select_mode == MeshSelectMode::Points
+            && self.mesh_optimize_tolerance.is_finite()
+            && self.mesh_optimize_tolerance > 0.0
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        lc_geom::can_optimize(
+                            mesh,
+                            self.mesh_components_for(*id),
+                            self.mesh_optimize_tolerance,
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Point Slide moves the selected points toward their neighbours, so it
+    /// needs point mode, a fraction above zero and at least one selected point
+    /// that an edge connects to something.
+    pub(super) fn mesh_point_slide_ready(&self) -> bool {
+        self.mesh_component_selection_ready()
+            && self.mesh_select_mode == MeshSelectMode::Points
+            && self.mesh_slide_fraction.is_finite()
+            && self.mesh_slide_fraction > 0.0
+            && self.mesh_slide_fraction <= 1.0
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        lc_geom::can_slide_points(
+                            mesh,
+                            self.mesh_components_for(*id),
+                            self.mesh_slide_fraction,
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Collapse welds the selected points into one at their centroid, so it
+    /// needs point mode and two distinct selected points on every selected mesh
+    /// — the same rule as Weld, which shares its geometry call.
+    pub(super) fn mesh_collapse_ready(&self) -> bool {
+        self.mesh_weld_ready()
     }
 
     /// Ring Cut is a through-plane cut: it must cross geometry on every
@@ -2366,6 +2999,161 @@ impl LeopardApp {
         selected_bridge_loops(mesh, self.mesh_components_for(id)).map(|_| ())
     }
 
+    /// Fill Hole accepts a selection in point, edge or polygon mode and only
+    /// needs part of one open border, matching the documented tool (source 38).
+    pub(super) fn mesh_fill_hole_ready(&self) -> bool {
+        if !self.mesh_component_selection_ready() {
+            return false;
+        }
+        let mode = self.mesh_select_mode;
+        self.selection.ids().iter().all(|id| {
+            self.editable_mesh(*id)
+                .map(|mesh| {
+                    let components = self.mesh_components_for(*id);
+                    if components.is_empty() {
+                        return false;
+                    }
+                    let points = mesh_affected_points(mesh, mode, components);
+                    !lc_geom::open_holes(mesh, &points).is_empty()
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Open hole borders under the primary mesh's component selection, used by
+    /// the Fill Hole count label.
+    pub(super) fn selected_hole_count(&self) -> usize {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            return 0;
+        };
+        let points = mesh_affected_points(&mesh, self.mesh_select_mode, &self.mesh_selected);
+        lc_geom::open_holes(&mesh, &points).len()
+    }
+
+    /// Split copies the selected polygons into a new object, so like the
+    /// documented tool (source 39) it is only available in polygon mode on raw
+    /// polygon objects.
+    pub(super) fn mesh_split_ready(&self) -> bool {
+        self.mesh_topology_ready(MeshSelectMode::Polygons, 1)
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        !selected_valid_polygons(mesh, self.mesh_components_for(*id)).is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Triangulate needs polygon mode and at least one selected polygon that
+    /// actually has more than three corners, so it never reports a no-op.
+    pub(super) fn mesh_triangulate_ready(&self) -> bool {
+        self.mesh_topology_ready(MeshSelectMode::Polygons, 1)
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        selected_valid_polygons(mesh, self.mesh_components_for(*id))
+                            .iter()
+                            .any(|face| {
+                                mesh.polygons
+                                    .get(*face as usize)
+                                    .is_some_and(|polygon| polygon.corners.len() > 3)
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Flip Normal reverses the winding of the selected polygons, so like Split
+    /// and Shell it needs polygon mode on raw polygon objects plus at least one
+    /// usable selected polygon.
+    pub(super) fn mesh_flip_normal_ready(&self) -> bool {
+        self.mesh_topology_ready(MeshSelectMode::Polygons, 1)
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        !selected_valid_polygons(mesh, self.mesh_components_for(*id)).is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Disconnect needs polygon mode and a selected face that still shares a
+    /// point with the rest of the mesh; a whole-mesh selection is already one
+    /// island, so the command would be a no-op.
+    pub(super) fn mesh_disconnect_ready(&self) -> bool {
+        self.mesh_topology_ready(MeshSelectMode::Polygons, 1)
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| lc_geom::can_disconnect(mesh, self.mesh_components_for(*id)))
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Cover fills the holes the selected faces border on every side, so it
+    /// needs polygon mode and at least one closed open boundary loop the
+    /// selection rings completely.
+    pub(super) fn mesh_cover_ready(&self) -> bool {
+        self.mesh_topology_ready(MeshSelectMode::Polygons, 1)
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        !lc_geom::coverable_holes(mesh, self.mesh_components_for(*id)).is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Create Polygon turns the selected boundary points into a new face, so it
+    /// needs point mode and at least one open boundary loop fully selected.
+    pub(super) fn mesh_create_polygon_ready(&self) -> bool {
+        self.mesh_component_selection_ready()
+            && self.mesh_select_mode == MeshSelectMode::Points
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        !lc_geom::faceable_loops(mesh, self.mesh_components_for(*id)).is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Shell needs polygon mode on raw polygon objects plus a usable distance,
+    /// following the documented modes and properties (source 41).
+    pub(super) fn mesh_shell_ready(&self) -> bool {
+        self.mesh_shell_thickness.is_finite()
+            && self.mesh_shell_thickness > 1e-6
+            && self.mesh_topology_ready(MeshSelectMode::Polygons, 1)
+            && self.selection.ids().iter().all(|id| {
+                self.editable_mesh(*id)
+                    .map(|mesh| {
+                        !selected_valid_polygons(mesh, self.mesh_components_for(*id)).is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Polygons the documented Angle property groups into the shell region
+    /// under the primary mesh's selection.
+    pub(super) fn selected_shell_face_count(&self) -> usize {
+        match self.selected_editable_mesh() {
+            Some((_, mesh)) if self.mesh_select_mode == MeshSelectMode::Polygons => {
+                let faces = selected_valid_polygons(&mesh, &self.mesh_selected);
+                lc_geom::shell_region(&mesh, &faces, self.mesh_shell_angle).len()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Polygons the Split button would copy out of the primary mesh.
+    pub(super) fn selected_split_polygon_count(&self) -> usize {
+        match self.selected_editable_mesh() {
+            Some((_, mesh)) if self.mesh_select_mode == MeshSelectMode::Polygons => {
+                selected_valid_polygons(&mesh, &self.mesh_selected).len()
+            }
+            _ => 0,
+        }
+    }
+
     fn mesh_components_for(&self, id: NodeId) -> &[u32] {
         self.mesh_components
             .get(&id)
@@ -2419,6 +3207,52 @@ impl LeopardApp {
         }
         self.selected_uv = Some(index);
         true
+    }
+
+    /// The pin command edits the UV point selected in the UV view, on the
+    /// primary editable mesh.
+    pub(super) fn uv_pin_ready(&self) -> bool {
+        self.selected_editable_mesh()
+            .zip(self.selected_uv)
+            .is_some_and(|((_, mesh), index)| index < mesh.uvs.len())
+    }
+
+    fn toggle_selected_uv_pin(&mut self) {
+        if !self.uv_pin_ready() {
+            self.status = if self.selected_editable_mesh().is_some() {
+                "Select a UV point in the UV view first".into()
+            } else {
+                "Pin UVs on an editable mesh with a UV set".into()
+            };
+            return;
+        }
+        let (Some((id, mesh)), Some(index)) = (self.selected_editable_mesh(), self.selected_uv)
+        else {
+            return;
+        };
+        let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
+            return;
+        };
+        let mut updated = mesh;
+        let pinned = updated.toggle_uv_pinned(index as u32);
+        let NodeKind::Mesh { geometry } = &before.kind else {
+            return;
+        };
+        let mut after = before.clone();
+        after.kind = NodeKind::Mesh {
+            geometry: geometry.with_mesh(updated),
+        };
+        self.history.execute(
+            &mut self.doc,
+            Box::new(SetShapesCmd {
+                edits: vec![(id, before, after)],
+            }),
+        );
+        self.status = if pinned {
+            format!("Pinned UV point {index}")
+        } else {
+            format!("Unpinned UV point {index}")
+        };
     }
 
     fn selected_editable_mesh(&self) -> Option<(NodeId, Mesh)> {
@@ -2701,6 +3535,144 @@ impl LeopardApp {
                     Ok(weld_selected_points(mesh, points))
                 });
             }
+            MeshAction::Collapse => {
+                if !self.mesh_collapse_ready() {
+                    self.status = if !self.mesh_topology_ready(MeshSelectMode::Points, 2) {
+                        self.mesh_tool_refusal(MeshSelectMode::Points, 2, "collapse")
+                    } else {
+                        "Select at least two distinct points to collapse".into()
+                    };
+                    return;
+                }
+                // The merged point can land on a new index after compaction, so
+                // the collapse reports its survivor and the selection follows it.
+                let survivors = std::cell::RefCell::new(Vec::new());
+                let depth = self.history.depth();
+                self.apply_mesh_operation_selection(
+                    "Collapsed points",
+                    true,
+                    |id, mesh, points| {
+                        let (out, survivor) = lc_geom::collapse_points(mesh, points);
+                        if let Some(survivor) = survivor {
+                            survivors.borrow_mut().push((id, survivor));
+                        }
+                        Ok(out)
+                    },
+                );
+                if self.history.depth() == depth {
+                    return;
+                }
+                let survivors = survivors.into_inner();
+                for (id, survivor) in &survivors {
+                    self.mesh_components.insert(*id, vec![*survivor]);
+                }
+                self.mesh_selected = self
+                    .selection
+                    .primary()
+                    .and_then(|primary| {
+                        survivors
+                            .iter()
+                            .find(|(id, _)| *id == primary)
+                            .map(|(_, survivor)| vec![*survivor])
+                    })
+                    .unwrap_or_default();
+            }
+            MeshAction::Optimize => {
+                if !self.mesh_optimize_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Points {
+                        "Optimize is only available in point mode".into()
+                    } else if !self.mesh_optimize_tolerance.is_finite()
+                        || self.mesh_optimize_tolerance <= 0.0
+                    {
+                        "Set a positive optimize tolerance first".into()
+                    } else if self
+                        .selection
+                        .ids()
+                        .iter()
+                        .any(|id| self.mesh_components_for(*id).len() < 2)
+                    {
+                        "Select at least two points to optimize".into()
+                    } else {
+                        "No selected points sit within the optimize tolerance".into()
+                    };
+                    return;
+                }
+                let tolerance = self.mesh_optimize_tolerance;
+                let survivors = std::cell::RefCell::new(Vec::new());
+                let depth = self.history.depth();
+                self.apply_mesh_operation_selection(
+                    "Optimized points",
+                    true,
+                    |id, mesh, components| {
+                        let points = selected_valid_points(mesh, components);
+                        if points.len() < 2 {
+                            return Err("select at least two points to optimize".into());
+                        }
+                        let Some((out, kept)) = lc_geom::optimize_points(mesh, &points, tolerance)
+                        else {
+                            return Err(
+                                "no selected points sit within the optimize tolerance".into()
+                            );
+                        };
+                        survivors.borrow_mut().push((id, kept));
+                        Ok(out)
+                    },
+                );
+                if self.history.depth() == depth {
+                    return;
+                }
+                let survivors = survivors.into_inner();
+                for (id, kept) in &survivors {
+                    self.mesh_components.insert(*id, kept.clone());
+                }
+                self.mesh_selected = self
+                    .selection
+                    .primary()
+                    .and_then(|primary| {
+                        survivors
+                            .iter()
+                            .find(|(id, _)| *id == primary)
+                            .map(|(_, kept)| kept.clone())
+                    })
+                    .unwrap_or_default();
+            }
+            MeshAction::PointSlide => {
+                if !self.mesh_point_slide_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Points {
+                        "Point Slide is only available in point mode".into()
+                    } else if !self.mesh_slide_fraction.is_finite()
+                        || self.mesh_slide_fraction < 0.0
+                        || self.mesh_slide_fraction > 1.0
+                    {
+                        "Set a slide fraction between 0 and 1 first".into()
+                    } else if self.mesh_slide_fraction == 0.0 {
+                        "Set a slide fraction above 0 to slide points".into()
+                    } else if self
+                        .selection
+                        .ids()
+                        .iter()
+                        .all(|id| self.mesh_components_for(*id).is_empty())
+                    {
+                        "Select at least one point to slide".into()
+                    } else {
+                        "No selected point has neighbours to slide toward".into()
+                    };
+                    return;
+                }
+                let fraction = self.mesh_slide_fraction;
+                self.apply_mesh_operation_selection("Slid points", false, |_, mesh, components| {
+                    let points = selected_valid_points(mesh, components);
+                    if points.is_empty() {
+                        return Err("select at least one point to slide".into());
+                    }
+                    lc_geom::slide_points(mesh, &points, fraction)
+                        .ok_or_else(|| "no selected point has neighbours to slide toward".into())
+                });
+            }
             MeshAction::Bridge => {
                 if let Some(status) = self.mesh_bridge_failure() {
                     self.status = status;
@@ -2711,6 +3683,261 @@ impl LeopardApp {
                     lc_geom::bridge_loops(mesh, &loop_a, &loop_b)
                 });
             }
+            MeshAction::FillHole => {
+                if !self.mesh_fill_hole_ready() {
+                    self.status = if self.mesh_component_selection_ready() {
+                        "Select a point on a hole border first".into()
+                    } else {
+                        "Enter component mode with editable meshes first".into()
+                    };
+                    return;
+                }
+                let mode = self.mesh_select_mode;
+                self.apply_mesh_operation("Filled hole", move |_, mesh, components| {
+                    let points = mesh_affected_points(mesh, mode, components);
+                    let holes = lc_geom::open_holes(mesh, &points);
+                    if holes.is_empty() {
+                        return Err("select a point on a hole border".into());
+                    }
+                    lc_geom::fill_holes(mesh, &holes)
+                });
+            }
+            MeshAction::Split => self.split_selected_polygons(),
+            MeshAction::Shell => {
+                if !self.mesh_shell_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                        "Shell is only available in polygon mode".into()
+                    } else if self.mesh_shell_thickness <= 1e-6 {
+                        "Set a positive shell thickness first; Inside picks the side".into()
+                    } else {
+                        "Select at least one polygon to shell".into()
+                    };
+                    return;
+                }
+                let thickness = self.mesh_shell_thickness;
+                let inside = self.mesh_shell_inside;
+                let angle = self.mesh_shell_angle;
+                let quantize = self.mesh_shell_quantize;
+                self.apply_mesh_operation("Shelled polygons", move |_, mesh, components| {
+                    let faces = selected_valid_polygons(mesh, components);
+                    lc_geom::shell_faces(mesh, &faces, thickness, inside, angle, quantize)
+                });
+            }
+            MeshAction::ToggleCrease => {
+                if !self.require_mesh_selection(MeshSelectMode::Edges, 1, "toggle creases") {
+                    return;
+                }
+                self.apply_mesh_operation_selection(
+                    "Toggled edge creases",
+                    false,
+                    |_, mesh, selected| {
+                        let edges = mesh.edges();
+                        let mut updated = mesh.clone();
+                        for &index in selected {
+                            if let Some(edge) = edges.get(index as usize) {
+                                updated.toggle_crease(edge.a, edge.b);
+                            }
+                        }
+                        Ok(updated)
+                    },
+                );
+            }
+            MeshAction::ToggleSeam => {
+                if !self.require_mesh_selection(MeshSelectMode::Edges, 1, "toggle UV seams") {
+                    return;
+                }
+                self.apply_mesh_operation_selection(
+                    "Toggled UV seams",
+                    false,
+                    |_, mesh, selected| {
+                        let edges = mesh.edges();
+                        let mut updated = mesh.clone();
+                        for &index in selected {
+                            if let Some(edge) = edges.get(index as usize) {
+                                updated.toggle_seam(edge.a, edge.b);
+                            }
+                        }
+                        Ok(updated)
+                    },
+                );
+            }
+            MeshAction::Triangulate => {
+                if !self.mesh_triangulate_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                        "Triangulate is only available in polygon mode".into()
+                    } else {
+                        "Select at least one polygon with more than three corners to triangulate"
+                            .into()
+                    };
+                    return;
+                }
+                self.apply_mesh_operation("Triangulated polygons", |_, mesh, components| {
+                    let faces = selected_valid_polygons(mesh, components);
+                    if faces.is_empty() {
+                        return Err(
+                            "select at least one polygon with more than three corners to triangulate"
+                                .into(),
+                        );
+                    }
+                    Ok(lc_geom::triangulate_faces(mesh, &faces))
+                });
+            }
+            MeshAction::FlipNormal => {
+                if !self.mesh_flip_normal_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                        "Flip Normal is only available in polygon mode".into()
+                    } else {
+                        "Select at least one polygon to flip".into()
+                    };
+                    return;
+                }
+                // Face indices do not change, so the selection stays and the
+                // same command flips the faces back.
+                self.apply_mesh_operation_selection(
+                    "Flipped polygon normals",
+                    false,
+                    |_, mesh, components| {
+                        let faces = selected_valid_polygons(mesh, components);
+                        if faces.is_empty() {
+                            return Err("select at least one polygon to flip".into());
+                        }
+                        Ok(lc_geom::flip_faces(mesh, &faces))
+                    },
+                );
+            }
+            MeshAction::Disconnect => {
+                if !self.mesh_disconnect_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                        "Disconnect is only available in polygon mode".into()
+                    } else {
+                        "Select polygons that border the rest of the mesh to disconnect".into()
+                    };
+                    return;
+                }
+                // Face indices do not change, so the selection stays exactly as
+                // it was and now names the detached island.
+                self.apply_mesh_operation_selection(
+                    "Disconnected polygons",
+                    false,
+                    |_, mesh, components| {
+                        let faces = selected_valid_polygons(mesh, components);
+                        if faces.is_empty() {
+                            return Err("select at least one polygon to disconnect".into());
+                        }
+                        Ok(lc_geom::disconnect_faces(mesh, &faces))
+                    },
+                );
+            }
+            MeshAction::Cover => {
+                if !self.mesh_cover_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                        "Cover is only available in polygon mode".into()
+                    } else {
+                        "Select the polygons that border an open hole on every side to cover it"
+                            .into()
+                    };
+                    return;
+                }
+                // The fill appends faces, so the handler selects them once the
+                // command has actually been pushed.
+                let created = std::cell::RefCell::new(Vec::new());
+                let depth = self.history.depth();
+                self.apply_mesh_operation_selection(
+                    "Covered holes",
+                    true,
+                    |id, mesh, components| {
+                        let faces = selected_valid_polygons(mesh, components);
+                        if faces.is_empty() {
+                            return Err("select at least one polygon to cover".into());
+                        }
+                        let (out, new_faces) = lc_geom::cover_faces(mesh, &faces)?;
+                        created.borrow_mut().push((id, new_faces));
+                        Ok(out)
+                    },
+                );
+                if self.history.depth() == depth {
+                    return;
+                }
+                let created = created.into_inner();
+                for (id, faces) in &created {
+                    if !faces.is_empty() {
+                        self.mesh_components.insert(*id, faces.clone());
+                    }
+                }
+                self.mesh_selected = self
+                    .selection
+                    .primary()
+                    .and_then(|primary| {
+                        created
+                            .iter()
+                            .find(|(id, _)| *id == primary)
+                            .map(|(_, faces)| faces.clone())
+                    })
+                    .unwrap_or_default();
+            }
+            MeshAction::CreatePolygon => {
+                if !self.mesh_create_polygon_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Points {
+                        "Create Polygon is only available in point mode".into()
+                    } else {
+                        "Select the boundary points that close an open region to create a polygon"
+                            .into()
+                    };
+                    return;
+                }
+                // New faces are appended, so the handler selects them once the
+                // command has actually been pushed.
+                let created = std::cell::RefCell::new(Vec::new());
+                let depth = self.history.depth();
+                self.apply_mesh_operation_selection(
+                    "Created polygons",
+                    true,
+                    |id, mesh, components| {
+                        let points = selected_valid_points(mesh, components);
+                        if points.len() < 3 {
+                            return Err(
+                                "select at least three boundary points that close an open region"
+                                    .into(),
+                            );
+                        }
+                        let (out, new_faces) = lc_geom::create_polygon_faces(mesh, &points)?;
+                        created.borrow_mut().push((id, new_faces));
+                        Ok(out)
+                    },
+                );
+                if self.history.depth() == depth {
+                    return;
+                }
+                let created = created.into_inner();
+                for (id, faces) in &created {
+                    if !faces.is_empty() {
+                        self.mesh_components.insert(*id, faces.clone());
+                    }
+                }
+                self.mesh_selected = self
+                    .selection
+                    .primary()
+                    .and_then(|primary| {
+                        created
+                            .iter()
+                            .find(|(id, _)| *id == primary)
+                            .map(|(_, faces)| faces.clone())
+                    })
+                    .unwrap_or_default();
+            }
+            MeshAction::TogglePinnedUv => self.toggle_selected_uv_pin(),
             MeshAction::AssignMaterial => self.assign_material_to_selected_faces(),
         }
     }
@@ -2831,6 +4058,90 @@ impl LeopardApp {
             self.clear_mesh_component_selection();
         }
         self.status = message.to_string();
+    }
+
+    /// Copy the selected polygons into a new object and leave the source mesh
+    /// untouched, exactly the documented Split behaviour (sources 39 and 40).
+    fn split_selected_polygons(&mut self) {
+        if !self.mesh_split_ready() {
+            self.status = if !self.mesh_component_selection_ready() {
+                "Enter component mode with editable meshes first".into()
+            } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                "Split is only available in polygon mode".into()
+            } else {
+                "Select at least one polygon to split".into()
+            };
+            return;
+        }
+        let mut nodes: Vec<(Node, Option<NodeId>)> = Vec::new();
+        let mut polygons = 0usize;
+        for id in self.selection.ids().to_vec() {
+            let Some(source) = self.doc.scene.get(id).cloned() else {
+                continue;
+            };
+            let NodeKind::Mesh {
+                geometry: GeometrySource::Editable { mesh, .. },
+            } = &source.kind
+            else {
+                continue;
+            };
+            let faces = selected_valid_polygons(mesh, self.mesh_components_for(id));
+            let part = match lc_geom::extract_faces(mesh, &faces) {
+                Ok(part) => part,
+                Err(error) => {
+                    self.status = format!("Split failed: {error}");
+                    return;
+                }
+            };
+            polygons += part.polygons.len();
+            // Source 39 copies "all tags and selections" to the new object. The
+            // modifier stack, skin, morph targets and object animation stay
+            // behind: the manual is silent and the new object holds raw geometry.
+            let mut node = self.doc.create_node(
+                NodeKind::Mesh {
+                    geometry: GeometrySource::editable(part),
+                },
+                &format!("{} Split", source.name),
+            );
+            node.transform = source.transform;
+            node.visible = source.visible;
+            node.renderable = source.renderable;
+            node.locked = source.locked;
+            node.layer = source.layer;
+            node.material = source.material;
+            node.material_slots = source.material_slots.clone();
+            node.tags = source.tags.clone();
+            node.tag_animations = source.tag_animations.clone();
+            nodes.push((node, source.parent));
+        }
+        if nodes.is_empty() {
+            self.status = "Select an editable mesh first".into();
+            return;
+        }
+        let ids: Vec<NodeId> = nodes.iter().map(|(node, _)| node.id).collect();
+        let name = nodes[0].0.name.clone();
+        let objects = nodes.len();
+        self.history.execute(
+            &mut self.doc,
+            Box::new(lc_scene::AddNodesCmd {
+                label: if objects == 1 {
+                    "Split".into()
+                } else {
+                    format!("Split {objects} Objects")
+                },
+                nodes,
+            }),
+        );
+        self.selection.set(ids);
+        self.clear_mesh_component_selection();
+        self.status = if objects == 1 {
+            format!(
+                "Split {polygons} polygon{} into \"{name}\"",
+                if polygons == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("Split {polygons} polygons into {objects} new objects")
+        };
     }
 
     fn mesh_transform_selection(&mut self) {
@@ -3143,12 +4454,27 @@ impl LeopardApp {
                         continue;
                     };
                     let chosen = selected.contains(&(i as u32));
+                    let seam = mesh.is_seam(edge.a, edge.b);
+                    let creased = mesh.is_crease(edge.a, edge.b);
                     painter.line_segment(
                         [a, b],
                         egui::Stroke::new(
-                            if chosen { 3.0 } else { 1.0 },
+                            if chosen {
+                                3.0
+                            } else if seam {
+                                2.5
+                            } else if creased {
+                                2.0
+                            } else {
+                                1.0
+                            },
                             if chosen {
                                 selected_color
+                            } else if seam {
+                                // Seam edges are green, as in Cheetah3D's UV tutorial.
+                                Color32::from_rgb(90, 200, 110)
+                            } else if creased {
+                                Color32::from_rgb(90, 165, 255)
                             } else {
                                 Color32::from_rgb(120, 135, 155)
                             },
@@ -3208,7 +4534,7 @@ impl LeopardApp {
             };
             let before = node.animation.clone();
             let mut after = before.clone();
-            after.record_transform(&node.transform, time, Interpolation::Bezier);
+            after.record_transform(&node.transform, time, Interpolation::Smooth);
             if after != before {
                 edits.push((*id, before, after));
             }
@@ -3265,6 +4591,7 @@ impl LeopardApp {
         if self.anim_target != Some(target) {
             self.selected_keys.clear();
             self.curve_key_drag = None;
+            self.curve_tangent_drag = None;
             self.curve_box_select = None;
             self.selected_curve_channel = None;
         }
@@ -3344,34 +4671,87 @@ impl LeopardApp {
             ChannelAppliesTo::AnyObject => true,
             ChannelAppliesTo::Camera => matches!(node.kind, NodeKind::Camera { .. }),
             ChannelAppliesTo::Light => matches!(node.kind, NodeKind::Light { .. }),
+            ChannelAppliesTo::Morph => {
+                matches!(node.kind, NodeKind::Mesh { .. }) && !node.morph.targets.is_empty()
+            }
             ChannelAppliesTo::Tag | ChannelAppliesTo::Material => false,
         }
     }
 
     /// Every registry channel offered for a target, expanded into one row per
-    /// scalar component. Quaternion channels stay a single row.
+    /// scalar component. Quaternion channels stay a single row, and a mesh with
+    /// morph targets gets one dynamic row per target weight.
     pub(super) fn curve_rows(&self, target: AnimTarget) -> Vec<CurveRow> {
         let mut rows = Vec::new();
         for channel in AnimChannel::ALL {
-            if !self.channel_applies_to_target(channel, target) {
+            if channel == AnimChannel::MorphWeight
+                || !self.channel_applies_to_target(channel, target)
+            {
                 continue;
             }
             match channel.kind() {
                 ChannelKind::Quaternion => rows.push(CurveRow {
                     channel,
                     property: None,
+                    morph_target: None,
                 }),
                 _ => {
                     for property in channel.scalar_properties() {
                         rows.push(CurveRow {
                             channel,
                             property: Some(*property),
+                            morph_target: None,
+                        });
+                    }
+                }
+            }
+        }
+        if let AnimTarget::Object(id) = target {
+            if let Some(node) = self.doc.scene.get(id) {
+                if matches!(node.kind, NodeKind::Mesh { .. }) {
+                    for index in 0..node.morph.targets.len() {
+                        rows.push(CurveRow {
+                            channel: AnimChannel::MorphWeight,
+                            property: None,
+                            morph_target: Some(index as u32),
                         });
                     }
                 }
             }
         }
         rows
+    }
+
+    pub(super) fn curve_row_track(row: CurveRow) -> CurveTrackId {
+        if let Some(index) = row.morph_target {
+            CurveTrackId::MorphWeight(index)
+        } else if let Some(property) = row.property {
+            CurveTrackId::Scalar(property)
+        } else {
+            CurveTrackId::Rotation
+        }
+    }
+
+    pub(super) fn curve_row_label(&self, target: AnimTarget, row: CurveRow) -> String {
+        if let Some(index) = row.morph_target {
+            let name = match target {
+                AnimTarget::Object(id) => self
+                    .doc
+                    .scene
+                    .get(id)
+                    .and_then(|node| node.morph.targets.get(index as usize))
+                    .map(|target| target.name.as_str())
+                    .unwrap_or("Morph"),
+                _ => "Morph",
+            };
+            return format!("{name} Weight");
+        }
+        match row.property {
+            Some(property) => {
+                AnimChannel::scalar_label(property).unwrap_or_else(|| property.label().to_string())
+            }
+            None => row.channel.label().to_string(),
+        }
     }
 
     /// Live values for a registry channel, in registry component order.
@@ -3421,6 +4801,59 @@ impl LeopardApp {
         }
     }
 
+    fn morph_weight_value(&self, target: AnimTarget, index: u32) -> Option<f32> {
+        let AnimTarget::Object(id) = target else {
+            return None;
+        };
+        self.doc
+            .scene
+            .get(id)?
+            .morph
+            .targets
+            .get(index as usize)
+            .map(|target| target.weight)
+    }
+
+    /// Record one registry row at the playhead. Morph-weight rows need their
+    /// target index in addition to the channel, so the F-curve editor uses this
+    /// entry point for both dynamic and ordinary rows.
+    pub(super) fn record_curve_row_key(&mut self, target: AnimTarget, row: CurveRow) -> bool {
+        if row.channel == AnimChannel::MorphWeight {
+            let Some(index) = row.morph_target else {
+                return false;
+            };
+            if !self.target_is_valid(target) || !self.channel_applies_to_target(row.channel, target)
+            {
+                return false;
+            }
+            let Some(value) = self.morph_weight_value(target, index) else {
+                return false;
+            };
+            let time = self.playback.time;
+            let Some(mut after) = self.target_clip(target) else {
+                return false;
+            };
+            after.set_morph_weight_key(index, time, value, Interpolation::Smooth);
+            if !self.commit_target_clip(target, after) {
+                return false;
+            }
+            self.anim_target = Some(target);
+            self.selected_curve_channel = Some((target, row));
+            self.status = format!(
+                "Keyed {} at frame {}",
+                self.curve_row_label(target, row),
+                (time * self.playback.fps).round()
+            );
+            return true;
+        }
+        if self.record_channel_key(target, row.channel) {
+            self.selected_curve_channel = Some((target, row));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Record one registry channel at the playhead as one undoable command.
     pub(super) fn record_channel_key(&mut self, target: AnimTarget, channel: AnimChannel) -> bool {
         if !self.target_is_valid(target) || !self.channel_applies_to_target(channel, target) {
@@ -3437,12 +4870,12 @@ impl LeopardApp {
             let Some(node) = self.doc.scene.get(id) else {
                 return false;
             };
-            after.set_rotation_key(time, node.transform.rotation, Interpolation::Bezier);
+            after.set_rotation_key(time, node.transform.rotation, Interpolation::Smooth);
         } else {
             let Some(values) = self.channel_values(target, channel) else {
                 return false;
             };
-            if !after.record_channel(channel, &values, time, Interpolation::Bezier) {
+            if !after.record_channel(channel, &values, time, Interpolation::Smooth) {
                 return false;
             }
         }
@@ -3450,7 +4883,14 @@ impl LeopardApp {
             return false;
         }
         self.anim_target = Some(target);
-        self.selected_curve_channel = Some((target, channel));
+        self.selected_curve_channel = Some((
+            target,
+            CurveRow {
+                channel,
+                property: channel.scalar_properties().first().copied(),
+                morph_target: None,
+            },
+        ));
         self.status = format!(
             "Keyed {} at frame {}",
             channel.label(),
@@ -3529,6 +4969,18 @@ impl LeopardApp {
         let track = clip.track(property)?;
         track
             .curve
+            .keys
+            .iter()
+            .position(|key| (key.time - time).abs() <= KEY_TIME_EPSILON)
+    }
+
+    pub(super) fn morph_curve_key_index(
+        clip: &AnimationClip,
+        target: u32,
+        time: f32,
+    ) -> Option<usize> {
+        clip.morph_weights
+            .get(&target)?
             .keys
             .iter()
             .position(|key| (key.time - time).abs() <= KEY_TIME_EPSILON)
@@ -3638,6 +5090,9 @@ impl LeopardApp {
                 Self::curve_key_index(clip, property, key.time).is_some()
             }
             CurveTrackId::Rotation => clip.rotation_key_index(key.time).is_some(),
+            CurveTrackId::MorphWeight(target) => {
+                Self::morph_curve_key_index(clip, target, key.time).is_some()
+            }
         }
     }
 
@@ -3726,6 +5181,21 @@ impl LeopardApp {
                     hits.push(SelectedKey {
                         target,
                         track: CurveTrackId::Rotation,
+                        time: key.time,
+                    });
+                }
+            }
+        }
+        for (target_index, curve) in &clip.morph_weights {
+            for key in &curve.keys {
+                if key.time >= time_min
+                    && key.time <= time_max
+                    && key.value >= value_min
+                    && key.value <= value_max
+                {
+                    hits.push(SelectedKey {
+                        target,
+                        track: CurveTrackId::MorphWeight(*target_index),
                         time: key.time,
                     });
                 }
@@ -3862,10 +5332,15 @@ impl LeopardApp {
             return false;
         };
         if track.curve.keys[index].interpolation == interpolation {
+            // Reselecting Smooth can still be a real edit when a legacy key
+            // retains manual slopes; let the curve normalize it.
+            if interpolation != Interpolation::Smooth {
+                return false;
+            }
+        }
+        if !track.curve.set_interpolation(time, interpolation) {
             return false;
         }
-        track.curve.keys[index].interpolation = interpolation;
-        track.curve.update_tangents();
         if !self.commit_target_clip(target, after) {
             return false;
         }
@@ -3875,6 +5350,121 @@ impl LeopardApp {
             time,
         }];
         self.status = format!("Set key interpolation to {}", interpolation.label());
+        true
+    }
+
+    /// Apply an interpolation change from one channel row. When keys in that
+    /// row are selected, only those keys change; otherwise the entire row
+    /// changes, matching the old per-row control's intent while making the edit
+    /// undoable and applying the same tangent rules as the selection commands.
+    pub(super) fn set_curve_row_interpolation(
+        &mut self,
+        target: AnimTarget,
+        row: CurveRow,
+        interpolation: Interpolation,
+    ) -> bool {
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let track_id = Self::curve_row_track(row);
+        let selected_times: Vec<f32> = self
+            .selected_curve_keys()
+            .into_iter()
+            .filter(|key| key.target == target && key.track == track_id)
+            .map(|key| key.time)
+            .collect();
+        let mut changed = 0;
+        if let Some(property) = row.property {
+            if let Some(track) = after.track_mut(property) {
+                let times: Vec<f32> = track
+                    .curve
+                    .keys
+                    .iter()
+                    .filter(|key| {
+                        selected_times.is_empty()
+                            || selected_times
+                                .iter()
+                                .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                    })
+                    .map(|key| key.time)
+                    .collect();
+                for time in times {
+                    if track.curve.set_interpolation(time, interpolation) {
+                        changed += 1;
+                    }
+                }
+            }
+        } else if let Some(index) = row.morph_target {
+            if let Some(curve) = after.morph_weights.get_mut(&index) {
+                let times: Vec<f32> = curve
+                    .keys
+                    .iter()
+                    .filter(|key| {
+                        selected_times.is_empty()
+                            || selected_times
+                                .iter()
+                                .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                    })
+                    .map(|key| key.time)
+                    .collect();
+                for time in times {
+                    if curve.set_interpolation(time, interpolation) {
+                        changed += 1;
+                    }
+                }
+            }
+        } else if let Some(track) = after.rotation.as_mut() {
+            let times: Vec<f32> = track
+                .keys
+                .iter()
+                .filter(|key| {
+                    selected_times.is_empty()
+                        || selected_times
+                            .iter()
+                            .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                })
+                .map(|key| key.time)
+                .collect();
+            for time in times {
+                if track.set_interpolation(time, interpolation) {
+                    changed += 1;
+                }
+            }
+        }
+        if changed == 0 {
+            return false;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.status = format!("Set key interpolation to {}", interpolation.label());
+        true
+    }
+
+    pub(super) fn delete_target_morph_weight_curve_key(
+        &mut self,
+        target: AnimTarget,
+        target_index: u32,
+        time: f32,
+    ) -> bool {
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let Some(index) = Self::morph_curve_key_index(&after, target_index, time) else {
+            return false;
+        };
+        let Some(curve) = after.morph_weights.get_mut(&target_index) else {
+            return false;
+        };
+        curve.keys.remove(index);
+        after
+            .morph_weights
+            .retain(|_, curve| !curve.keys.is_empty());
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys.clear();
+        self.status = "Deleted key".into();
         true
     }
 
@@ -3901,6 +5491,162 @@ impl LeopardApp {
         }
         self.selected_keys.clear();
         self.status = "Deleted key".into();
+        true
+    }
+
+    /// Retime the selected F-curve keys around their earliest selected time.
+    ///
+    /// The pivot is the earliest selected key, so the selection's leading edge
+    /// stays fixed and later keys move toward or away from it. Times are not
+    /// frame-snapped. Positive factors are required; a collision with an
+    /// unselected key or an implied negative time rejects the whole edit without
+    /// changing the document. Auto tangents are re-derived and manual tangents
+    /// are rescaled per incident segment by the anim crate. One target commit
+    /// makes the retime one undo step.
+    pub(super) fn retime_selected_curve_keys(&mut self, factor: f32) -> bool {
+        if !factor.is_finite() || factor <= 0.0 || (factor - 1.0).abs() <= 1e-6 {
+            self.status = "Enter a positive retime factor other than 1".into();
+            return false;
+        }
+        let keys = self.selected_curve_keys();
+        let Some(first) = keys.first() else {
+            self.status = "Select F-curve keys to retime".into();
+            return false;
+        };
+        let target = first.target;
+        if keys.iter().any(|key| key.target != target) {
+            return false;
+        }
+        let pivot = keys
+            .iter()
+            .map(|key| key.time)
+            .fold(f32::INFINITY, f32::min);
+        let Some(before) = self.target_clip(target) else {
+            return false;
+        };
+        let mut after = before.clone();
+        let mut scalar_tracks: Vec<(AnimProperty, Vec<f32>)> = Vec::new();
+        let mut morph_tracks: Vec<(u32, Vec<f32>)> = Vec::new();
+        let mut rotation_times = Vec::new();
+        for key in &keys {
+            match key.track {
+                CurveTrackId::Scalar(property) => {
+                    if let Some((_, times)) = scalar_tracks
+                        .iter_mut()
+                        .find(|(candidate, _)| *candidate == property)
+                    {
+                        times.push(key.time);
+                    } else {
+                        scalar_tracks.push((property, vec![key.time]));
+                    }
+                }
+                CurveTrackId::Rotation => rotation_times.push(key.time),
+                CurveTrackId::MorphWeight(target) => {
+                    if let Some((_, times)) = morph_tracks
+                        .iter_mut()
+                        .find(|(candidate, _)| *candidate == target)
+                    {
+                        times.push(key.time);
+                    } else {
+                        morph_tracks.push((target, vec![key.time]));
+                    }
+                }
+            }
+        }
+        for (property, times) in &scalar_tracks {
+            let Some(track) = after.track_mut(*property) else {
+                return false;
+            };
+            if !track.curve.retime_selected_keys(pivot, factor, times) {
+                self.status = "Retime would collide with another key or leave the timeline".into();
+                return false;
+            }
+        }
+        if !rotation_times.is_empty() {
+            let Some(track) = after.rotation.as_mut() else {
+                return false;
+            };
+            if !track.retime_selected_keys(pivot, factor, &rotation_times) {
+                self.status = "Retime would collide with another key or leave the timeline".into();
+                return false;
+            }
+        }
+        for (target_index, times) in &morph_tracks {
+            let Some(curve) = after.morph_weights.get_mut(target_index) else {
+                return false;
+            };
+            if !curve.retime_selected_keys(pivot, factor, times) {
+                self.status = "Retime would collide with another key or leave the timeline".into();
+                return false;
+            }
+        }
+        if after == before {
+            self.status = "Those keys already have the requested timing".into();
+            return false;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.selected_keys = keys
+            .into_iter()
+            .map(|mut key| {
+                key.time = pivot + (key.time - pivot) * factor;
+                key
+            })
+            .collect();
+        self.status = format!("Retimed {} key(s) by ×{factor}", self.selected_keys.len());
+        true
+    }
+
+    /// Retime every key in one object's take around zero seconds. The take
+    /// manager uses this path; it is one `SetAnimationCmd` undo step and covers
+    /// scalar, morph-weight and quaternion rotation channels. Tag and material
+    /// clips are not part of a per-object take; retime their selected keys from
+    /// the F-curve editor instead.
+    pub(super) fn retime_animation_take(&mut self, id: NodeId, factor: f32) -> bool {
+        if !factor.is_finite() || factor <= 0.0 || (factor - 1.0).abs() <= 1e-6 {
+            self.status = "Enter a positive retime factor other than 1".into();
+            return false;
+        }
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        let name = node.name.clone();
+        let before = node.animation.clone();
+        if before.is_empty() {
+            self.status = "This take has no keys to retime".into();
+            return false;
+        }
+        let mut after = before.clone();
+        if !after.retime_all(0.0, factor) {
+            self.status = "Retime would collide with another key or leave the timeline".into();
+            return false;
+        }
+        if after == before {
+            self.status = "That factor does not change any key times in this take".into();
+            return false;
+        }
+        let key_count = after
+            .tracks
+            .iter()
+            .map(|track| track.curve.keys.len())
+            .sum::<usize>()
+            + after.rotation.as_ref().map_or(0, |track| track.keys.len())
+            + after
+                .morph_weights
+                .values()
+                .map(|curve| curve.keys.len())
+                .sum::<usize>();
+        let Some(command) = SetAnimationCmd::new(&self.doc, id, after) else {
+            return false;
+        };
+        self.history.execute(&mut self.doc, Box::new(command));
+        for key in &mut self.selected_keys {
+            if key.target == AnimTarget::Object(id) {
+                key.time *= factor;
+            }
+        }
+        self.status = format!("Retimed take {name} by ×{factor} ({key_count} keys)");
         true
     }
 
@@ -3958,6 +5704,16 @@ impl LeopardApp {
                                 .any(|time| (candidate.time - time).abs() <= KEY_TIME_EPSILON)
                     })
                 }),
+                CurveTrackId::MorphWeight(target) => {
+                    after.morph_weights.get(&target).is_some_and(|curve| {
+                        curve.keys.iter().any(|candidate| {
+                            (candidate.time - *new_time).abs() <= KEY_TIME_EPSILON
+                                && !selected_times
+                                    .iter()
+                                    .any(|time| (candidate.time - time).abs() <= KEY_TIME_EPSILON)
+                        })
+                    })
+                }
             };
             if collides {
                 self.status = "Another key already sits at that frame".into();
@@ -3994,6 +5750,17 @@ impl LeopardApp {
                     };
                     track.keys[index].time = *new_time;
                 }
+                CurveTrackId::MorphWeight(target) => {
+                    let Some(curve) = after.morph_weights.get_mut(&target) else {
+                        return false;
+                    };
+                    let Some(index) = curve.keys.iter().position(|candidate| {
+                        (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
+                    }) else {
+                        return false;
+                    };
+                    curve.keys[index].time = *new_time;
+                }
             }
         }
         for track in &mut after.tracks {
@@ -4002,6 +5769,10 @@ impl LeopardApp {
         }
         if let Some(track) = after.rotation.as_mut() {
             track.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+        }
+        for curve in after.morph_weights.values_mut() {
+            curve.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+            curve.update_tangents();
         }
         if after == before {
             return false;
@@ -4034,6 +5805,83 @@ impl LeopardApp {
         self.move_selected_curve_keys_by(to - key.time)
     }
 
+    /// Set one hand-authored Bezier tangent slope for a scalar or morph key.
+    /// One drag becomes one undo step; the editor keeps the other side of the
+    /// key exactly as it was.
+    pub(super) fn set_target_curve_tangent(
+        &mut self,
+        target: AnimTarget,
+        track: CurveTrackId,
+        time: f32,
+        incoming: bool,
+        slope: f32,
+    ) -> bool {
+        if !slope.is_finite() {
+            return false;
+        }
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let changed = match track {
+            CurveTrackId::Scalar(property) => {
+                let Some(track) = after.track_mut(property) else {
+                    return false;
+                };
+                let Some(index) = track
+                    .curve
+                    .keys
+                    .iter()
+                    .position(|key| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                else {
+                    return false;
+                };
+                let key = &mut track.curve.keys[index];
+                let before = (key.tangent_in, key.tangent_out, key.tangent_manual);
+                if incoming {
+                    key.tangent_in = slope;
+                    key.tangent_in_type = TangentType::Spline;
+                } else {
+                    key.tangent_out = slope;
+                    key.tangent_out_type = TangentType::Spline;
+                }
+                key.tangent_manual = true;
+                before != (key.tangent_in, key.tangent_out, key.tangent_manual)
+            }
+            CurveTrackId::MorphWeight(target_index) => {
+                let Some(curve) = after.morph_weights.get_mut(&target_index) else {
+                    return false;
+                };
+                let Some(index) = curve
+                    .keys
+                    .iter()
+                    .position(|key| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                else {
+                    return false;
+                };
+                let key = &mut curve.keys[index];
+                let before = (key.tangent_in, key.tangent_out, key.tangent_manual);
+                if incoming {
+                    key.tangent_in = slope;
+                    key.tangent_in_type = TangentType::Spline;
+                } else {
+                    key.tangent_out = slope;
+                    key.tangent_out_type = TangentType::Spline;
+                }
+                key.tangent_manual = true;
+                before != (key.tangent_in, key.tangent_out, key.tangent_manual)
+            }
+            CurveTrackId::Rotation => return false,
+        };
+        if !changed {
+            return false;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.status = "Adjusted tangent".into();
+        true
+    }
+
     /// Delete every selected key as a single undo step. A track disappears
     /// when its last key is removed, and a quaternion track is dropped with it.
     pub(super) fn delete_selected_curve_key(&mut self) -> bool {
@@ -4064,9 +5912,17 @@ impl LeopardApp {
                         }
                     }
                 }
+                CurveTrackId::MorphWeight(target) => {
+                    if let Some(curve) = after.morph_weights.get_mut(&target) {
+                        curve.remove_nearest(key.time);
+                    }
+                }
             }
         }
         after.tracks.retain(|track| !track.curve.keys.is_empty());
+        after
+            .morph_weights
+            .retain(|_, curve| !curve.keys.is_empty());
         if !self.commit_target_clip(target, after) {
             return false;
         }
@@ -4079,8 +5935,10 @@ impl LeopardApp {
         true
     }
 
-    /// Set interpolation for every selected key as one undo step.
-    #[cfg(test)]
+    /// Set interpolation for every selected key as one undo step. The anim
+    /// crate applies the tangent-ownership rule: Smooth replaces hand-authored
+    /// slopes with automatic ones, while Spline preserves them. Scalar, morph
+    /// and quaternion keys all pass through this same selection.
     pub(super) fn set_selected_curve_key_interpolation(
         &mut self,
         interpolation: Interpolation,
@@ -4101,24 +5959,22 @@ impl LeopardApp {
             match key.track {
                 CurveTrackId::Scalar(property) => {
                     if let Some(track) = after.track_mut(property) {
-                        if let Some(index) = track.curve.keys.iter().position(|candidate| {
-                            (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
-                        }) {
-                            if track.curve.keys[index].interpolation != interpolation {
-                                track.curve.keys[index].interpolation = interpolation;
-                                changed += 1;
-                            }
+                        if track.curve.set_interpolation(key.time, interpolation) {
+                            changed += 1;
                         }
-                        track.curve.update_tangents();
                     }
                 }
                 CurveTrackId::Rotation => {
                     if let Some(track) = after.rotation.as_mut() {
-                        if let Some(index) = track.key_index(key.time) {
-                            if track.keys[index].interpolation != interpolation {
-                                track.keys[index].interpolation = interpolation;
-                                changed += 1;
-                            }
+                        if track.set_interpolation(key.time, interpolation) {
+                            changed += 1;
+                        }
+                    }
+                }
+                CurveTrackId::MorphWeight(target) => {
+                    if let Some(curve) = after.morph_weights.get_mut(&target) {
+                        if curve.set_interpolation(key.time, interpolation) {
+                            changed += 1;
                         }
                     }
                 }
@@ -4132,6 +5988,155 @@ impl LeopardApp {
         }
         self.status = format!("Set key interpolation to {}", interpolation.label());
         true
+    }
+
+    /// Set the same tangent derivation rule on the selected keys. `Tangent >
+    /// Type` passes both sides; the left/right menu variants set only one. The
+    /// whole selection is committed once, so types and overwritten slopes undo
+    /// together.
+    pub(super) fn set_selected_curve_tangent_type(
+        &mut self,
+        tangent_type: TangentType,
+        incoming: bool,
+        outgoing: bool,
+    ) -> bool {
+        let keys = self.selected_curve_keys();
+        if keys.is_empty() {
+            self.status = "Select F-curve keys to change their tangent type".into();
+            return false;
+        }
+        let target = keys[0].target;
+        if keys.iter().any(|key| key.target != target) {
+            return false;
+        }
+        let Some(mut after) = self.target_clip(target) else {
+            return false;
+        };
+        let mut changed = 0;
+        for key in &keys {
+            match key.track {
+                CurveTrackId::Scalar(property) => {
+                    if let Some(track) = after.track_mut(property) {
+                        if track
+                            .curve
+                            .set_tangent_type(key.time, tangent_type, incoming, outgoing)
+                        {
+                            changed += 1;
+                        }
+                    }
+                }
+                CurveTrackId::Rotation => {
+                    if let Some(track) = after.rotation.as_mut() {
+                        if track.set_tangent_type(key.time, tangent_type, incoming, outgoing) {
+                            changed += 1;
+                        }
+                    }
+                }
+                CurveTrackId::MorphWeight(target) => {
+                    if let Some(curve) = after.morph_weights.get_mut(&target) {
+                        if curve.set_tangent_type(key.time, tangent_type, incoming, outgoing) {
+                            changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if changed == 0 {
+            self.status = "Those keys already use that tangent type".into();
+            return false;
+        }
+        if !self.commit_target_clip(target, after) {
+            return false;
+        }
+        self.status = format!("Set tangent type to {}", tangent_type.label());
+        true
+    }
+
+    /// The common interpolation of the current key selection, or `None` for a
+    /// mixed selection. The toolbar uses this to show `Mixed` rather than
+    /// implying that the first key speaks for the rest.
+    pub(super) fn selected_curve_interpolation(&self) -> Option<Interpolation> {
+        let keys = self.selected_curve_keys();
+        let clip = self.target_clip(self.current_anim_target()?)?;
+        let mut common = None;
+        for key in keys {
+            let interpolation = match key.track {
+                CurveTrackId::Scalar(property) => {
+                    clip.track(property)?
+                        .curve
+                        .keys
+                        .iter()
+                        .find(|candidate| (candidate.time - key.time).abs() <= KEY_TIME_EPSILON)?
+                        .interpolation
+                }
+                CurveTrackId::Rotation => {
+                    clip.rotation
+                        .as_ref()?
+                        .keys
+                        .iter()
+                        .find(|candidate| (candidate.time - key.time).abs() <= KEY_TIME_EPSILON)?
+                        .interpolation
+                }
+                CurveTrackId::MorphWeight(target) => {
+                    clip.morph_weights
+                        .get(&target)?
+                        .keys
+                        .iter()
+                        .find(|candidate| (candidate.time - key.time).abs() <= KEY_TIME_EPSILON)?
+                        .interpolation
+                }
+            };
+            match common {
+                Some(existing) if existing != interpolation => return None,
+                None => common = Some(interpolation),
+                _ => {}
+            }
+        }
+        common
+    }
+
+    /// The common tangent type across every selected side, or `None` when the
+    /// selection is mixed (including a key whose two sides differ).
+    pub(super) fn selected_curve_tangent_type(&self) -> Option<TangentType> {
+        let keys = self.selected_curve_keys();
+        let clip = self.target_clip(self.current_anim_target()?)?;
+        let mut common = None;
+        for key in keys {
+            let (incoming, outgoing) = match key.track {
+                CurveTrackId::Scalar(property) => {
+                    let key =
+                        clip.track(property)?.curve.keys.iter().find(|candidate| {
+                            (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
+                        })?;
+                    (key.tangent_in_type, key.tangent_out_type)
+                }
+                CurveTrackId::Rotation => {
+                    let key =
+                        clip.rotation.as_ref()?.keys.iter().find(|candidate| {
+                            (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
+                        })?;
+                    (key.tangent_in_type, key.tangent_out_type)
+                }
+                CurveTrackId::MorphWeight(target) => {
+                    let key = clip
+                        .morph_weights
+                        .get(&target)?
+                        .keys
+                        .iter()
+                        .find(|candidate| (candidate.time - key.time).abs() <= KEY_TIME_EPSILON)?;
+                    (key.tangent_in_type, key.tangent_out_type)
+                }
+            };
+            if incoming != outgoing {
+                return None;
+            }
+            match common {
+                Some(existing) if existing != incoming => return None,
+                None => common = Some(incoming),
+                _ => {}
+            }
+        }
+        common
     }
 
     /// Copy the current key selection, preserving each key's offset from the
@@ -4189,6 +6194,24 @@ impl LeopardApp {
                         interpolation: value.interpolation,
                     });
                 }
+                CurveTrackId::MorphWeight(target) => {
+                    let Some(curve) = clip.morph_weights.get(&target) else {
+                        continue;
+                    };
+                    let Some(value) = curve
+                        .keys
+                        .iter()
+                        .find(|candidate| (candidate.time - key.time).abs() <= KEY_TIME_EPSILON)
+                    else {
+                        continue;
+                    };
+                    clipboard.push(CurveClipboardKey {
+                        track: key.track,
+                        offset: key.time - anchor,
+                        value: CurveKeyValue::Scalar(value.value),
+                        interpolation: value.interpolation,
+                    });
+                }
             }
         }
         if clipboard.is_empty() {
@@ -4221,16 +6244,24 @@ impl LeopardApp {
             let channel = match item.track {
                 CurveTrackId::Scalar(property) => AnimChannel::from_scalar_property(property),
                 CurveTrackId::Rotation => Some(AnimChannel::Rotation),
+                CurveTrackId::MorphWeight(_) => Some(AnimChannel::MorphWeight),
             };
             let Some(channel) = channel else {
                 continue;
             };
             let compatible = match item.track {
-                CurveTrackId::Scalar(_) => channel.kind() != ChannelKind::Quaternion,
+                CurveTrackId::Scalar(_) | CurveTrackId::MorphWeight(_) => {
+                    channel.kind() != ChannelKind::Quaternion
+                }
                 CurveTrackId::Rotation => channel.kind() == ChannelKind::Quaternion,
             };
             if !compatible || !self.channel_applies_to_target(channel, target) {
                 continue;
+            }
+            if let CurveTrackId::MorphWeight(index) = item.track {
+                if self.morph_weight_value(target, index).is_none() {
+                    continue;
+                }
             }
             let time = (self.playback.time + item.offset).max(0.0);
             if !time.is_finite() {
@@ -4253,6 +6284,17 @@ impl LeopardApp {
                         continue;
                     };
                     after.set_rotation_key(time, value, item.interpolation);
+                    pasted.push(SelectedKey {
+                        target,
+                        track: item.track,
+                        time,
+                    });
+                }
+                CurveTrackId::MorphWeight(index) => {
+                    let CurveKeyValue::Scalar(value) = item.value else {
+                        continue;
+                    };
+                    after.set_morph_weight_key(index, time, value, item.interpolation);
                     pasted.push(SelectedKey {
                         target,
                         track: item.track,
@@ -4749,9 +6791,13 @@ impl LeopardApp {
 
         let mut mode_hovered = false;
         let mesh_ready = self.selected_is_mesh();
+        let weight_ready = self.weight_paint_ready();
+        if self.weight_paint && !weight_ready {
+            self.weight_paint = false;
+        }
         let strip = Rect::from_min_size(
             rect.left_top() + Vec2::new(7.0, 8.0),
-            Vec2::new(30.0, 4.0 * 27.0 + 7.0),
+            Vec2::new(30.0, 5.0 * 27.0 + 7.0),
         );
         painter.rect_filled(
             strip,
@@ -4769,26 +6815,33 @@ impl LeopardApp {
             (Icon::PointMode, "Point mode"),
             (Icon::EdgeMode, "Edge mode"),
             (Icon::PolygonMode, "Polygon mode"),
+            (Icon::WeightPaint, "Weight paint"),
         ]
         .into_iter()
         .enumerate()
         {
-            let active = if index == 0 {
-                !self.mesh_edit
-            } else {
-                self.mesh_edit
-                    && matches!(
-                        (index, self.mesh_select_mode),
-                        (1, MeshSelectMode::Points)
-                            | (2, MeshSelectMode::Edges)
-                            | (3, MeshSelectMode::Polygons)
-                    )
+            let active = match index {
+                0 => !self.mesh_edit && !self.weight_paint,
+                4 => self.weight_paint,
+                _ => {
+                    self.mesh_edit
+                        && matches!(
+                            (index, self.mesh_select_mode),
+                            (1, MeshSelectMode::Points)
+                                | (2, MeshSelectMode::Edges)
+                                | (3, MeshSelectMode::Polygons)
+                        )
+                }
             };
             let hit = Rect::from_min_size(
                 strip.left_top() + Vec2::new(3.0, 4.0 + index as f32 * 27.0),
                 Vec2::splat(24.0),
             );
-            let interactive = index == 0 || mesh_ready;
+            let interactive = match index {
+                0 => true,
+                4 => weight_ready,
+                _ => mesh_ready,
+            };
             let item = ui.interact(
                 hit,
                 ui.id().with(("viewport_mode", index)),
@@ -4823,8 +6876,13 @@ impl LeopardApp {
             );
             if item.clicked() {
                 if index == 0 {
+                    self.set_weight_paint(false);
                     self.leave_mesh_edit();
+                } else if index == 4 {
+                    let enable = !self.weight_paint;
+                    self.set_weight_paint(enable);
                 } else {
+                    self.set_weight_paint(false);
                     let mode = match index {
                         1 => MeshSelectMode::Points,
                         2 => MeshSelectMode::Edges,
@@ -4837,7 +6895,11 @@ impl LeopardApp {
             if interactive {
                 item.on_hover_text(label);
             } else {
-                item.on_hover_text("Select a mesh object to edit components");
+                item.on_hover_text(if index == 4 {
+                    "Bind a modifier-free mesh to joints to paint weights"
+                } else {
+                    "Select a mesh object to edit components"
+                });
             }
         }
         if !mode_hovered {
@@ -5140,6 +7202,27 @@ impl LeopardApp {
             self.view_label = "Viewport".into();
         }
 
+        if !modifiers.alt && self.weight_paint {
+            let painting = response.dragged_by(egui::PointerButton::Primary)
+                || response.clicked_by(egui::PointerButton::Primary);
+            if response.drag_started_by(egui::PointerButton::Primary)
+                || response.clicked_by(egui::PointerButton::Primary)
+            {
+                self.begin_weight_stroke();
+            }
+            if painting {
+                if let Some(pointer) = pointer {
+                    self.paint_weight_brush(evaluated, rect, pixel_w, pixel_h, pointer);
+                }
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary)
+                || response.clicked_by(egui::PointerButton::Primary)
+            {
+                self.commit_pending();
+            }
+            return;
+        }
+
         let drag_started = !modifiers.alt && response.drag_started_by(egui::PointerButton::Primary);
         if drag_started {
             if let Some(pointer) = pointer {
@@ -5330,7 +7413,7 @@ impl LeopardApp {
         pixel_h: u32,
         pointer: Pos2,
     ) -> Option<GizmoDrag> {
-        if self.mesh_edit {
+        if self.mesh_edit || self.weight_paint {
             return None;
         }
         if self.gizmo == GizmoMode::Off {
@@ -5546,6 +7629,58 @@ impl LeopardApp {
         ))
     }
 
+    fn draw_weight_paint_overlay(
+        &self,
+        painter: &egui::Painter,
+        ui: &egui::Ui,
+        rect: Rect,
+        evaluated: &EvaluatedScene,
+        pixel_w: u32,
+        pixel_h: u32,
+    ) {
+        let Some(id) = self.selection.primary() else {
+            return;
+        };
+        let Some(node) = evaluated.node(id) else {
+            return;
+        };
+        let Some(mesh) = node.mesh() else {
+            return;
+        };
+        let Some(skin) = self.doc.scene.get(id).and_then(|node| node.skin.as_ref()) else {
+            return;
+        };
+        let Some(joint) = self.active_weight_joint() else {
+            return;
+        };
+        for (vertex, position) in mesh.positions.iter().enumerate() {
+            let Some(screen) = self.project(
+                node.world.transform_point3(*position),
+                rect,
+                pixel_w,
+                pixel_h,
+            ) else {
+                continue;
+            };
+            let weight = skin.influence(vertex, joint).clamp(0.0, 1.0);
+            let color = if weight > 0.001 {
+                Color32::from_rgba_unmultiplied(245, 135, 35, (55.0 + 190.0 * weight) as u8)
+            } else {
+                Color32::from_rgba_unmultiplied(190, 195, 200, 80)
+            };
+            painter.circle_filled(screen, 2.4, color);
+        }
+        if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+            if rect.contains(pointer) {
+                painter.circle_stroke(
+                    pointer,
+                    self.weight_brush.radius,
+                    egui::Stroke::new(1.4, Color32::from_rgb(245, 160, 50)),
+                );
+            }
+        }
+    }
+
     fn draw_viewport_overlay(
         &self,
         ui: &egui::Ui,
@@ -5555,6 +7690,10 @@ impl LeopardApp {
         pixel_h: u32,
     ) {
         let painter = ui.painter_at(rect);
+        if self.weight_paint {
+            self.draw_weight_paint_overlay(&painter, ui, rect, evaluated, pixel_w, pixel_h);
+            return;
+        }
         if self.mesh_edit {
             self.draw_mesh_edit_overlay(ui, rect, evaluated, pixel_w, pixel_h);
             return;
@@ -5738,19 +7877,85 @@ fn point_in_polygon(p: Pos2, polygon: &[Pos2]) -> bool {
 
 struct SkinTarget {
     vertex_count: usize,
-    joint_count: usize,
-    skin: Option<Skin>,
+    joints: Vec<NodeId>,
+    inverse_bind: Vec<Mat4>,
+    segments: Vec<(Vec3, Vec3)>,
+    positions: Vec<Vec3>,
+    existing: Option<Skin>,
 }
 
-fn skin_binding_candidate<'a>(node: &Node, target: &'a SkinTarget) -> Option<&'a Skin> {
-    target
-        .skin
-        .as_ref()
-        .filter(|skin| node.skin.as_ref() != Some(*skin))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeightBrushMode {
+    Add,
+    Subtract,
+    Replace,
+    Smooth,
 }
 
-fn skin_binding_ready(node: &Node, target: &SkinTarget) -> bool {
-    skin_binding_candidate(node, target).is_some()
+impl WeightBrushMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Add => "Add",
+            Self::Subtract => "Subtract",
+            Self::Replace => "Replace",
+            Self::Smooth => "Smooth",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeightFalloff {
+    Constant,
+    Linear,
+    Smooth,
+}
+
+impl WeightFalloff {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Constant => "Constant",
+            Self::Linear => "Linear",
+            Self::Smooth => "Smooth",
+        }
+    }
+
+    fn factor(self, distance: f32, radius: f32) -> f32 {
+        if radius <= 0.0 {
+            return 0.0;
+        }
+        let t = (distance / radius).clamp(0.0, 1.0);
+        match self {
+            Self::Constant => 1.0,
+            Self::Linear => 1.0 - t,
+            Self::Smooth => {
+                let s = 1.0 - t;
+                s * s * (3.0 - 2.0 * s)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WeightBrush {
+    mode: WeightBrushMode,
+    falloff: WeightFalloff,
+    radius: f32,
+    strength: f32,
+}
+
+impl Default for WeightBrush {
+    fn default() -> Self {
+        Self {
+            mode: WeightBrushMode::Add,
+            falloff: WeightFalloff::Smooth,
+            radius: 44.0,
+            strength: 0.3,
+        }
+    }
+}
+
+fn skin_binding_ready(_node: &Node, target: &SkinTarget) -> bool {
+    target.vertex_count > 0 && !target.joints.is_empty()
 }
 
 fn skin_unbind_ready(node: &Node) -> bool {
@@ -5833,6 +8038,17 @@ fn selected_valid_points(mesh: &Mesh, selected: &[u32]) -> Vec<u32> {
     unique
 }
 
+fn selected_valid_polygons(mesh: &Mesh, selected: &[u32]) -> Vec<u32> {
+    let mut unique: Vec<u32> = selected
+        .iter()
+        .copied()
+        .filter(|p| (*p as usize) < mesh.polygons.len())
+        .collect();
+    unique.sort_unstable();
+    unique.dedup();
+    unique
+}
+
 /// The cut plane must strictly cross a polygon; that is exactly when
 /// `lc_geom::ring_cut` is guaranteed to change the mesh.
 fn ring_cut_would_split(mesh: &Mesh, axis: usize, offset: f32) -> bool {
@@ -5856,30 +8072,10 @@ fn ring_cut_would_split(mesh: &Mesh, axis: usize, offset: f32) -> bool {
     })
 }
 
+/// Weld is the editor's Collapse: both merge the selected points into one at
+/// their centroid, so they share the geometry call in `lc-geom`.
 fn weld_selected_points(mesh: &Mesh, selected: &[u32]) -> Mesh {
-    let unique = selected_valid_points(mesh, selected);
-    if unique.len() < 2 {
-        return mesh.clone();
-    }
-    let center = unique
-        .iter()
-        .map(|p| mesh.positions[*p as usize])
-        .sum::<Vec3>()
-        / unique.len() as f32;
-    let target = unique[0];
-    let remap: HashMap<u32, u32> = unique.iter().map(|p| (*p, target)).collect();
-    let mut out = mesh.clone();
-    out.positions[target as usize] = center;
-    for poly in &mut out.polygons {
-        for corner in &mut poly.corners {
-            if let Some(mapped) = remap.get(&corner.point) {
-                corner.point = *mapped;
-            }
-        }
-    }
-    out.remove_degenerate_polygons();
-    out.compact_points();
-    out
+    lc_geom::collapse_points(mesh, selected).0
 }
 
 /// Orders the selected edges into exactly the two clean closed loops Bridge

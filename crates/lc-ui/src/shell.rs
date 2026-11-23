@@ -351,6 +351,20 @@ impl LeopardApp {
                     segments: 32,
                 });
             }
+            if icons::icon_button(ui, Icon::Cylinder, "Add capsule", true).clicked() {
+                self.add_primitive(Primitive::Capsule {
+                    radius: 0.5,
+                    height: 2.0,
+                    segments: 32,
+                    rings: 8,
+                });
+            }
+            if icons::icon_button(ui, Icon::Plane, "Add disc", true).clicked() {
+                self.add_primitive(Primitive::Disc {
+                    radius: 1.0,
+                    segments: 32,
+                });
+            }
             if icons::icon_button(ui, Icon::Cone, "Add cone", true).clicked() {
                 self.add_primitive(Primitive::Cone {
                     radius: 0.8,
@@ -588,6 +602,26 @@ impl LeopardApp {
                 {
                     self.perform_mesh_action(MeshAction::SelectNone);
                 }
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Toggle Seam",
+                    self.mesh_topology_ready(MeshSelectMode::Edges, 1),
+                    "Toggle Seam",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::ToggleSeam);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Selection:Toggle Pinned UV",
+                    self.uv_pin_ready(),
+                    "Toggle Pinned UV",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::TogglePinnedUv);
+                }
                 ui.separator();
                 if recorded_button_enabled(
                     ui,
@@ -620,6 +654,20 @@ impl LeopardApp {
                     self.add_primitive(Primitive::Cylinder {
                         radius: 0.7,
                         height: 2.0,
+                        segments: 32,
+                    });
+                }
+                if ui.button("Capsule").clicked() {
+                    self.add_primitive(Primitive::Capsule {
+                        radius: 0.5,
+                        height: 2.0,
+                        segments: 32,
+                        rings: 8,
+                    });
+                }
+                if ui.button("Disc").clicked() {
+                    self.add_primitive(Primitive::Disc {
+                        radius: 1.0,
                         segments: 32,
                     });
                 }
@@ -861,6 +909,46 @@ impl LeopardApp {
                 }
                 if recorded_button_enabled(
                     ui,
+                    "Tools:Collapse",
+                    self.mesh_collapse_ready(),
+                    "Collapse",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Collapse);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Create Polygon",
+                    self.mesh_create_polygon_ready(),
+                    "Create Polygon",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::CreatePolygon);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Optimize",
+                    self.mesh_optimize_ready(),
+                    "Optimize",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Optimize);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Point Slide",
+                    self.mesh_point_slide_ready(),
+                    "Point Slide",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::PointSlide);
+                }
+                if recorded_button_enabled(
+                    ui,
                     "Tools:Bridge Loops",
                     self.mesh_bridge_ready(),
                     "Bridge Loops",
@@ -868,6 +956,61 @@ impl LeopardApp {
                 .clicked()
                 {
                     self.perform_mesh_action(MeshAction::Bridge);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Fill Hole",
+                    self.mesh_fill_hole_ready(),
+                    "Fill Hole",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::FillHole);
+                }
+                if recorded_button_enabled(ui, "Tools:Split", self.mesh_split_ready(), "Split")
+                    .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Split);
+                }
+                if recorded_button_enabled(ui, "Tools:Shell", self.mesh_shell_ready(), "Shell")
+                    .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Shell);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Triangulate",
+                    self.mesh_triangulate_ready(),
+                    "Triangulate",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Triangulate);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Flip Normal",
+                    self.mesh_flip_normal_ready(),
+                    "Flip Normal",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::FlipNormal);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Disconnect",
+                    self.mesh_disconnect_ready(),
+                    "Disconnect",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Disconnect);
+                }
+                if recorded_button_enabled(ui, "Tools:Cover", self.mesh_cover_ready(), "Cover")
+                    .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Cover);
                 }
                 ui.separator();
                 recorded_submenu(ui, "Tools:UV Projection", "UV Projection", |ui| {
@@ -1013,6 +1156,32 @@ impl LeopardApp {
                 {
                     self.show_curves = !self.show_curves;
                 }
+                let has_curve_selection = !self.selected_curve_keys().is_empty();
+                ui.add_enabled_ui(has_curve_selection, |ui| {
+                    ui.menu_button("Tangent", |ui| {
+                        ui.menu_button("Type", |ui| {
+                            for tangent_type in TangentType::ALL {
+                                if ui.button(tangent_type.label()).clicked() {
+                                    self.set_selected_curve_tangent_type(tangent_type, true, true);
+                                }
+                            }
+                        });
+                    });
+                    ui.menu_button("Left Tangent", |ui| {
+                        for tangent_type in TangentType::ALL {
+                            if ui.button(tangent_type.label()).clicked() {
+                                self.set_selected_curve_tangent_type(tangent_type, true, false);
+                            }
+                        }
+                    });
+                    ui.menu_button("Right Tangent", |ui| {
+                        for tangent_type in TangentType::ALL {
+                            if ui.button(tangent_type.label()).clicked() {
+                                self.set_selected_curve_tangent_type(tangent_type, false, true);
+                            }
+                        }
+                    });
+                });
                 ui.checkbox(&mut self.playback.looping, "Loop Playback");
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1121,6 +1290,7 @@ impl LeopardApp {
 
     pub(super) fn leave_mesh_edit(&mut self) {
         self.mesh_edit = false;
+        self.weight_paint = false;
         self.clear_mesh_component_selection();
         self.status = "Object mode".into();
     }
@@ -1135,6 +1305,7 @@ impl LeopardApp {
             return;
         }
         self.mesh_select_mode = mode;
+        self.weight_paint = false;
         self.clear_mesh_component_selection();
         if self.mesh_edit {
             return;
@@ -1189,7 +1360,10 @@ impl LeopardApp {
             }
             let before = Shape::of(node);
             let mut after = before.clone();
-            after.modifiers.push(Modifier::Subdivision { levels: 1 });
+            after.modifiers.push(Modifier::Subdivision {
+                levels: 2,
+                scheme: lc_scene::SubdivisionScheme::CatmullClark,
+            });
             edits.push((*id, before, after));
         }
         let count = edits.len();

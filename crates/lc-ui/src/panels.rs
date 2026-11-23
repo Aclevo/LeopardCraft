@@ -50,6 +50,9 @@ impl LeopardApp {
             .collect();
         let mut parent = node.parent;
         let mut parent_changed = false;
+        let mut morph_action: Option<MorphAction> = None;
+        let mut bake_ik = false;
+        let editable_mesh = self.selected_editable_mesh().map(|(_, mesh)| mesh);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -315,6 +318,42 @@ impl LeopardApp {
                                             .prefix("Segments "),
                                     );
                                 }
+                                Primitive::Capsule {
+                                    radius,
+                                    height,
+                                    segments,
+                                    rings,
+                                } => {
+                                    ui.add(
+                                        egui::DragValue::new(radius).speed(0.01).prefix("Radius "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(height).speed(0.01).prefix("Height "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(segments)
+                                            .speed(0.2)
+                                            .range(3..=128)
+                                            .prefix("Segments "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(rings)
+                                            .speed(0.2)
+                                            .range(2..=128)
+                                            .prefix("Rings "),
+                                    );
+                                }
+                                Primitive::Disc { radius, segments } => {
+                                    ui.add(
+                                        egui::DragValue::new(radius).speed(0.01).prefix("Radius "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(segments)
+                                            .speed(0.2)
+                                            .range(3..=128)
+                                            .prefix("Segments "),
+                                    );
+                                }
                                 Primitive::Cone {
                                     radius,
                                     height,
@@ -478,6 +517,29 @@ impl LeopardApp {
                                         egui::DragValue::new(radius).speed(0.01).prefix("Radius "),
                                     );
                                 }
+                                LightKind::Spot {
+                                    radius,
+                                    inner_deg,
+                                    outer_deg,
+                                } => {
+                                    ui.label("Cone follows the object's -Z axis");
+                                    ui.add(
+                                        egui::DragValue::new(radius).speed(0.01).prefix("Radius "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(inner_deg)
+                                            .range(0.0..=90.0)
+                                            .speed(0.1)
+                                            .prefix("Inner "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(outer_deg)
+                                            .range(0.0..=90.0)
+                                            .speed(0.1)
+                                            .prefix("Outer "),
+                                    );
+                                    *outer_deg = outer_deg.max(*inner_deg);
+                                }
                                 LightKind::Area { width, height } => {
                                     ui.add(
                                         egui::DragValue::new(width).speed(0.01).prefix("Width "),
@@ -593,30 +655,101 @@ impl LeopardApp {
                     theme::section(ui, "skinning", "Skinning", |ui| {
                         let target = self.skin_target();
                         let vertex_count = target.as_ref().map(|t| t.vertex_count).unwrap_or(0);
-                        let joint_count = target.as_ref().map(|t| t.joint_count).unwrap_or(0);
+                        let all_joint_ids = self.all_joint_ids();
+                        let all_joint_count = all_joint_ids.len();
+                        let selected_count = self.bind_joint_ids().len();
                         ui.label(
                             egui::RichText::new(format!(
-                                "{vertex_count} mesh vertices · {joint_count} joint objects"
+                                "{vertex_count} mesh vertices · {selected_count}/{all_joint_count} chosen joints"
                             ))
                             .small()
                             .weak(),
                         );
+                        if !all_joint_ids.is_empty() {
+                            ui.horizontal(|ui| {
+                                let mut all = self.bind_joints.is_none();
+                                if ui.checkbox(&mut all, "All joints").changed() {
+                                    self.set_all_bind_joints(all);
+                                }
+                                if ui.small_button("None").clicked() {
+                                    self.bind_joints = Some(Default::default());
+                                }
+                            });
+                            egui::ScrollArea::vertical()
+                                .max_height(104.0)
+                                .show(ui, |ui| {
+                                    for joint in &all_joint_ids {
+                                        let name = self
+                                            .doc
+                                            .scene
+                                            .get(*joint)
+                                            .map(|node| node.name.clone())
+                                            .unwrap_or_else(|| format!("Joint {joint}"));
+                                        let mut checked = self
+                                            .bind_joints
+                                            .as_ref()
+                                            .is_none_or(|joints| joints.contains(joint));
+                                        if ui.checkbox(&mut checked, name).changed() {
+                                            self.set_bind_joint(*joint, checked);
+                                        }
+                                    }
+                                });
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Add Joint objects, then choose the joints to bind.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                        ui.checkbox(
+                            &mut self.bind_auto_weights,
+                            "Automatic proximity weights",
+                        );
+                        if self.bind_auto_weights {
+                            ui.add(
+                                egui::Slider::new(&mut self.bind_dropoff, 0.25..=8.0)
+                                    .text("Dropoff"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.bind_strength, 0.1..=1.0)
+                                    .text("Strength"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.bind_max_influences, 1..=4)
+                                    .text("Max influences"),
+                            );
+                        }
                         let bind_ready = target
                             .as_ref()
                             .map(|target| skin_binding_ready(&node, target))
-                            .unwrap_or(false);
-                        if let Some((joints, weights)) = node
-                            .skin
-                            .as_ref()
-                            .map(|skin| (skin.joints.len(), skin.vertex_count()))
+                            .unwrap_or(false)
+                            && selected_count > 0;
+                        let bind_label = if node.skin.is_some() {
+                            "Rebind chosen joints"
+                        } else {
+                            "Bind chosen joints"
+                        };
+                        if ui
+                            .add_enabled(bind_ready, egui::Button::new(bind_label))
+                            .clicked()
                         {
-                            ui.label(format!("{joints} joints · {weights} weighted vertices"));
-                            if ui
-                                .add_enabled(bind_ready, egui::Button::new("Rebind to all joints"))
-                                .clicked()
-                            {
-                                self.bind_skin_to_all_joints();
-                            }
+                            self.bind_skin_to_joints();
+                        }
+                        if let Some((joints, weighted, vertices)) = node.skin.as_ref().map(|skin| {
+                            (
+                                skin.joints.len(),
+                                skin.weights
+                                    .iter()
+                                    .filter(|weights| weights.iter().any(|weight| *weight > 0.0))
+                                    .count(),
+                                skin.vertex_count(),
+                            )
+                        }) {
+                            ui.label(format!(
+                                "{joints} joints · {weighted}/{vertices} weighted vertices"
+                            ));
                             if ui
                                 .add_enabled(
                                     skin_unbind_ready(&node),
@@ -626,22 +759,445 @@ impl LeopardApp {
                             {
                                 self.unbind_skin_from_primary();
                             }
-                        } else {
-                            if ui
-                                .add_enabled(bind_ready, egui::Button::new("Bind to all joints"))
-                                .clicked()
-                            {
-                                self.bind_skin_to_all_joints();
-                            }
+                        }
+                        if !self.bind_auto_weights {
                             ui.label(
                                 egui::RichText::new(
-                                    "Add Joint objects, then bind to create a skin. \
-                                     Every vertex starts fully weighted to the first joint.",
+                                    "Manual binding leaves uncovered vertices unweighted; \
+                                     they stay at their rest positions until painted.",
                                 )
                                 .small()
                                 .weak(),
                             );
                         }
+                        let joint_names: Vec<String> = node
+                            .skin
+                            .as_ref()
+                            .map(|skin| {
+                                skin.joints
+                                    .iter()
+                                    .map(|joint| {
+                                        self.doc
+                                            .scene
+                                            .get(*joint)
+                                            .map(|node| node.name.clone())
+                                            .unwrap_or_else(|| format!("Joint {joint}"))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !joint_names.is_empty() {
+                            ui.separator();
+                            let current = self
+                                .active_weight_joint()
+                                .unwrap_or(0)
+                                .min(joint_names.len() - 1);
+                            ui.horizontal(|ui| {
+                                ui.label("Active joint");
+                                egui::ComboBox::from_id_salt("weight_joint")
+                                    .selected_text(&joint_names[current])
+                                    .show_ui(ui, |ui| {
+                                        for (index, name) in joint_names.iter().enumerate() {
+                                            if ui.selectable_label(current == index, name).clicked()
+                                            {
+                                                self.weight_joint = Some(index);
+                                            }
+                                        }
+                                    });
+                            });
+                            let paint_ready = self.weight_paint_ready();
+                            let mut paint = self.weight_paint;
+                            if ui
+                                .add_enabled(
+                                    paint_ready,
+                                    egui::Checkbox::new(&mut paint, "Paint weights"),
+                                )
+                                .changed()
+                            {
+                                self.set_weight_paint(paint);
+                            }
+                            if !paint_ready {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Weight painting requires an editable mesh with no \
+                                         modifier stack and matching skin weights",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Brush");
+                                egui::ComboBox::from_id_salt("weight_brush_mode")
+                                    .selected_text(self.weight_brush.mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in [
+                                            WeightBrushMode::Add,
+                                            WeightBrushMode::Subtract,
+                                            WeightBrushMode::Replace,
+                                            WeightBrushMode::Smooth,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.weight_brush.mode,
+                                                mode,
+                                                mode.label(),
+                                            );
+                                        }
+                                    });
+                                egui::ComboBox::from_id_salt("weight_brush_falloff")
+                                    .selected_text(self.weight_brush.falloff.label())
+                                    .show_ui(ui, |ui| {
+                                        for falloff in [
+                                            WeightFalloff::Constant,
+                                            WeightFalloff::Linear,
+                                            WeightFalloff::Smooth,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.weight_brush.falloff,
+                                                falloff,
+                                                falloff.label(),
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.add(
+                                egui::Slider::new(&mut self.weight_brush.radius, 4.0..=180.0)
+                                    .text("Radius"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.weight_brush.strength, 0.01..=1.0)
+                                    .text("Strength"),
+                            );
+                            ui.label(
+                                egui::RichText::new("Auto-normalized · max 4 influences")
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
+                }
+
+                if matches!(&node.kind, NodeKind::Joint { .. }) {
+                    let mut remove_ik = false;
+                    theme::section(ui, "ik", "Inverse Kinematics", |ui| {
+                        if node.ik.is_none() {
+                            let target = node_list
+                                .iter()
+                                .find(|(nid, _)| *nid != id)
+                                .map(|(nid, _)| *nid);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Attach a chain to this tip joint. The tip origin is the end \
+                                     effector; chain length counts movable joints above it.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            if let Some(target) = target {
+                                if ui.button("Create IK Chain").clicked() {
+                                    node.ik = Some(lc_scene::IkChain::new(target));
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Add a target object (for example a Null) first.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        } else if let Some(chain) = node.ik.as_mut() {
+                            ui.checkbox(&mut chain.enabled, "Enabled");
+                            let target_name = node_list
+                                .iter()
+                                .find(|(nid, _)| *nid == chain.target)
+                                .map(|(_, name)| name.as_str())
+                                .unwrap_or("Missing target");
+                            ui.horizontal(|ui| {
+                                ui.label("Target");
+                                egui::ComboBox::from_id_salt("ik_target")
+                                    .selected_text(target_name)
+                                    .show_ui(ui, |ui| {
+                                        for (nid, name) in &node_list {
+                                            ui.selectable_value(&mut chain.target, *nid, name);
+                                        }
+                                    });
+                            });
+                            let pole_name = chain
+                                .pole
+                                .and_then(|pole| {
+                                    node_list
+                                        .iter()
+                                        .find(|(nid, _)| *nid == pole)
+                                        .map(|(_, name)| name.as_str())
+                                })
+                                .unwrap_or("None");
+                            ui.horizontal(|ui| {
+                                ui.label("Pole");
+                                egui::ComboBox::from_id_salt("ik_pole")
+                                    .selected_text(pole_name)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut chain.pole, None, "None");
+                                        for (nid, name) in &node_list {
+                                            if *nid != chain.target {
+                                                ui.selectable_value(
+                                                    &mut chain.pole,
+                                                    Some(*nid),
+                                                    name,
+                                                );
+                                            }
+                                        }
+                                    });
+                            });
+                            ui.add(
+                                egui::DragValue::new(&mut chain.chain_length)
+                                    .speed(0.1)
+                                    .range(1..=16)
+                                    .prefix("Chain length "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut chain.iterations)
+                                    .speed(0.2)
+                                    .range(1..=128)
+                                    .prefix("Iterations "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut chain.tolerance)
+                                    .speed(0.0005)
+                                    .range(0.0001..=0.25)
+                                    .prefix("Tolerance "),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut chain.damping, 0.05..=1.0)
+                                    .text("Damping"),
+                            );
+                            let movable = lc_scene::ik_chain_joints(&self.doc.scene, id, chain);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} movable joint{} · tip origin is the goal",
+                                    movable.len(),
+                                    if movable.len() == 1 { "" } else { "s" }
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        chain.enabled && !movable.is_empty(),
+                                        egui::Button::new("Bake IK take"),
+                                    )
+                                    .on_hover_text(
+                                        "Key every solved frame from the playback start to end",
+                                    )
+                                    .clicked()
+                                {
+                                    bake_ik = true;
+                                }
+                                if ui.button("Remove IK").clicked() {
+                                    remove_ik = true;
+                                }
+                            });
+                        }
+                    });
+                    if remove_ik {
+                        node.ik = None;
+                    }
+
+                    if node.rotation_limits.is_none() {
+                        theme::section(ui, "joint_limits_empty", "Joint Rotation Limits", |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Restrict this joint's local XYZ rotation. Limits clamp direct \
+                                     joint posing and both IK solvers.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            if ui.button("Add Rotation Limits").clicked() {
+                                node.rotation_limits = Some(lc_scene::JointLimits::default());
+                            }
+                        });
+                    } else {
+                        let mut remove_limits = false;
+                        theme::section(ui, "joint_limits", "Joint Rotation Limits", |ui| {
+                            let Some(limits) = node.rotation_limits.as_mut() else {
+                                return;
+                            };
+                            ui.checkbox(&mut limits.enabled, "Enabled");
+                            ui.label(
+                                egui::RichText::new(
+                                    "Local XYZ degrees. A zero-width range locks that axis.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("Min");
+                                ui.add(
+                                    egui::DragValue::new(&mut limits.min.x)
+                                        .speed(1.0)
+                                        .range(-360.0..=360.0)
+                                        .prefix("X ")
+                                        .suffix("°"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut limits.min.y)
+                                        .speed(1.0)
+                                        .range(-360.0..=360.0)
+                                        .prefix("Y ")
+                                        .suffix("°"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut limits.min.z)
+                                        .speed(1.0)
+                                        .range(-360.0..=360.0)
+                                        .prefix("Z ")
+                                        .suffix("°"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Max");
+                                ui.add(
+                                    egui::DragValue::new(&mut limits.max.x)
+                                        .speed(1.0)
+                                        .range(-360.0..=360.0)
+                                        .prefix("X ")
+                                        .suffix("°"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut limits.max.y)
+                                        .speed(1.0)
+                                        .range(-360.0..=360.0)
+                                        .prefix("Y ")
+                                        .suffix("°"),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut limits.max.z)
+                                        .speed(1.0)
+                                        .range(-360.0..=360.0)
+                                        .prefix("Z ")
+                                        .suffix("°"),
+                                );
+                            });
+                            if ui.button("Remove Limits").clicked() {
+                                remove_limits = true;
+                            }
+                        });
+                        if remove_limits {
+                            node.rotation_limits = None;
+                        }
+                    }
+                }
+
+                if node.is_mesh() {
+                    theme::section(ui, "morph_targets", "Morph Targets", |ui| {
+                        let vertex_count = editable_mesh
+                            .as_ref()
+                            .map(|mesh| mesh.positions.len())
+                            .unwrap_or(0);
+                        let has_base = node.morph.has_base();
+                        let base_matches = has_base && node.morph.base.len() == vertex_count;
+                        let mesh_changed = editable_mesh
+                            .as_ref()
+                            .map(|mesh| mesh.positions != node.morph.base)
+                            .unwrap_or(false);
+                        if !has_base {
+                            if editable_mesh.is_none() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Convert this object to an editable mesh to record \
+                                         morph targets.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            } else {
+                                let ready = vertex_count > 0 && node.morph.targets.is_empty();
+                                if ui
+                                    .add_enabled(ready, egui::Button::new("Record Base"))
+                                    .on_hover_text(
+                                        "Record the current vertex positions as the rest shape",
+                                    )
+                                    .clicked()
+                                {
+                                    morph_action = Some(MorphAction::RecordBase);
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Record the base, move vertices, then capture a target.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                let capture_ready =
+                                    editable_mesh.is_some() && base_matches && mesh_changed;
+                                if ui
+                                    .add_enabled(capture_ready, egui::Button::new("Capture Target"))
+                                    .on_hover_text(
+                                        "Store the current vertices as a new morph target",
+                                    )
+                                    .clicked()
+                                {
+                                    morph_action = Some(MorphAction::Capture);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        editable_mesh.is_some() && base_matches && mesh_changed,
+                                        egui::Button::new("Restore Base"),
+                                    )
+                                    .on_hover_text("Return the editable mesh to the recorded base")
+                                    .clicked()
+                                {
+                                    morph_action = Some(MorphAction::Restore);
+                                }
+                            });
+                            if !base_matches {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "The recorded base no longer matches this mesh's topology.",
+                                    )
+                                    .small()
+                                    .color(theme::RECORD),
+                                );
+                            } else if !mesh_changed {
+                                ui.label(
+                                    egui::RichText::new("Move vertices before capturing a target.")
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                        }
+                        for (index, target) in node.morph.targets.iter_mut().enumerate() {
+                            ui.push_id(("morph_target", index), |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut target.name)
+                                            .desired_width(104.0),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut target.weight, 0.0..=1.0)
+                                            .show_value(true),
+                                    );
+                                    if theme::close_icon(ui, 16.0)
+                                        .on_hover_text("Remove morph target")
+                                        .clicked()
+                                    {
+                                        morph_action = Some(MorphAction::Remove(index));
+                                    }
+                                });
+                            });
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "Targets add their weighted vertex offsets; topology must match.",
+                            )
+                            .small()
+                            .weak(),
+                        );
                     });
                 }
 
@@ -665,14 +1221,57 @@ impl LeopardApp {
                         ui.horizontal(|ui| {
                             ui.label(modifier.label());
                             match modifier {
-                                Modifier::Subdivision { levels } => {
+                                Modifier::Subdivision { levels, scheme } => {
                                     ui.add(egui::DragValue::new(levels).range(0..=4));
+                                    egui::ComboBox::from_id_salt(("subdiv_scheme", i))
+                                        .selected_text(scheme.label())
+                                        .show_ui(ui, |ui| {
+                                            for value in [
+                                                lc_scene::SubdivisionScheme::CatmullClark,
+                                                lc_scene::SubdivisionScheme::StamLoop,
+                                                lc_scene::SubdivisionScheme::Linear,
+                                            ] {
+                                                ui.selectable_value(scheme, value, value.label());
+                                            }
+                                        });
                                 }
                                 Modifier::Bend { angle_deg } => {
                                     ui.add(egui::DragValue::new(angle_deg).speed(1.0).suffix("°"));
                                 }
                                 Modifier::Taper { amount, .. } => {
                                     ui.add(egui::DragValue::new(amount).speed(0.01));
+                                }
+                                Modifier::Twist { angle_deg, axis } => {
+                                    ui.add(egui::DragValue::new(angle_deg).speed(1.0).suffix("°"));
+                                    modifier_axis_combo(ui, ("twist_axis", i), axis);
+                                }
+                                Modifier::Shear {
+                                    distance,
+                                    direction_deg,
+                                    axis,
+                                } => {
+                                    ui.add(egui::DragValue::new(distance).speed(0.01));
+                                    ui.add(
+                                        egui::DragValue::new(direction_deg)
+                                            .speed(1.0)
+                                            .suffix("°"),
+                                    );
+                                    modifier_axis_combo(ui, ("shear_axis", i), axis);
+                                }
+                                Modifier::Bulge {
+                                    strength,
+                                    x_axis,
+                                    z_axis,
+                                } => {
+                                    ui.add(egui::DragValue::new(strength).speed(0.01));
+                                    ui.checkbox(x_axis, "X");
+                                    ui.checkbox(z_axis, "Z");
+                                }
+                                Modifier::Spherify { radius, strength } => {
+                                    ui.add(egui::DragValue::new(radius).speed(0.01));
+                                    ui.add(
+                                        egui::DragValue::new(strength).range(0.0..=1.0).speed(0.01),
+                                    );
                                 }
                                 Modifier::Array { count, .. } => {
                                     ui.add(egui::DragValue::new(count).range(1..=256));
@@ -863,6 +1462,9 @@ impl LeopardApp {
                 self.status = "Reparented object".into();
             }
         }
+        if let Some(action) = morph_action {
+            self.perform_morph_action(id, action);
+        }
         // Mesh-edit actions (entering edit mode, topology tools and component
         // transforms) replace the node kind directly. The property editor's
         // local clone predates that replacement, so applying it would undo the
@@ -877,10 +1479,14 @@ impl LeopardApp {
                 shape.kind != original_shape.kind
                     || shape.modifiers != original_shape.modifiers
                     || shape.skin != original_shape.skin
+                    || shape.morph != original_shape.morph
             })
             .unwrap_or(true);
         if !shape_changed_below {
             self.apply_node_edits(id, &original, &node);
+        }
+        if bake_ik {
+            self.bake_ik_chain(id);
         }
     }
 }
@@ -1056,6 +1662,30 @@ impl LeopardApp {
             if bevel.clicked() {
                 action = Some(MeshAction::Bevel);
             }
+            let triangulate_ready = self.mesh_triangulate_ready();
+            let triangulate = ui.add_enabled(triangulate_ready, egui::Button::new("Triangulate"));
+            record_menu_item_state("panel:Triangulate", &triangulate, triangulate_ready);
+            if triangulate.clicked() {
+                action = Some(MeshAction::Triangulate);
+            }
+            let flip_ready = self.mesh_flip_normal_ready();
+            let flip = ui.add_enabled(flip_ready, egui::Button::new("Flip Normal"));
+            record_menu_item_state("panel:Flip Normal", &flip, flip_ready);
+            if flip.clicked() {
+                action = Some(MeshAction::FlipNormal);
+            }
+            let disconnect_ready = self.mesh_disconnect_ready();
+            let disconnect = ui.add_enabled(disconnect_ready, egui::Button::new("Disconnect"));
+            record_menu_item_state("panel:Disconnect", &disconnect, disconnect_ready);
+            if disconnect.clicked() {
+                action = Some(MeshAction::Disconnect);
+            }
+            let cover_ready = self.mesh_cover_ready();
+            let cover = ui.add_enabled(cover_ready, egui::Button::new("Cover"));
+            record_menu_item_state("panel:Cover", &cover, cover_ready);
+            if cover.clicked() {
+                action = Some(MeshAction::Cover);
+            }
             ui.checkbox(&mut self.mesh_extrude_individual, "Individual");
         });
         ui.horizontal(|ui| {
@@ -1090,6 +1720,42 @@ impl LeopardApp {
             if weld.clicked() {
                 action = Some(MeshAction::Weld);
             }
+            let collapse_ready = self.mesh_collapse_ready();
+            let collapse = ui.add_enabled(collapse_ready, egui::Button::new("Collapse"));
+            record_menu_item_state("panel:Collapse", &collapse, collapse_ready);
+            if collapse.clicked() {
+                action = Some(MeshAction::Collapse);
+            }
+            let create_ready = self.mesh_create_polygon_ready();
+            let create = ui.add_enabled(create_ready, egui::Button::new("Create Polygon"));
+            record_menu_item_state("panel:Create Polygon", &create, create_ready);
+            if create.clicked() {
+                action = Some(MeshAction::CreatePolygon);
+            }
+            let optimize_ready = self.mesh_optimize_ready();
+            let optimize = ui.add_enabled(optimize_ready, egui::Button::new("Optimize"));
+            record_menu_item_state("panel:Optimize", &optimize, optimize_ready);
+            if optimize.clicked() {
+                action = Some(MeshAction::Optimize);
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.mesh_optimize_tolerance)
+                    .speed(0.0005)
+                    .range(0.0..=1.0)
+                    .prefix("Tolerance "),
+            );
+            let slide_ready = self.mesh_point_slide_ready();
+            let slide = ui.add_enabled(slide_ready, egui::Button::new("Point Slide"));
+            record_menu_item_state("panel:PointSlide", &slide, slide_ready);
+            if slide.clicked() {
+                action = Some(MeshAction::PointSlide);
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.mesh_slide_fraction)
+                    .speed(0.01)
+                    .range(0.0..=1.0)
+                    .prefix("Fraction "),
+            );
             let bridge_ready = self.mesh_bridge_ready();
             let bridge = ui.add_enabled(bridge_ready, egui::Button::new("Bridge Selected Loops"));
             record_menu_item_state("panel:Bridge Loops", &bridge, bridge_ready);
@@ -1097,6 +1763,124 @@ impl LeopardApp {
                 action = Some(MeshAction::Bridge);
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            let fill_ready = self.mesh_fill_hole_ready();
+            let fill = ui.add_enabled(fill_ready, egui::Button::new("Fill Hole"));
+            record_menu_item_state("panel:Fill Hole", &fill, fill_ready);
+            if fill.clicked() {
+                action = Some(MeshAction::FillHole);
+            }
+            let holes = self.selected_hole_count();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{holes} open hole{} under the selection",
+                    if holes == 1 { "" } else { "s" }
+                ))
+                .small()
+                .weak(),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            let split_ready = self.mesh_split_ready();
+            let split = ui.add_enabled(split_ready, egui::Button::new("Split"));
+            record_menu_item_state("panel:Split", &split, split_ready);
+            if split.clicked() {
+                action = Some(MeshAction::Split);
+            }
+            let parts = self.selected_split_polygon_count();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{parts} selected polygon{} to split",
+                    if parts == 1 { "" } else { "s" }
+                ))
+                .small()
+                .weak(),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut self.mesh_shell_thickness)
+                    .speed(0.005)
+                    .range(0.0..=100000.0)
+                    .prefix("Shell "),
+            );
+            ui.checkbox(&mut self.mesh_shell_inside, "Inside");
+            ui.add(
+                egui::DragValue::new(&mut self.mesh_shell_angle)
+                    .speed(1.0)
+                    .range(0.0..=180.0)
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.mesh_shell_quantize)
+                    .speed(0.005)
+                    .range(0.0..=100000.0)
+                    .prefix("Quantize "),
+            );
+            let shell_ready = self.mesh_shell_ready();
+            let shell = ui.add_enabled(shell_ready, egui::Button::new("Shell"));
+            record_menu_item_state("panel:Shell", &shell, shell_ready);
+            if shell.clicked() {
+                action = Some(MeshAction::Shell);
+            }
+            let region = self.selected_shell_face_count();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{region} polygon{} in the shell region",
+                    if region == 1 { "" } else { "s" }
+                ))
+                .small()
+                .weak(),
+            );
+        });
+        if self.mesh_select_mode == MeshSelectMode::Edges {
+            ui.horizontal_wrapped(|ui| {
+                let edge_ready = self.mesh_topology_ready(MeshSelectMode::Edges, 1);
+                let edges = mesh.edges();
+                let creased = edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, edge)| {
+                        self.mesh_selected.contains(&(*index as u32))
+                            && mesh.is_crease(edge.a, edge.b)
+                    })
+                    .count();
+                let seamed = edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, edge)| {
+                        self.mesh_selected.contains(&(*index as u32))
+                            && mesh.is_seam(edge.a, edge.b)
+                    })
+                    .count();
+                let crease = ui.add_enabled(edge_ready, egui::Button::new("Toggle Crease"));
+                record_menu_item_state("panel:Toggle Crease", &crease, edge_ready);
+                if crease.clicked() {
+                    action = Some(MeshAction::ToggleCrease);
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{creased}/{} selected edges creased",
+                        self.mesh_selected.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+                let seam = ui.add_enabled(edge_ready, egui::Button::new("Toggle Seam"));
+                record_menu_item_state("panel:Toggle Seam", &seam, edge_ready);
+                if seam.clicked() {
+                    action = Some(MeshAction::ToggleSeam);
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{seamed}/{} selected edges are UV seams",
+                        self.mesh_selected.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+        }
         if self.mesh_select_mode == MeshSelectMode::Polygons && !self.mesh_selected.is_empty() {
             ui.separator();
             let material_name = self
@@ -1145,6 +1929,8 @@ fn primitive_icon(primitive: &Primitive) -> Icon {
         Primitive::Box { .. } => Icon::Box,
         Primitive::Sphere { .. } => Icon::Ball,
         Primitive::Cylinder { .. } => Icon::Cylinder,
+        Primitive::Capsule { .. } => Icon::Cylinder,
+        Primitive::Disc { .. } => Icon::Plane,
         Primitive::Cone { .. } => Icon::Cone,
         Primitive::Torus { .. } => Icon::Torus,
         Primitive::Plane { .. } => Icon::Plane,
@@ -1164,7 +1950,7 @@ fn node_icon(kind: &NodeKind) -> Icon {
         NodeKind::Camera { .. } => Icon::Camera,
         NodeKind::Light { light } => match light.kind {
             LightKind::Directional => Icon::DirectionalLight,
-            LightKind::Point { .. } => Icon::PointLight,
+            LightKind::Point { .. } | LightKind::Spot { .. } => Icon::PointLight,
             LightKind::Area { .. } => Icon::AreaLight,
         },
         NodeKind::Joint { .. } => Icon::Joint,
@@ -1814,8 +2600,19 @@ impl LeopardApp {
                     .animation
                     .tracks
                     .iter()
-                    .map(|t| t.curve.keys.len())
-                    .sum();
+                    .map(|track| track.curve.keys.len())
+                    .sum::<usize>()
+                    + node
+                        .animation
+                        .rotation
+                        .as_ref()
+                        .map_or(0, |track| track.keys.len())
+                    + node
+                        .animation
+                        .morph_weights
+                        .values()
+                        .map(|curve| curve.keys.len())
+                        .sum::<usize>();
                 let times = node.animation.key_times();
                 Some((
                     id,
@@ -1832,6 +2629,49 @@ impl LeopardApp {
                 "No animated objects yet\nKey transforms to create a take",
             );
             return;
+        }
+        let selected_take = self.selection.primary().and_then(|selected_id| {
+            takes
+                .iter()
+                .find(|(id, _, _, _, _)| *id == selected_id)
+                .map(|(id, name, _, _, _)| (*id, name.clone()))
+        });
+        if let Some((take_id, take_name)) = selected_take {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Retime take ×")
+                        .size(9.5)
+                        .color(theme::TEXT_WEAK),
+                );
+                let mut factor = self.retime_factor;
+                ui.add(
+                    egui::DragValue::new(&mut factor)
+                        .speed(0.01)
+                        .range(0.01..=100.0)
+                        .max_decimals(3),
+                );
+                let ready = (factor - 1.0).abs() > 1e-6;
+                if ui
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(egui::RichText::new("Retime Take").size(9.0)),
+                    )
+                    .on_hover_text(format!(
+                        "Scale every key in {take_name} around 0 seconds; fractional times are preserved"
+                    ))
+                    .clicked()
+                {
+                    self.retime_factor = factor;
+                    self.retime_animation_take(take_id, factor);
+                } else {
+                    self.retime_factor = factor;
+                }
+            });
+            ui.label(
+                egui::RichText::new("Pivot: 0s. Collisions reject the whole edit.")
+                    .size(9.0)
+                    .color(theme::TEXT_WEAK),
+            );
         }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1913,6 +2753,21 @@ impl LeopardApp {
                 }
             });
     }
+}
+
+fn modifier_axis_combo(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    axis: &mut u8,
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(["X", "Y", "Z"][(*axis as usize).min(2)])
+        .width(44.0)
+        .show_ui(ui, |ui| {
+            for (value, label) in [(0u8, "X"), (1, "Y"), (2, "Z")] {
+                ui.selectable_value(axis, value, label);
+            }
+        });
 }
 
 fn modifier_is_boolean(modifier: &Modifier) -> bool {
@@ -2053,6 +2908,15 @@ mod node_icon_tests {
                 height: 1.0,
             })),
             Icon::AreaLight
+        );
+        // Spot lights share the point-light glyph; the inspector names the kind.
+        assert_eq!(
+            node_icon(&light(LightKind::Spot {
+                radius: 1.0,
+                inner_deg: 15.0,
+                outer_deg: 30.0,
+            })),
+            Icon::PointLight
         );
     }
 }

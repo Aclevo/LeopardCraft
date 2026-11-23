@@ -8,7 +8,15 @@
 use glam::{Mat4, Vec2, Vec3};
 use lc_core::{Aabb, StableHasher};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+fn canonical_edge(a: u32, b: u32) -> [u32; 2] {
+    if a < b {
+        [a, b]
+    } else {
+        [b, a]
+    }
+}
 
 /// One polygon corner: a point reference plus an independent UV reference.
 /// UV seams therefore do not require duplicating points.
@@ -60,6 +68,20 @@ pub struct Mesh {
     pub uvs: Vec<Vec2>,
     #[serde(default)]
     pub polygons: Vec<Polygon>,
+    /// Authored sharp edges as canonical undirected point pairs. Creases are
+    /// honoured by Catmull-Clark and Stam-Loop subdivision and ignored by
+    /// linear subdivision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creases: Vec<[u32; 2]>,
+    /// Authored UV seams as canonical undirected point pairs. Automatic unwrap
+    /// cuts the mesh along these edges, so a seam is a chart border even where
+    /// the neighbouring faces point the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seams: Vec<[u32; 2]>,
+    /// Pinned UV slots: indices into `uvs` whose coordinate unwrap, relax and
+    /// normalize must leave exactly where the user put it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_uvs: Vec<u32>,
 }
 
 /// Flat render triangle with corner attributes.
@@ -68,6 +90,11 @@ pub struct RenderVertex {
     pub position: Vec3,
     pub normal: Vec3,
     pub uv: Vec2,
+    /// Source mesh point, used by exporters to copy skin weights and morph
+    /// deltas onto the expanded render vertex.
+    pub point: u32,
+    /// Source polygon corner inside `RenderTriangle::polygon`.
+    pub corner: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -382,6 +409,8 @@ impl Mesh {
                     position: Vec3::ZERO,
                     normal: Vec3::Y,
                     uv: Vec2::ZERO,
+                    point: 0,
+                    corner: 0,
                 }; 3];
                 for k in 0..3 {
                     let c = &poly.corners[tri[k]];
@@ -389,6 +418,8 @@ impl Mesh {
                         position: self.positions[c.point as usize],
                         normal: normals[pi][tri[k]],
                         uv: self.uv_of(c),
+                        point: c.point,
+                        corner: tri[k] as u32,
                     };
                 }
                 out.push(RenderTriangle {
@@ -512,6 +543,23 @@ impl Mesh {
                 material_slot: p.material_slot,
             }
         }));
+        self.creases.extend(
+            other
+                .creases
+                .iter()
+                .map(|[a, b]| [a + point_offset, b + point_offset]),
+        );
+        self.seams.extend(
+            other
+                .seams
+                .iter()
+                .map(|[a, b]| [a + point_offset, b + point_offset]),
+        );
+        self.pinned_uvs
+            .extend(other.pinned_uvs.iter().map(|slot| slot + uv_offset));
+        self.normalize_creases();
+        self.normalize_seams();
+        self.normalize_pinned_uvs();
     }
 
     /// Merge points within `epsilon` using a spatial hash. UVs live on corners
@@ -564,11 +612,19 @@ impl Mesh {
         }
         self.positions = new_positions;
         self.polygons.retain(|p| p.is_valid());
+        self.remap_edge_marks(&remap);
         self.compact_points();
     }
 
     /// Remove points no polygon references.
     pub fn compact_points(&mut self) {
+        self.compact_points_with_remap();
+    }
+
+    /// Remove points no polygon references and report where each old point
+    /// went (`u32::MAX` marks a point that was dropped), so a caller can follow
+    /// one specific point through the rebuild.
+    pub fn compact_points_with_remap(&mut self) -> Vec<u32> {
         let mut used = vec![false; self.positions.len()];
         for p in &self.polygons {
             for c in &p.corners {
@@ -586,7 +642,7 @@ impl Mesh {
             }
         }
         if new_positions.len() == self.positions.len() {
-            return;
+            return (0..self.positions.len() as u32).collect();
         }
         for poly in &mut self.polygons {
             for c in &mut poly.corners {
@@ -594,6 +650,179 @@ impl Mesh {
             }
         }
         self.positions = new_positions;
+        self.remap_edge_marks(&remap);
+        remap
+    }
+
+    /// Merge the given points into one point at their centroid.
+    ///
+    /// This is the topology half of Cheetah3D's Collapse tool, shared with the
+    /// editor's Weld command. The lowest selected index survives and every face
+    /// that used one of the merged points uses it instead. Adjacent duplicate
+    /// corners are folded first, so a quad that loses a corner becomes a
+    /// triangle; a face that still repeats a point, or drops below three
+    /// corners, is deleted rather than left pinched. Creases and seams follow
+    /// the surviving indices (a mark with both endpoints merged disappears),
+    /// pins on UV slots no corner uses any more are dropped, and unused points
+    /// are compacted away. Returns the survivor's index in the rebuilt mesh, or
+    /// `None` when fewer than two points were selected or no face survived to
+    /// use the merged point.
+    pub fn merge_points(&mut self, points: &[u32]) -> Option<u32> {
+        let mut selected: Vec<u32> = points
+            .iter()
+            .copied()
+            .filter(|p| (*p as usize) < self.positions.len())
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        if selected.len() < 2 {
+            return None;
+        }
+        let centroid = selected
+            .iter()
+            .map(|p| self.positions[*p as usize])
+            .sum::<Vec3>()
+            / selected.len() as f32;
+        let target = selected[0];
+        self.positions[target as usize] = centroid;
+        let merged: HashSet<u32> = selected.into_iter().collect();
+        for poly in &mut self.polygons {
+            for corner in &mut poly.corners {
+                if merged.contains(&corner.point) {
+                    corner.point = target;
+                }
+            }
+        }
+        let remap = self.finish_point_merge();
+        remap
+            .get(target as usize)
+            .copied()
+            .filter(|index| *index != u32::MAX)
+    }
+
+    /// Weld the selected points that sit within `epsilon` of each other.
+    ///
+    /// This is the topology half of Cheetah3D's Optimize tool, shared with the
+    /// matching logic of `weld`. Only the given points are grouped, so unselected
+    /// points stay exactly as authored. Points are visited in index order and each
+    /// joins the first earlier survivor inside the tolerance, which keeps the
+    /// result independent of the order they were selected in, and the survivor
+    /// keeps its authored position. Returns the rebuilt indices of every selected
+    /// point (merged points fold onto their survivor), or `None` when fewer than
+    /// two points are given, the tolerance is not a positive finite number, or no
+    /// two selected points are close enough to merge.
+    pub fn weld_points(&mut self, points: &[u32], epsilon: f32) -> Option<Vec<u32>> {
+        let (map, _) = weld_groups(&self.positions, points, epsilon)?;
+        let mut selected: Vec<u32> = points
+            .iter()
+            .copied()
+            .filter(|p| (*p as usize) < self.positions.len())
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        for poly in &mut self.polygons {
+            for corner in &mut poly.corners {
+                corner.point = map[corner.point as usize];
+            }
+        }
+        let remap = self.finish_point_merge();
+        let mut survivors: Vec<u32> = selected
+            .iter()
+            .filter_map(|p| remap.get(*p as usize).copied())
+            .filter(|index| *index != u32::MAX)
+            .collect();
+        survivors.sort_unstable();
+        survivors.dedup();
+        Some(survivors)
+    }
+
+    /// Whether `weld_points` would merge at least one cluster.
+    pub fn can_weld_points(&self, points: &[u32], epsilon: f32) -> bool {
+        weld_groups(&self.positions, points, epsilon).is_some()
+    }
+
+    /// Slide the selected points a fraction of the way toward their neighbours.
+    ///
+    /// This is the geometry half of Cheetah3D's Point Slide tool: each selected
+    /// point moves `fraction` of the distance toward the centroid of the points
+    /// its edges directly connect it to, measured from the positions before the
+    /// move so the result never depends on the order the points are visited in.
+    /// A point with exactly two neighbours lands on the midpoint of the segment
+    /// between them at `fraction = 1`. Only the selected positions change: no
+    /// face, UV slot, material slot, crease, seam or pin is touched and no index
+    /// moves. Returns whether any point actually moved.
+    pub fn slide_points(&mut self, points: &[u32], fraction: f32) -> bool {
+        if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+            return false;
+        }
+        let neighbours = neighbour_lists(self);
+        let original = self.positions.clone();
+        let mut moved = false;
+        for point in selected_points(&original, points) {
+            let Some(list) = neighbours.get(point as usize) else {
+                continue;
+            };
+            if list.is_empty() {
+                continue;
+            }
+            let centroid = list
+                .iter()
+                .map(|neighbour| original[*neighbour as usize])
+                .sum::<Vec3>()
+                / list.len() as f32;
+            let target = original[point as usize].lerp(centroid, fraction);
+            if target != original[point as usize] {
+                self.positions[point as usize] = target;
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// Whether `slide_points` would move at least one selected point.
+    pub fn can_slide_points(&self, points: &[u32], fraction: f32) -> bool {
+        if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
+            return false;
+        }
+        let neighbours = neighbour_lists(self);
+        selected_points(&self.positions, points)
+            .into_iter()
+            .any(|point| {
+                neighbours
+                    .get(point as usize)
+                    .is_some_and(|list| !list.is_empty())
+            })
+    }
+
+    /// Shared rebuild after a point merge: fold adjacent duplicate corners,
+    /// delete faces that repeat a point or fall below three corners, compact
+    /// unused points (which remaps creases and seams), and drop pins on UV slots
+    /// no corner uses any more. Returns the point remap from compaction.
+    fn finish_point_merge(&mut self) -> Vec<u32> {
+        for poly in &mut self.polygons {
+            dedup_corners(&mut poly.corners);
+        }
+        self.polygons.retain(|poly| {
+            if poly.corners.len() < 3 {
+                return false;
+            }
+            let mut points: Vec<u32> = poly.corners.iter().map(|c| c.point).collect();
+            points.sort_unstable();
+            points.dedup();
+            points.len() == poly.corners.len()
+        });
+        let remap = self.compact_points_with_remap();
+        let mut used_uvs: Vec<u32> = self
+            .polygons
+            .iter()
+            .flat_map(|poly| poly.corners.iter().map(|c| c.uv))
+            .collect();
+        used_uvs.sort_unstable();
+        used_uvs.dedup();
+        self.pinned_uvs
+            .retain(|slot| used_uvs.binary_search(slot).is_ok());
+        self.normalize_pinned_uvs();
+        remap
     }
 
     pub fn remove_degenerate_polygons(&mut self) {
@@ -615,6 +844,95 @@ impl Mesh {
         for poly in &mut self.polygons {
             poly.corners.reverse();
         }
+    }
+
+    /// Whether the edge between two points is marked as a crease.
+    pub fn is_crease(&self, a: u32, b: u32) -> bool {
+        edge_marked(&self.creases, a, b)
+    }
+
+    /// Add or remove a crease. Returns whether the mesh changed.
+    pub fn set_crease(&mut self, a: u32, b: u32, creased: bool) -> bool {
+        set_edge_marked(&mut self.creases, a, b, creased)
+    }
+
+    /// Toggle one edge's crease state and return the new state.
+    pub fn toggle_crease(&mut self, a: u32, b: u32) -> bool {
+        let creased = !self.is_crease(a, b);
+        self.set_crease(a, b, creased);
+        creased
+    }
+
+    /// Whether the edge between two points is marked as a UV seam.
+    pub fn is_seam(&self, a: u32, b: u32) -> bool {
+        edge_marked(&self.seams, a, b)
+    }
+
+    /// Add or remove a seam. Returns whether the mesh changed.
+    pub fn set_seam(&mut self, a: u32, b: u32, seam: bool) -> bool {
+        set_edge_marked(&mut self.seams, a, b, seam)
+    }
+
+    /// Toggle one edge's seam state and return the new state.
+    pub fn toggle_seam(&mut self, a: u32, b: u32) -> bool {
+        let seam = !self.is_seam(a, b);
+        self.set_seam(a, b, seam);
+        seam
+    }
+
+    /// Remove duplicate, degenerate and out-of-range crease entries and keep
+    /// the list sorted so `is_crease` can use a binary search.
+    pub fn normalize_creases(&mut self) {
+        normalize_edge_marks(&mut self.creases, self.positions.len());
+    }
+
+    /// Same repair for seams, so `is_seam` can use a binary search.
+    pub fn normalize_seams(&mut self) {
+        normalize_edge_marks(&mut self.seams, self.positions.len());
+    }
+
+    /// Whether a UV slot is pinned.
+    pub fn is_uv_pinned(&self, slot: u32) -> bool {
+        self.pinned_uvs.binary_search(&slot).is_ok()
+    }
+
+    /// Add or remove a UV pin. Returns whether the mesh changed.
+    pub fn set_uv_pinned(&mut self, slot: u32, pinned: bool) -> bool {
+        let existing = self.is_uv_pinned(slot);
+        if pinned == existing {
+            return false;
+        }
+        if pinned {
+            let index = self.pinned_uvs.partition_point(|s| *s < slot);
+            self.pinned_uvs.insert(index, slot);
+        } else if let Ok(index) = self.pinned_uvs.binary_search(&slot) {
+            self.pinned_uvs.remove(index);
+        }
+        true
+    }
+
+    /// Toggle one UV slot's pin state and return the new state.
+    pub fn toggle_uv_pinned(&mut self, slot: u32) -> bool {
+        let pinned = !self.is_uv_pinned(slot);
+        self.set_uv_pinned(slot, pinned);
+        pinned
+    }
+
+    /// Drop duplicate and out-of-range UV pins and keep the list sorted so
+    /// `is_uv_pinned` can use a binary search.
+    pub fn normalize_pinned_uvs(&mut self) {
+        let count = self.uvs.len() as u32;
+        self.pinned_uvs.retain(|slot| *slot < count);
+        self.pinned_uvs.sort_unstable();
+        self.pinned_uvs.dedup();
+    }
+
+    /// Follow point renumbering through both edge-marker lists.
+    fn remap_edge_marks(&mut self, remap: &[u32]) {
+        remap_marks(&mut self.creases, remap);
+        remap_marks(&mut self.seams, remap);
+        self.normalize_creases();
+        self.normalize_seams();
     }
 
     /// Structural validation used by tests and after imports.
@@ -680,6 +998,20 @@ impl Mesh {
                 h.write_u32(c.uv);
             }
         }
+        h.write_u64(self.creases.len() as u64);
+        for [a, b] in &self.creases {
+            h.write_u32(*a);
+            h.write_u32(*b);
+        }
+        h.write_u64(self.seams.len() as u64);
+        for [a, b] in &self.seams {
+            h.write_u32(*a);
+            h.write_u32(*b);
+        }
+        h.write_u64(self.pinned_uvs.len() as u64);
+        for slot in &self.pinned_uvs {
+            h.write_u32(*slot);
+        }
         h.finish()
     }
 
@@ -690,6 +1022,122 @@ impl Mesh {
             .map(|t| [t.v[0].position, t.v[1].position, t.v[2].position])
             .collect()
     }
+}
+
+fn edge_marked(list: &[[u32; 2]], a: u32, b: u32) -> bool {
+    list.binary_search(&canonical_edge(a, b)).is_ok()
+}
+
+fn set_edge_marked(list: &mut Vec<[u32; 2]>, a: u32, b: u32, marked: bool) -> bool {
+    if a == b {
+        return false;
+    }
+    let key = canonical_edge(a, b);
+    let existing = list.binary_search(&key).is_ok();
+    if marked == existing {
+        return false;
+    }
+    if marked {
+        let index = list.partition_point(|edge| *edge < key);
+        list.insert(index, key);
+    } else if let Ok(index) = list.binary_search(&key) {
+        list.remove(index);
+    }
+    true
+}
+
+fn normalize_edge_marks(list: &mut Vec<[u32; 2]>, point_count: usize) {
+    let n = point_count as u32;
+    list.retain(|[a, b]| a != b && *a < n && *b < n);
+    for edge in list.iter_mut() {
+        *edge = canonical_edge(edge[0], edge[1]);
+    }
+    list.sort_unstable();
+    list.dedup();
+}
+
+fn remap_marks(list: &mut Vec<[u32; 2]>, remap: &[u32]) {
+    let mut next = Vec::with_capacity(list.len());
+    for [a, b] in list.iter() {
+        let mapped = remap
+            .get(*a as usize)
+            .zip(remap.get(*b as usize))
+            .map(|(&a, &b)| canonical_edge(a, b));
+        if let Some(edge) = mapped {
+            if edge[0] != edge[1] {
+                next.push(edge);
+            }
+        }
+    }
+    *list = next;
+}
+
+/// Sorted, de-duplicated, in-range selection of points.
+fn selected_points(positions: &[Vec3], points: &[u32]) -> Vec<u32> {
+    let mut selected: Vec<u32> = points
+        .iter()
+        .copied()
+        .filter(|point| (*point as usize) < positions.len())
+        .collect();
+    selected.sort_unstable();
+    selected.dedup();
+    selected
+}
+
+/// Point indices connected by a polygon edge, sorted and de-duplicated.
+fn neighbour_lists(mesh: &Mesh) -> Vec<Vec<u32>> {
+    let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); mesh.positions.len()];
+    for edge in mesh.edges() {
+        if let Some(list) = neighbours.get_mut(edge.a as usize) {
+            list.push(edge.b);
+        }
+        if let Some(list) = neighbours.get_mut(edge.b as usize) {
+            list.push(edge.a);
+        }
+    }
+    for list in &mut neighbours {
+        list.sort_unstable();
+        list.dedup();
+    }
+    neighbours
+}
+
+/// Group the selected points that lie within `epsilon` of each other.
+///
+/// Returns the point remap plus the surviving representatives, or `None` when
+/// there is nothing to merge. Greedy first-fit in index order keeps the result
+/// deterministic and independent of the order the points were picked in.
+fn weld_groups(positions: &[Vec3], points: &[u32], epsilon: f32) -> Option<(Vec<u32>, Vec<u32>)> {
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return None;
+    }
+    let mut selected: Vec<u32> = points
+        .iter()
+        .copied()
+        .filter(|p| (*p as usize) < positions.len())
+        .collect();
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.len() < 2 {
+        return None;
+    }
+    let total = selected.len();
+    let mut map: Vec<u32> = (0..positions.len() as u32).collect();
+    let mut survivors: Vec<u32> = Vec::new();
+    for point in selected {
+        let position = positions[point as usize];
+        match survivors
+            .iter()
+            .find(|survivor| positions[**survivor as usize].distance(position) <= epsilon)
+        {
+            Some(&survivor) => map[point as usize] = survivor,
+            None => survivors.push(point),
+        }
+    }
+    if survivors.len() == total {
+        return None;
+    }
+    Some((map, survivors))
 }
 
 fn dedup_corners(corners: &mut Vec<Corner>) {
@@ -740,6 +1188,89 @@ mod tests {
         let tris = mesh.polygon_triangles(0);
         assert_eq!(tris.len(), 3);
         assert!(mesh.validate().is_ok());
+    }
+
+    #[test]
+    fn creases_toggle_canonically_and_survive_compaction() {
+        let mut mesh = Mesh::from_polygons(
+            "quad",
+            vec![
+                Vec3::new(-1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(-1.0, 0.0, 1.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        );
+        assert!(mesh.set_crease(3, 1, true));
+        assert!(mesh.is_crease(1, 3));
+        assert_eq!(mesh.creases, vec![[1, 3]]);
+        assert!(!mesh.set_crease(1, 3, true));
+        assert!(!mesh.toggle_crease(1, 3));
+        assert!(mesh.creases.is_empty());
+
+        assert!(mesh.set_crease(0, 1, true));
+        mesh.add_point(Vec3::new(5.0, 0.0, 5.0));
+        assert!(mesh.set_crease(1, 4, true));
+        mesh.compact_points();
+        assert_eq!(mesh.positions.len(), 4);
+        assert_eq!(mesh.creases, vec![[0, 1]]);
+    }
+
+    #[test]
+    fn seams_mark_canonically_and_survive_compaction_and_merge() {
+        let mut mesh = quad_grid();
+        assert!(mesh.set_seam(1, 0, true));
+        assert!(mesh.is_seam(0, 1));
+        assert_eq!(mesh.seams, vec![[0, 1]]);
+        assert!(!mesh.set_seam(0, 1, true));
+        assert!(!mesh.toggle_seam(1, 0));
+        assert!(mesh.seams.is_empty());
+
+        assert!(mesh.set_seam(1, 2, true));
+        assert!(mesh.set_crease(1, 2, true));
+        assert!(mesh.is_crease(1, 2), "creases and seams stay independent");
+        mesh.add_point(Vec3::new(9.0, 0.0, 9.0));
+        assert!(mesh.set_seam(2, 6, true));
+        mesh.compact_points();
+        assert_eq!(mesh.positions.len(), 6);
+        assert_eq!(mesh.seams, vec![[1, 2]]);
+        assert_eq!(mesh.creases, vec![[1, 2]]);
+
+        let mut other = crate::primitives::box_mesh(1.0, 1.0, 1.0);
+        assert!(other.set_seam(0, 1, true));
+        let offset = mesh.positions.len() as u32;
+        mesh.merge(&other, Mat4::IDENTITY);
+        assert_eq!(mesh.seams, vec![[1, 2], [offset, offset + 1]]);
+    }
+
+    #[test]
+    fn uv_pins_toggle_canonically_and_survive_merge() {
+        let mut mesh = quad_grid();
+        mesh.uvs = vec![Vec2::ZERO, Vec2::new(0.5, 0.5)];
+        assert!(mesh.set_uv_pinned(1, true));
+        assert!(mesh.is_uv_pinned(1));
+        assert!(!mesh.set_uv_pinned(1, true));
+        assert!(!mesh.toggle_uv_pinned(1));
+        assert!(mesh.pinned_uvs.is_empty());
+
+        assert!(mesh.set_uv_pinned(0, true));
+        let before = mesh.signature();
+        assert!(mesh.set_uv_pinned(1, true));
+        assert_ne!(before, mesh.signature(), "pins are part of the signature");
+        assert_eq!(mesh.pinned_uvs, vec![0, 1]);
+
+        mesh.pinned_uvs = vec![1, 1, 7];
+        mesh.normalize_pinned_uvs();
+        assert_eq!(mesh.pinned_uvs, vec![1], "out-of-range pins are dropped");
+
+        let mut other = quad_grid();
+        other.uvs = vec![Vec2::new(0.25, 0.25)];
+        assert!(other.set_uv_pinned(0, true));
+        let uv_offset = mesh.uvs.len() as u32;
+        mesh.merge(&other, Mat4::IDENTITY);
+        assert_eq!(mesh.pinned_uvs, vec![1, uv_offset]);
+        assert_eq!(mesh.uvs.len() as u32, uv_offset + 1);
     }
 
     #[test]

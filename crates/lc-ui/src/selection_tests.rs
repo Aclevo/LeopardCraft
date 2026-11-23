@@ -56,7 +56,9 @@ fn test_app(label: &str) -> (LeopardApp, TestRoot) {
         selected_uv: None,
         anim_target: None,
         selected_keys: Vec::new(),
+        retime_factor: 1.0,
         curve_key_drag: None,
+        curve_tangent_drag: None,
         curve_box_select: None,
         curve_clipboard: CurveClipboard::default(),
         selected_curve_channel: None,
@@ -112,6 +114,20 @@ fn test_app(label: &str) -> (LeopardApp, TestRoot) {
         mesh_depth: 0.05,
         mesh_offset: 0.0,
         mesh_extrude_individual: false,
+        mesh_shell_thickness: 0.1,
+        mesh_shell_inside: true,
+        mesh_shell_angle: 30.0,
+        mesh_shell_quantize: 0.0,
+        mesh_optimize_tolerance: 0.001,
+        mesh_slide_fraction: 0.5,
+        weight_paint: false,
+        weight_joint: None,
+        weight_brush: WeightBrush::default(),
+        bind_joints: None,
+        bind_auto_weights: true,
+        bind_dropoff: 2.0,
+        bind_strength: 0.6,
+        bind_max_influences: 4,
         last_viewport_rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)),
         last_viewport_size: Vec2::splat(100.0),
         object_row_rects: Vec::new(),
@@ -2686,6 +2702,446 @@ fn ring_cut_enablement_tracks_the_cut_plane_and_never_partially_cuts() {
 }
 
 #[test]
+fn edge_crease_toggle_is_one_undo_and_marks_the_selected_edges() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-crease-toggle",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Edges;
+    let edges = selected_mesh(&harness.app, cube).edges();
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0, 1]);
+    harness.app.mesh_selected = vec![0, 1];
+    let depth = harness.app.history.depth();
+
+    harness.app.perform_mesh_action(MeshAction::ToggleCrease);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert!(mesh.is_crease(edges[0].a, edges[0].b));
+    assert!(mesh.is_crease(edges[1].a, edges[1].b));
+    assert_eq!(mesh.creases.len(), 2);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(selected_mesh(&harness.app, cube).creases.is_empty());
+
+    harness.app.mesh_selected = vec![0, 1];
+    harness.app.mesh_components.insert(cube, vec![0, 1]);
+    harness.app.perform_mesh_action(MeshAction::ToggleCrease);
+    assert_eq!(selected_mesh(&harness.app, cube).creases.len(), 2);
+    harness.app.perform_mesh_action(MeshAction::ToggleCrease);
+    assert!(
+        !selected_mesh(&harness.app, cube).is_crease(edges[0].a, edges[0].b),
+        "toggling the same edge twice must remove the crease"
+    );
+    assert_eq!(harness.app.history.depth(), depth + 2);
+}
+
+#[test]
+fn edge_seam_toggle_is_one_undo_and_marks_the_selected_edges() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-seam-toggle",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Edges;
+    let edges = selected_mesh(&harness.app, cube).edges();
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0, 1]);
+    harness.app.mesh_selected = vec![0, 1];
+    let depth = harness.app.history.depth();
+
+    harness.app.perform_mesh_action(MeshAction::ToggleSeam);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert!(mesh.is_seam(edges[0].a, edges[0].b));
+    assert!(mesh.is_seam(edges[1].a, edges[1].b));
+    assert_eq!(mesh.seams.len(), 2);
+    assert!(
+        mesh.creases.is_empty(),
+        "marking seams must not mark creases"
+    );
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(selected_mesh(&harness.app, cube).seams.is_empty());
+
+    harness.app.mesh_selected = vec![0, 1];
+    harness.app.mesh_components.insert(cube, vec![0, 1]);
+    harness.app.perform_mesh_action(MeshAction::ToggleSeam);
+    assert_eq!(selected_mesh(&harness.app, cube).seams.len(), 2);
+    harness.app.perform_mesh_action(MeshAction::ToggleSeam);
+    assert!(
+        selected_mesh(&harness.app, cube).seams.is_empty(),
+        "toggling the same edges twice must remove the seams"
+    );
+    assert_eq!(harness.app.history.depth(), depth + 2);
+}
+
+#[test]
+fn toggle_pinned_uv_is_one_undo_and_needs_a_selected_uv_point() {
+    let (mut harness, _root) =
+        InputHarness::new("input-uv-pin", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.selected_uv = None;
+    assert!(
+        !harness.app.uv_pin_ready(),
+        "the pin command needs a selected UV point"
+    );
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(harness.app.status.contains("Select a UV point"));
+
+    harness.app.selected_uv = Some(2);
+    assert!(harness.app.uv_pin_ready());
+    harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert!(mesh.is_uv_pinned(2));
+    assert_eq!(mesh.pinned_uvs, vec![2]);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(selected_mesh(&harness.app, cube).pinned_uvs.is_empty());
+
+    harness.app.selected_uv = Some(2);
+    harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
+    assert!(selected_mesh(&harness.app, cube).is_uv_pinned(2));
+    harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
+    assert!(
+        selected_mesh(&harness.app, cube).pinned_uvs.is_empty(),
+        "toggling the same UV point twice unpins it"
+    );
+    assert_eq!(harness.app.history.depth(), depth + 2);
+}
+
+#[test]
+fn fill_hole_is_one_undo_and_gated_on_a_hole_border() {
+    let (mut harness, _root) =
+        InputHarness::new("input-fill-hole", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    let removed = base.polygons.remove(0);
+    let border: Vec<u32> = removed.corners.iter().map(|c| c.point).collect();
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+
+    // A point away from the hole cannot select a border, so the tool refuses.
+    let off_border = (0u32..8)
+        .find(|p| !border.contains(p))
+        .expect("a box has points off the removed face");
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![off_border]);
+    harness.app.mesh_selected = vec![off_border];
+    assert!(!harness.app.mesh_fill_hole_ready());
+    assert_eq!(harness.app.selected_hole_count(), 0);
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::FillHole);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("hole border"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // One border point is enough, as with the documented click-driven tool.
+    harness.app.mesh_components.insert(cube, vec![border[0]]);
+    harness.app.mesh_selected = vec![border[0]];
+    assert!(harness.app.mesh_fill_hole_ready());
+    assert_eq!(harness.app.selected_hole_count(), 1);
+    harness.app.perform_mesh_action(MeshAction::FillHole);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.polygons.len(), 6);
+    assert!(mesh.boundary_loops().is_empty(), "the hole is closed");
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.polygons.len(), 5);
+    assert_eq!(mesh.boundary_loops().len(), 1);
+}
+
+#[test]
+fn split_is_polygon_mode_only_and_one_undo_per_copy() {
+    let (mut harness, _root) =
+        InputHarness::new("input-split", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Source 39: the tool is "only available in polygon mode".
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0, 1, 2, 3]);
+    harness.app.mesh_selected = vec![0, 1, 2, 3];
+    assert!(!harness.app.mesh_split_ready());
+    harness.open_menu("menu:Tools");
+    assert!(!harness.menu_item("Tools:Split").1);
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::Split);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("polygon mode"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, vec![0, 1]);
+    harness.app.mesh_selected = vec![0, 1];
+    assert!(harness.app.mesh_split_ready());
+    assert_eq!(harness.app.selected_split_polygon_count(), 2);
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    assert!(
+        harness.menu_item("Tools:Split").1,
+        "polygon mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+
+    // Source 39 copies "all tags and selections" to the new object.
+    {
+        let node = harness.app.doc.scene.get_mut(cube).unwrap();
+        node.transform = lc_core::Transform::from_translation(Vec3::new(4.0, 0.5, 0.0));
+        node.tags.push(lc_scene::Tag::RenderOverride {
+            visible: true,
+            casts_shadow: false,
+        });
+    }
+    let nodes = harness.app.doc.scene.depth_first().len();
+    harness.app.perform_mesh_action(MeshAction::Split);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step adds the copy"
+    );
+    assert_eq!(harness.app.doc.scene.depth_first().len(), nodes + 1);
+    assert!(
+        harness.app.mesh_selected.is_empty(),
+        "copied vertices get new indices"
+    );
+
+    let new_id = harness
+        .app
+        .selection
+        .primary()
+        .expect("the copy is selected");
+    assert_ne!(new_id, cube);
+    let copied = harness.app.doc.scene.get(new_id).unwrap();
+    assert_eq!(copied.name, "Cube Split");
+    assert_eq!(copied.transform.translation, Vec3::new(4.0, 0.5, 0.0));
+    assert_eq!(copied.tags.len(), 1);
+    let NodeKind::Mesh { geometry } = &copied.kind else {
+        panic!("expected a mesh node");
+    };
+    let copied_mesh = geometry.mesh().expect("the copy is an editable mesh");
+    assert_eq!(copied_mesh.polygons.len(), 2);
+    assert!(copied_mesh.validate().is_ok());
+    assert_eq!(
+        selected_mesh(&harness.app, cube).polygons.len(),
+        6,
+        "the source keeps every polygon"
+    );
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.scene.depth_first().len(), nodes);
+    assert!(harness.app.doc.scene.get(new_id).is_none());
+    assert_eq!(selected_mesh(&harness.app, cube).polygons.len(), 6);
+}
+
+#[test]
+fn triangulate_is_polygon_mode_gated_and_one_undo_per_action() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-triangulate",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Point mode is refused: no undo entry, and the command names the reason.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, vec![0, 1, 2, 3]);
+    harness.app.mesh_selected = vec![0, 1, 2, 3];
+    assert!(!harness.app.mesh_triangulate_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::Triangulate);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("polygon mode"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Polygon mode without a selection is refused too: there is nothing to split.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    assert!(!harness.app.mesh_triangulate_ready());
+    harness.app.perform_mesh_action(MeshAction::Triangulate);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("more than three corners"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // One selected quad: enabled, split into two triangles, one undo step.
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(harness.app.mesh_triangulate_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Triangulate").1,
+        "polygon mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    let positions = selected_mesh(&harness.app, cube).positions.clone();
+    harness.app.perform_mesh_action(MeshAction::Triangulate);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole operation"
+    );
+    {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert_eq!(mesh.polygons.len(), 7, "one quad became two triangles");
+        assert_eq!(
+            mesh.positions, positions,
+            "triangulating must not move points"
+        );
+        assert!(mesh.validate().is_ok());
+        assert_eq!(
+            mesh.polygons
+                .iter()
+                .filter(|p| p.corners.len() == 3)
+                .count(),
+            2
+        );
+    }
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(selected_mesh(&harness.app, cube).polygons.len(), 6);
+}
+
+#[test]
+fn shell_is_polygon_mode_gated_and_one_undo_per_action() {
+    let (mut harness, _root) =
+        InputHarness::new("input-shell", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_shell_thickness = 0.1;
+    harness.app.mesh_shell_inside = true;
+    harness.app.mesh_shell_angle = 30.0;
+    harness.app.mesh_shell_quantize = 0.0;
+
+    // Source 41: the tool is "only available in polygon mode".
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0, 1, 2, 3]);
+    harness.app.mesh_selected = vec![0, 1, 2, 3];
+    assert!(!harness.app.mesh_shell_ready());
+    harness.open_menu("menu:Tools");
+    assert!(!harness.menu_item("Tools:Shell").1);
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::Shell);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("polygon mode"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    let faces: Vec<u32> = (0..6).collect();
+    harness.app.mesh_components.insert(cube, faces.clone());
+    harness.app.mesh_selected = faces;
+    assert_eq!(harness.app.selected_shell_face_count(), 6);
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    assert!(
+        harness.menu_item("Tools:Shell").1,
+        "polygon mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+
+    // A zero distance cannot build a wall.
+    harness.app.mesh_shell_thickness = 0.0;
+    assert!(!harness.app.mesh_shell_ready());
+    harness.app.perform_mesh_action(MeshAction::Shell);
+    assert!(
+        harness.app.status.contains("thickness"),
+        "got {:?}",
+        harness.app.status
+    );
+    assert_eq!(harness.app.history.depth(), depth);
+
+    // A signed distance would quietly flip the documented Inside side.
+    harness.app.mesh_shell_thickness = -0.1;
+    assert!(!harness.app.mesh_shell_ready());
+    harness.app.perform_mesh_action(MeshAction::Shell);
+    assert!(
+        harness.app.status.contains("positive"),
+        "got {:?}",
+        harness.app.status
+    );
+    assert_eq!(harness.app.history.depth(), depth);
+
+    harness.app.mesh_shell_thickness = 0.1;
+    assert!(harness.app.mesh_shell_ready());
+    harness.app.perform_mesh_action(MeshAction::Shell);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step shells the selection"
+    );
+    assert!(harness.app.mesh_selected.is_empty(), "indices change");
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.polygons.len(), 12, "outer and inner shell");
+    assert_eq!(mesh.positions.len(), 16);
+    assert!(
+        mesh.boundary_loops().is_empty(),
+        "hollowing a closed solid adds no border"
+    );
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.polygons.len(), 6);
+    assert_eq!(mesh.positions.len(), 8);
+}
+
+#[test]
 fn weld_enablement_requires_distinct_points_on_every_mesh() {
     let (mut harness, _root) = InputHarness::new(
         "input-weld-parity",
@@ -3031,7 +3487,10 @@ fn modifier_add_and_remove_validate_through_the_same_predicates() {
     let cube = named(&app, "Cube");
     let panel = named(&app, "Checker Panel");
     let light = named(&app, "Key Light");
-    let subdivision = Modifier::Subdivision { levels: 1 };
+    let subdivision = Modifier::Subdivision {
+        levels: 1,
+        scheme: lc_scene::SubdivisionScheme::CatmullClark,
+    };
 
     app.selection.select_one(cube);
     let initial = app.doc.scene.get(cube).unwrap().modifiers.clone();
@@ -3130,7 +3589,7 @@ fn skin_binding_and_unbinding_share_their_predicate_and_refuse_noop_rebinds() {
     let before = app.doc.signature();
     let depth = app.history.depth();
     assert!(!skin_ready(&app));
-    assert!(!app.bind_skin_to_all_joints());
+    assert!(!app.bind_skin_to_joints());
     assert_eq!(app.doc.signature(), before);
     assert_eq!(app.history.depth(), depth);
 
@@ -3138,14 +3597,17 @@ fn skin_binding_and_unbinding_share_their_predicate_and_refuse_noop_rebinds() {
     app.selection.select_one(cube);
     assert!(skin_ready(&app));
     let depth = app.history.depth();
-    assert!(app.bind_skin_to_all_joints());
+    assert!(app.bind_skin_to_joints());
     assert!(app.doc.scene.get(cube).unwrap().skin.is_some());
     assert_eq!(app.history.depth(), depth + 1);
 
-    assert!(!skin_ready(&app), "an identical rebind has no effect");
+    assert!(
+        skin_ready(&app),
+        "binding prerequisites stay available for a no-op rebind check"
+    );
     let before = app.doc.signature();
     let depth = app.history.depth();
-    assert!(!app.bind_skin_to_all_joints());
+    assert!(!app.bind_skin_to_joints());
     assert_eq!(app.doc.signature(), before);
     assert_eq!(app.history.depth(), depth);
 
@@ -3168,20 +3630,531 @@ fn skin_binding_and_unbinding_share_their_predicate_and_refuse_noop_rebinds() {
     let before = app.doc.signature();
     let depth = app.history.depth();
     assert!(!skin_ready(&app));
-    assert!(!app.bind_skin_to_all_joints());
+    assert!(!app.bind_skin_to_joints());
     assert_eq!(app.doc.signature(), before);
     assert_eq!(app.history.depth(), depth);
 
     app.selection.set([panel, cube]);
     assert!(skin_ready(&app));
     let depth = app.history.depth();
-    assert!(app.bind_skin_to_all_joints());
+    assert!(app.bind_skin_to_joints());
     assert!(app.doc.scene.get(cube).unwrap().skin.is_some());
     assert!(
         app.doc.scene.get(panel).unwrap().skin.is_none(),
         "inspector skin binding is explicitly primary-object only"
     );
     assert_eq!(app.history.depth(), depth + 1);
+}
+
+#[test]
+fn weight_brush_falloff_is_deterministic_and_bounded() {
+    assert_eq!(WeightFalloff::Constant.factor(0.0, 40.0), 1.0);
+    assert_eq!(WeightFalloff::Constant.factor(40.0, 40.0), 1.0);
+    assert!((WeightFalloff::Linear.factor(20.0, 40.0) - 0.5).abs() < 1e-6);
+    assert_eq!(WeightFalloff::Linear.factor(0.0, 40.0), 1.0);
+    assert_eq!(WeightFalloff::Linear.factor(40.0, 40.0), 0.0);
+    assert_eq!(WeightFalloff::Smooth.factor(0.0, 40.0), 1.0);
+    assert_eq!(WeightFalloff::Smooth.factor(40.0, 40.0), 0.0);
+    assert!(WeightFalloff::Smooth.factor(10.0, 40.0) > 0.5);
+    assert!(WeightFalloff::Smooth.factor(30.0, 40.0) < 0.5);
+}
+
+#[test]
+fn weight_paint_stroke_is_one_undo_step() {
+    let (mut app, _root) = test_app("weight-paint-undo");
+    let id = app.doc.append_node(
+        NodeKind::Mesh {
+            geometry: GeometrySource::editable(lc_geom::box_mesh(1.0, 1.0, 1.0)),
+        },
+        "Weight Mesh",
+        None,
+    );
+    app.selection.select_one(id);
+    app.add_joint();
+    app.add_joint();
+    app.selection.select_one(id);
+    app.bind_auto_weights = false;
+    assert!(app.bind_skin_to_joints());
+    assert!(app.weight_paint_ready());
+    app.set_weight_paint(true);
+    assert!(app.weight_paint);
+    app.weight_joint = Some(1);
+
+    let before = app.doc.signature();
+    let depth = app.history.depth();
+    assert!(app.begin_weight_stroke());
+    let changed = app
+        .doc
+        .scene
+        .get_mut(id)
+        .unwrap()
+        .skin
+        .as_mut()
+        .unwrap()
+        .set_influence(0, 1, 0.5);
+    assert!(changed);
+    app.commit_pending();
+    assert_eq!(app.history.depth(), depth + 1);
+    assert_ne!(app.doc.signature(), before);
+    app.undo();
+    assert_eq!(app.doc.signature(), before);
+}
+
+#[test]
+fn weight_brush_paints_the_vertices_under_the_cursor() {
+    let (mut app, _root) = test_app("weight-paint-brush");
+    let id = app.doc.append_node(
+        NodeKind::Mesh {
+            geometry: GeometrySource::editable(lc_geom::box_mesh(1.0, 1.0, 1.0)),
+        },
+        "Brush Mesh",
+        None,
+    );
+    app.selection.select_one(id);
+    app.add_joint();
+    app.add_joint();
+    app.selection.select_one(id);
+    app.bind_auto_weights = false;
+    assert!(app.bind_skin_to_joints());
+    app.set_weight_paint(true);
+    app.weight_joint = Some(1);
+    app.weight_brush.radius = 8.0;
+    app.weight_brush.strength = 1.0;
+    app.weight_brush.mode = WeightBrushMode::Add;
+    app.weight_brush.falloff = WeightFalloff::Constant;
+
+    let evaluated = app.evaluate();
+    let node = evaluated.node(id).unwrap();
+    let mesh = node.mesh().unwrap();
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0));
+    let pointer = mesh
+        .positions
+        .iter()
+        .find_map(|position| app.project(node.world.transform_point3(*position), rect, 200, 200))
+        .expect("the test mesh must be visible from the default camera");
+    let before = app.doc.signature();
+    assert!(app.begin_weight_stroke());
+    assert!(app.paint_weight_brush(&evaluated, rect, 200, 200, pointer));
+    app.commit_pending();
+    assert_ne!(app.doc.signature(), before);
+    let skin = app.doc.scene.get(id).unwrap().skin.as_ref().unwrap();
+    assert!(skin.influence(0, 1) > 0.0);
+}
+
+#[test]
+fn selected_joint_binding_restricts_the_skin_and_leaves_uncovered_vertices_at_rest() {
+    let (mut app, _root) = test_app("bind-selected-joints");
+    let mesh = lc_geom::box_mesh(2.0, 1.0, 1.0);
+    let vertex_count = mesh.positions.len();
+    let id = app.doc.append_node(
+        NodeKind::Mesh {
+            geometry: GeometrySource::editable(mesh),
+        },
+        "Selected Joint Mesh",
+        None,
+    );
+    let joint = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Chosen Joint",
+        None,
+    );
+    let unused = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Unchosen Joint",
+        None,
+    );
+    app.selection.select_one(id);
+    app.bind_auto_weights = false;
+    app.set_all_bind_joints(false);
+    app.set_bind_joint(joint, true);
+    assert_eq!(app.bind_joint_ids(), vec![joint]);
+    assert!(app.bind_skin_to_joints());
+    let skin = app.doc.scene.get(id).unwrap().skin.as_ref().unwrap();
+    assert_eq!(skin.joints, vec![joint]);
+    assert!(!skin.joints.contains(&unused));
+    assert_eq!(skin.vertex_count(), vertex_count);
+    assert!(skin.weights.iter().all(|weights| weights == &[0.0; 4]));
+    assert!(
+        skin.joint_indices.iter().all(|indices| indices == &[0; 4]),
+        "unweighted vertices must not be assigned a fallback joint"
+    );
+
+    let rest = app
+        .evaluate()
+        .node(id)
+        .and_then(|node| node.mesh())
+        .map(|mesh| mesh.positions.clone())
+        .unwrap();
+    app.doc.scene.get_mut(joint).unwrap().transform =
+        Transform::from_translation(Vec3::new(0.0, 2.0, 0.0));
+    let posed = app
+        .evaluate()
+        .node(id)
+        .and_then(|node| node.mesh())
+        .map(|mesh| mesh.positions.clone())
+        .unwrap();
+    assert!(
+        rest.iter()
+            .zip(&posed)
+            .all(|(a, b)| (*a - *b).length() < 1e-5),
+        "unweighted vertices must stay at their rest positions"
+    );
+}
+
+#[test]
+fn proximity_bind_produces_normalized_weights_that_deform_when_posed() {
+    let (mut app, _root) = test_app("proximity-bind");
+    let mesh = lc_geom::box_mesh(2.0, 1.0, 1.0);
+    let base_positions = mesh.positions.clone();
+    let id = app.doc.append_node(
+        NodeKind::Mesh {
+            geometry: GeometrySource::editable(mesh),
+        },
+        "Proximity Mesh",
+        None,
+    );
+    app.doc.scene.get_mut(id).unwrap().transform =
+        Transform::from_translation(Vec3::new(3.0, 0.0, 0.0));
+    let left = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Left Joint",
+        None,
+    );
+    let right = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Right Joint",
+        None,
+    );
+    let unused = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Unused Auto Joint",
+        None,
+    );
+    app.doc.scene.get_mut(left).unwrap().transform =
+        Transform::from_translation(Vec3::new(2.0, 0.0, 0.0));
+    app.doc.scene.get_mut(right).unwrap().transform =
+        Transform::from_translation(Vec3::new(4.0, 0.0, 0.0));
+    app.selection.select_one(id);
+    app.bind_joints = Some([left, right].into_iter().collect());
+    app.bind_auto_weights = true;
+    app.bind_dropoff = 2.5;
+    app.bind_strength = 0.8;
+    app.bind_max_influences = 2;
+    assert!(app.bind_skin_to_joints());
+    let skin = app.doc.scene.get(id).unwrap().skin.as_ref().unwrap();
+    assert_eq!(skin.joints, vec![left, right]);
+    assert!(!skin.joints.contains(&unused));
+    for weights in skin.weights.iter().take(skin.vertex_count()) {
+        let total: f32 = weights.iter().sum();
+        assert!((total - 1.0).abs() < 1e-5);
+    }
+    assert!(skin.influence(0, 0) > skin.influence(0, 1));
+    assert!(skin.influence(1, 1) > skin.influence(1, 0));
+
+    let rest = app
+        .evaluate()
+        .node(id)
+        .and_then(|node| node.mesh())
+        .map(|mesh| mesh.positions.clone())
+        .unwrap();
+    assert!(
+        rest.iter()
+            .zip(&base_positions)
+            .all(|(a, b)| (*a - *b).length() < 1e-5),
+        "binding a transformed mesh must preserve its rest pose"
+    );
+    app.doc.scene.get_mut(right).unwrap().transform =
+        Transform::from_translation(Vec3::new(4.0, 1.0, 0.0));
+    let posed = app
+        .evaluate()
+        .node(id)
+        .and_then(|node| node.mesh())
+        .map(|mesh| mesh.positions.clone())
+        .unwrap();
+    let max_delta = rest
+        .iter()
+        .zip(&posed)
+        .map(|(a, b)| (*a - *b).length())
+        .fold(0.0f32, f32::max);
+    assert!(max_delta > 0.05, "auto weights must deform when posed");
+}
+
+#[test]
+fn auto_weight_panel_controls_change_the_bound_weights() {
+    let (mut app, _root) = test_app("auto-weight-controls");
+    let id = app.doc.append_node(
+        NodeKind::Mesh {
+            geometry: GeometrySource::editable(lc_geom::box_mesh(2.0, 1.0, 1.0)),
+        },
+        "Auto Controls Mesh",
+        None,
+    );
+    let left = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Controls Left",
+        None,
+    );
+    let right = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Controls Right",
+        None,
+    );
+    app.doc.scene.get_mut(left).unwrap().transform =
+        Transform::from_translation(Vec3::new(-1.0, 0.0, 0.0));
+    app.doc.scene.get_mut(right).unwrap().transform =
+        Transform::from_translation(Vec3::new(1.0, 0.0, 0.0));
+    app.selection.select_one(id);
+    app.bind_joints = Some([left, right].into_iter().collect());
+    app.bind_auto_weights = true;
+    app.bind_dropoff = 2.0;
+    app.bind_strength = 0.8;
+    app.bind_max_influences = 2;
+    assert!(app.bind_skin_to_joints());
+    let two_way = app.doc.scene.get(id).unwrap().skin.clone().unwrap().weights;
+    assert_eq!(two_way[0].iter().filter(|weight| **weight > 0.0).count(), 2);
+
+    assert!(app.unbind_skin_from_primary());
+    app.bind_dropoff = 0.5;
+    app.bind_strength = 0.1;
+    assert!(app.bind_skin_to_joints());
+    let softer = app.doc.scene.get(id).unwrap().skin.clone().unwrap().weights;
+    assert_eq!(softer[0].iter().filter(|weight| **weight > 0.0).count(), 2);
+    assert_ne!(
+        two_way[0], softer[0],
+        "panel dropoff and strength settings must reach the bind"
+    );
+
+    assert!(app.unbind_skin_from_primary());
+    app.bind_max_influences = 1;
+    assert!(app.bind_skin_to_joints());
+    let one_way = app.doc.scene.get(id).unwrap().skin.clone().unwrap().weights;
+    assert_eq!(one_way[0].iter().filter(|weight| **weight > 0.0).count(), 1);
+    assert_ne!(
+        softer[0], one_way[0],
+        "panel max-influence setting must reach the bind"
+    );
+}
+
+#[test]
+fn rebinding_preserves_covered_weights_and_keeps_the_brush_usable() {
+    let (mut app, _root) = test_app("preserve-rebind");
+    let mesh = lc_geom::box_mesh(3.0, 1.0, 1.0);
+    let id = app.doc.append_node(
+        NodeKind::Mesh {
+            geometry: GeometrySource::editable(mesh),
+        },
+        "Rebind Mesh",
+        None,
+    );
+    let left = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Rebind Left",
+        None,
+    );
+    let middle = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Rebind Middle",
+        None,
+    );
+    let right = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.8,
+            width: 0.08,
+        },
+        "Rebind Right",
+        None,
+    );
+    app.doc.scene.get_mut(left).unwrap().transform =
+        Transform::from_translation(Vec3::new(-1.0, 0.0, 0.0));
+    app.doc.scene.get_mut(right).unwrap().transform =
+        Transform::from_translation(Vec3::new(1.0, 0.0, 0.0));
+    app.selection.select_one(id);
+    app.bind_joints = Some([left, middle, right].into_iter().collect());
+    app.bind_auto_weights = true;
+    app.bind_max_influences = 3;
+    assert!(app.bind_skin_to_joints());
+    let initial_right_index = app
+        .doc
+        .scene
+        .get(id)
+        .and_then(|node| node.skin.as_ref())
+        .and_then(|skin| skin.joints.iter().position(|joint| *joint == right))
+        .unwrap();
+    let initial_left_index = app
+        .doc
+        .scene
+        .get(id)
+        .and_then(|node| node.skin.as_ref())
+        .and_then(|skin| skin.joints.iter().position(|joint| *joint == left))
+        .unwrap();
+    let initial_middle_index = app
+        .doc
+        .scene
+        .get(id)
+        .and_then(|node| node.skin.as_ref())
+        .and_then(|skin| skin.joints.iter().position(|joint| *joint == middle))
+        .unwrap();
+    app.doc
+        .scene
+        .get_mut(id)
+        .unwrap()
+        .skin
+        .as_mut()
+        .unwrap()
+        .set_exclusive_influence(0, initial_right_index, 1.0);
+    app.doc
+        .scene
+        .get_mut(id)
+        .unwrap()
+        .skin
+        .as_mut()
+        .unwrap()
+        .set_exclusive_influence(1, initial_left_index, 1.0);
+    app.doc
+        .scene
+        .get_mut(id)
+        .unwrap()
+        .skin
+        .as_mut()
+        .unwrap()
+        .set_exclusive_influence(2, 0, 0.0);
+    app.weight_joint = Some(initial_middle_index);
+
+    // This is a real rebind: the middle joint is removed. The painted vertices
+    // must keep their right/left weights; only the cleared vertex is auto-filled.
+    app.bind_joints = Some([left, right].into_iter().collect());
+    assert!(app.bind_skin_to_joints());
+    let (left_index, right_index) = app
+        .doc
+        .scene
+        .get(id)
+        .and_then(|node| node.skin.as_ref())
+        .map(|skin| {
+            (
+                skin.joints.iter().position(|joint| *joint == left).unwrap(),
+                skin.joints
+                    .iter()
+                    .position(|joint| *joint == right)
+                    .unwrap(),
+            )
+        })
+        .unwrap();
+    {
+        let skin = app.doc.scene.get(id).unwrap().skin.as_ref().unwrap();
+        assert_eq!(skin.joints, vec![left, right]);
+        assert!((skin.influence(0, right_index) - 1.0).abs() < 1e-5);
+        assert_eq!(skin.influence(0, left_index), 0.0);
+        assert!((skin.influence(1, left_index) - 1.0).abs() < 1e-5);
+        assert_eq!(skin.influence(1, right_index), 0.0);
+        let filled: f32 = skin.weights[2].iter().sum();
+        assert!((filled - 1.0).abs() < 1e-5);
+        assert!(skin.weights[2].iter().any(|weight| *weight > 0.0));
+        for weights in skin.weights.iter().take(skin.vertex_count()) {
+            let total: f32 = weights.iter().sum();
+            if total > 0.0 {
+                assert!((total - 1.0).abs() < 1e-5);
+            }
+            assert!(weights.iter().filter(|weight| **weight > 0.0).count() <= 2);
+        }
+    }
+    assert_eq!(app.active_weight_joint(), Some(0));
+
+    // Dropping the painted joint leaves covered vertices intact and clears the
+    // vertex that had no remaining influence; the brush still works afterwards.
+    app.bind_joints = Some([right].into_iter().collect());
+    app.bind_auto_weights = false;
+    assert!(app.bind_skin_to_joints());
+    assert_eq!(app.active_weight_joint(), Some(0));
+    let skin = app.doc.scene.get(id).unwrap().skin.as_ref().unwrap();
+    assert_eq!(skin.joints, vec![right]);
+    assert!((skin.influence(0, 0) - 1.0).abs() < 1e-5);
+    assert!(skin.weights[1].iter().all(|weight| *weight == 0.0));
+
+    // The heat-map overlay must read the rebound skin and show both the painted
+    // vertex (orange) and the cleared vertex (grey).
+    let evaluated = app.evaluate();
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0));
+    let ctx = egui::Context::default();
+    ctx.set_fonts(egui::FontDefinitions::empty());
+    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.draw_weight_paint_overlay(ui.painter(), ui, rect, &evaluated, 200, 200);
+    });
+    let fills: Vec<egui::Color32> = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Circle(circle) => Some(circle.fill),
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    let zero_color = egui::Color32::from_rgba_unmultiplied(190, 195, 200, 80);
+    let painted_color = egui::Color32::from_rgba_unmultiplied(245, 135, 35, 245);
+    assert!(
+        fills.contains(&painted_color),
+        "the heat map must paint the active joint's nonzero weight"
+    );
+    assert!(
+        fills.contains(&zero_color),
+        "the heat map must show zero-weight vertices in grey"
+    );
+
+    app.set_weight_paint(true);
+    assert!(app.weight_paint_ready());
+    app.weight_joint = Some(0);
+    let before = app.doc.signature();
+    let depth = app.history.depth();
+    assert!(app.begin_weight_stroke());
+    assert!(app
+        .doc
+        .scene
+        .get_mut(id)
+        .unwrap()
+        .skin
+        .as_mut()
+        .unwrap()
+        .set_influence(1, 0, 0.5));
+    let painted = app.doc.scene.get(id).unwrap().skin.as_ref().unwrap();
+    assert!((painted.weights[1].iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    assert_eq!(
+        painted.weights[1]
+            .iter()
+            .filter(|weight| **weight > 0.0)
+            .count(),
+        1
+    );
+    app.commit_pending();
+    assert_eq!(app.history.depth(), depth + 1);
+    assert_ne!(app.doc.signature(), before);
+    app.undo();
+    assert_eq!(app.doc.signature(), before);
 }
 
 #[test]
@@ -3273,6 +4246,203 @@ fn deleting_a_tracks_last_key_drops_the_track_and_undo_restores_it() {
 }
 
 #[test]
+fn fcurve_manual_tangents_survive_edits_and_undo_redo() {
+    let (mut app, _root) = test_app("fcurve-tangents");
+    let cube = named(&app, "Cube");
+    app.selection.select_one(cube);
+    let target = AnimTarget::Object(cube);
+    {
+        let node = app.doc.scene.get_mut(cube).unwrap();
+        node.animation = AnimationClip::default();
+        node.animation
+            .set_key(AnimProperty::TranslationX, 0.0, 0.0, Interpolation::Smooth);
+        node.animation
+            .set_key(AnimProperty::TranslationX, 1.0, 1.0, Interpolation::Smooth);
+    }
+    assert!(app.set_anim_target(target));
+    assert!(app.select_curve_key(AnimProperty::TranslationX, 0.0));
+    assert!(app.set_target_curve_tangent(
+        target,
+        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        0.0,
+        false,
+        2.0
+    ));
+    let clip = app.target_clip(target).unwrap();
+    let key = clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0];
+    assert!(key.tangent_manual);
+    assert!((key.tangent_out - 2.0).abs() < 1e-5);
+    let sampled = clip.sample(AnimProperty::TranslationX, 0.5).unwrap();
+    assert!(
+        (sampled - 0.625).abs() < 1e-4,
+        "manual tangent sampled {sampled}"
+    );
+
+    app.undo();
+    let restored = app.target_clip(target).unwrap();
+    let key = restored
+        .track(AnimProperty::TranslationX)
+        .unwrap()
+        .curve
+        .keys[0];
+    assert!(!key.tangent_manual);
+    assert!((restored.sample(AnimProperty::TranslationX, 0.5).unwrap() - 0.5).abs() < 1e-4);
+    app.redo();
+    let restored = app.target_clip(target).unwrap();
+    let key = restored
+        .track(AnimProperty::TranslationX)
+        .unwrap()
+        .curve
+        .keys[0];
+    assert!(key.tangent_manual);
+    assert!((key.tangent_out - 2.0).abs() < 1e-5);
+
+    // A later key insertion must not overwrite the hand-authored slope.
+    app.doc.scene.get_mut(cube).unwrap().animation.set_key(
+        AnimProperty::TranslationX,
+        2.0,
+        0.0,
+        Interpolation::Smooth,
+    );
+    let key = app
+        .target_clip(target)
+        .unwrap()
+        .track(AnimProperty::TranslationX)
+        .unwrap()
+        .curve
+        .keys[0];
+    assert!(key.tangent_manual);
+    assert!((key.tangent_out - 2.0).abs() < 1e-5);
+}
+
+#[test]
+fn fcurve_retime_selected_channels_is_one_undo_and_rescales_manual_tangents() {
+    let (mut app, _root) = test_app("fcurve-retime-selected");
+    let cube = named(&app, "Cube");
+    app.selection.select_one(cube);
+    {
+        let node = app.doc.scene.get_mut(cube).unwrap();
+        node.animation = AnimationClip::default();
+        for (time, value) in [(1.0, 0.0), (3.0, 1.0)] {
+            node.animation.set_key(
+                AnimProperty::TranslationX,
+                time,
+                value,
+                Interpolation::Smooth,
+            );
+            node.animation
+                .set_morph_weight_key(0, time, value, Interpolation::Smooth);
+        }
+        node.animation
+            .set_rotation_key(1.0, Quat::IDENTITY, Interpolation::Linear);
+        node.animation
+            .set_rotation_key(3.0, Quat::from_rotation_y(1.0), Interpolation::Linear);
+        let curve = &mut node
+            .animation
+            .track_mut(AnimProperty::TranslationX)
+            .unwrap()
+            .curve;
+        assert!(curve.set_manual_tangents(1.0, 0.0, 2.0));
+        assert!(curve.set_manual_tangents(3.0, 0.0, 0.0));
+    }
+    let target = AnimTarget::Object(cube);
+    assert!(app.set_anim_target(target));
+    let old_mid = app
+        .target_clip(target)
+        .unwrap()
+        .sample(AnimProperty::TranslationX, 2.0)
+        .unwrap();
+    for track in [
+        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::MorphWeight(0),
+        CurveTrackId::Rotation,
+    ] {
+        for time in [1.0, 3.0] {
+            assert!(app.select_target_track_key_additive(target, track, time, true));
+        }
+    }
+    assert_eq!(app.selected_curve_keys().len(), 6);
+    app.history.clear();
+    assert!(app.retime_selected_curve_keys(2.0));
+    assert_eq!(app.history.depth(), 1, "retime is one undo step");
+    let clip = app.target_clip(target).unwrap();
+    assert_property_curve_times(&app, target, AnimProperty::TranslationX, &[1.0, 5.0]);
+    assert_eq!(
+        clip.morph_weights.get(&0).unwrap().keys[1].time,
+        5.0,
+        "morph keys move in the same pass"
+    );
+    assert_eq!(
+        clip.rotation.as_ref().unwrap().keys[1].time,
+        5.0,
+        "rotation keys move in the same pass"
+    );
+    let key = clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0];
+    assert!(key.tangent_manual);
+    assert!((key.tangent_out - 1.0).abs() < 1e-5);
+    assert!((clip.sample(AnimProperty::TranslationX, 3.0).unwrap() - old_mid).abs() < 1e-4);
+
+    app.undo();
+    let restored = app.target_clip(target).unwrap();
+    assert_property_curve_times(&app, target, AnimProperty::TranslationX, &[1.0, 3.0]);
+    let key = restored
+        .track(AnimProperty::TranslationX)
+        .unwrap()
+        .curve
+        .keys[0];
+    assert!((key.tangent_out - 2.0).abs() < 1e-5);
+    assert!(key.tangent_manual);
+    assert!((restored.sample(AnimProperty::TranslationX, 2.0).unwrap() - old_mid).abs() < 1e-4);
+
+    app.redo();
+    let redone = app.target_clip(target).unwrap();
+    assert_property_curve_times(&app, target, AnimProperty::TranslationX, &[1.0, 5.0]);
+    assert!(
+        (redone.track(AnimProperty::TranslationX).unwrap().curve.keys[0].tangent_out - 1.0).abs()
+            < 1e-5
+    );
+}
+
+#[test]
+fn fcurve_retime_keeps_tracks_that_are_anchored_at_the_pivot_consistent() {
+    let (mut app, _root) = test_app("fcurve-retime-anchored");
+    let cube = named(&app, "Cube");
+    app.selection.select_one(cube);
+    {
+        let node = app.doc.scene.get_mut(cube).unwrap();
+        node.animation = AnimationClip::default();
+        node.animation
+            .set_key(AnimProperty::TranslationX, 1.0, 0.0, Interpolation::Linear);
+        node.animation
+            .set_rotation_key(2.0, Quat::from_rotation_y(0.5), Interpolation::Linear);
+    }
+    let target = AnimTarget::Object(cube);
+    assert!(app.set_anim_target(target));
+    assert!(app.select_target_track_key_additive(
+        target,
+        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        1.0,
+        true
+    ));
+    assert!(app.select_target_track_key_additive(target, CurveTrackId::Rotation, 2.0, true));
+    app.history.clear();
+
+    assert!(app.retime_selected_curve_keys(2.0));
+    assert_eq!(app.history.depth(), 1);
+    let clip = app.target_clip(target).unwrap();
+    assert_eq!(
+        clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0].time,
+        1.0,
+        "the scalar track is anchored at the pivot"
+    );
+    assert_eq!(
+        clip.rotation.as_ref().unwrap().keys[0].time,
+        3.0,
+        "the other selected track still moves"
+    );
+}
+
+#[test]
 fn per_key_interpolation_changes_only_the_targeted_key() {
     let (mut app, _root) = test_app("curve-key-interpolation");
     let cube = named(&app, "Cube");
@@ -3285,7 +4455,7 @@ fn per_key_interpolation_changes_only_the_targeted_key() {
     }
     app.history.clear();
 
-    assert!(app.set_curve_key_interpolation(AnimProperty::RotationY, 0.0, Interpolation::Step));
+    assert!(app.set_curve_key_interpolation(AnimProperty::RotationY, 0.0, Interpolation::Constant));
     let track = app
         .doc
         .scene
@@ -3294,15 +4464,177 @@ fn per_key_interpolation_changes_only_the_targeted_key() {
         .animation
         .track(AnimProperty::RotationY)
         .unwrap();
-    assert_eq!(track.curve.keys[0].interpolation, Interpolation::Step);
+    assert_eq!(track.curve.keys[0].interpolation, Interpolation::Constant);
     assert_eq!(track.curve.keys[1].interpolation, Interpolation::Linear);
     assert_eq!(app.history.depth(), 1);
 
     let before = app.doc.signature();
-    assert!(!app.set_curve_key_interpolation(AnimProperty::RotationY, 0.0, Interpolation::Step));
-    assert!(!app.set_curve_key_interpolation(AnimProperty::RotationY, 4.0, Interpolation::Step));
+    assert!(!app.set_curve_key_interpolation(
+        AnimProperty::RotationY,
+        0.0,
+        Interpolation::Constant
+    ));
+    assert!(!app.set_curve_key_interpolation(
+        AnimProperty::RotationY,
+        4.0,
+        Interpolation::Constant
+    ));
     assert_eq!(app.doc.signature(), before);
     assert_eq!(app.history.depth(), 1);
+}
+
+#[test]
+fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
+    let (mut app, _root) = test_app("curve-interpolation-tangent-mixed");
+    let cube = named(&app, "Cube");
+    app.selection.select_one(cube);
+    {
+        let animation = &mut app.doc.scene.get_mut(cube).unwrap().animation;
+        *animation = AnimationClip::default();
+        for (time, value) in [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)] {
+            animation.set_key(
+                AnimProperty::TranslationX,
+                time,
+                value,
+                Interpolation::Spline,
+            );
+            animation.set_morph_weight_key(0, time, value, Interpolation::Spline);
+            animation.set_rotation_key(time, Quat::from_rotation_y(value), Interpolation::Spline);
+        }
+        let curve = &mut animation
+            .track_mut(AnimProperty::TranslationX)
+            .unwrap()
+            .curve;
+        assert!(curve.set_manual_tangents(0.0, 0.0, 2.0));
+    }
+    let target = AnimTarget::Object(cube);
+    assert!(app.set_anim_target(target));
+    for track in [
+        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::MorphWeight(0),
+        CurveTrackId::Rotation,
+    ] {
+        assert!(app.select_target_track_key_additive(target, track, 0.0, true));
+    }
+    assert_eq!(app.selected_curve_keys().len(), 3);
+    assert_eq!(
+        app.selected_curve_interpolation(),
+        Some(Interpolation::Spline)
+    );
+    assert_eq!(app.selected_curve_tangent_type(), Some(TangentType::Spline));
+
+    app.history.clear();
+    assert!(app.set_selected_curve_key_interpolation(Interpolation::Smooth));
+    assert_eq!(
+        app.history.depth(),
+        1,
+        "interpolation edit is one undo step"
+    );
+    let clip = app.target_clip(target).unwrap();
+    assert_eq!(
+        clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0].interpolation,
+        Interpolation::Smooth
+    );
+    assert_eq!(
+        clip.morph_weights.get(&0).unwrap().keys[0].interpolation,
+        Interpolation::Smooth
+    );
+    assert_eq!(
+        clip.rotation.as_ref().unwrap().keys[0].interpolation,
+        Interpolation::Smooth
+    );
+    assert!(
+        !clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0].tangent_manual,
+        "Smooth redefines the hand-authored tangent"
+    );
+
+    app.undo();
+    let restored = app.target_clip(target).unwrap();
+    assert_eq!(
+        restored
+            .track(AnimProperty::TranslationX)
+            .unwrap()
+            .curve
+            .keys[0]
+            .interpolation,
+        Interpolation::Spline
+    );
+    assert!(
+        restored
+            .track(AnimProperty::TranslationX)
+            .unwrap()
+            .curve
+            .keys[0]
+            .tangent_manual
+    );
+    assert!(
+        (restored
+            .track(AnimProperty::TranslationX)
+            .unwrap()
+            .curve
+            .keys[0]
+            .tangent_out
+            - 2.0)
+            .abs()
+            < 1e-5,
+        "undo restores the previous hand-authored slope"
+    );
+    app.redo();
+    assert_eq!(
+        app.target_clip(target)
+            .unwrap()
+            .rotation
+            .as_ref()
+            .unwrap()
+            .keys[0]
+            .interpolation,
+        Interpolation::Smooth
+    );
+
+    app.undo();
+    app.history.clear();
+    assert!(app.set_selected_curve_tangent_type(TangentType::Linear, true, true));
+    assert_eq!(app.history.depth(), 1, "tangent type edit is one undo step");
+    let changed = app.target_clip(target).unwrap();
+    let scalar = changed
+        .track(AnimProperty::TranslationX)
+        .unwrap()
+        .curve
+        .keys[0];
+    assert_eq!(scalar.tangent_in_type, TangentType::Linear);
+    assert_eq!(scalar.tangent_out_type, TangentType::Linear);
+    assert!(!scalar.tangent_manual);
+    assert_eq!(
+        changed.morph_weights.get(&0).unwrap().keys[0].tangent_in_type,
+        TangentType::Linear
+    );
+    assert_eq!(
+        changed.rotation.as_ref().unwrap().keys[0].tangent_in_type,
+        TangentType::Linear,
+        "rotation keys receive the same tangent-type edit"
+    );
+
+    app.undo();
+    let restored = app.target_clip(target).unwrap();
+    let scalar = restored
+        .track(AnimProperty::TranslationX)
+        .unwrap()
+        .curve
+        .keys[0];
+    assert!(scalar.tangent_manual);
+    assert!((scalar.tangent_out - 2.0).abs() < 1e-5);
+    assert_eq!(scalar.tangent_out_type, TangentType::Spline);
+    app.redo();
+    assert_eq!(
+        app.target_clip(target)
+            .unwrap()
+            .track(AnimProperty::TranslationX)
+            .unwrap()
+            .curve
+            .keys[0]
+            .tangent_out_type,
+        TangentType::Linear
+    );
 }
 
 #[test]
@@ -3354,7 +4686,7 @@ fn recorded_rotation_round_trips_through_registry_and_key_editing() {
     );
 
     assert!(app.select_rotation_key(0.5));
-    assert!(app.set_selected_curve_key_interpolation(Interpolation::Step));
+    assert!(app.set_selected_curve_key_interpolation(Interpolation::Constant));
     assert_eq!(
         app.doc
             .scene
@@ -3366,7 +4698,7 @@ fn recorded_rotation_round_trips_through_registry_and_key_editing() {
             .unwrap()
             .keys[0]
             .interpolation,
-        Interpolation::Step
+        Interpolation::Constant
     );
 
     assert!(app.select_rotation_key(0.5));
@@ -3499,7 +4831,7 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
         0.0
     ));
-    assert!(app.set_selected_curve_key_interpolation(Interpolation::Step));
+    assert!(app.set_selected_curve_key_interpolation(Interpolation::Constant));
     assert_eq!(app.history.depth(), depth + 1);
     let stepped = app
         .doc
@@ -3515,6 +4847,34 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
             .sample_or(AnimProperty::CopyLocationWeight, 0.5, -1.0)
             .abs()
             < 1e-4
+    );
+    app.history.undo(&mut app.doc);
+
+    let depth = app.history.depth();
+    assert!(app.select_target_track_key(
+        target,
+        CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
+        0.0
+    ));
+    assert!(app.set_selected_curve_tangent_type(TangentType::Linear, true, true));
+    assert_eq!(app.history.depth(), depth + 1);
+    let typed = app
+        .doc
+        .scene
+        .get(cube)
+        .unwrap()
+        .tag_animations
+        .get(&(tag_index as u32))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        typed
+            .track(AnimProperty::CopyLocationWeight)
+            .unwrap()
+            .curve
+            .keys[0]
+            .tangent_out_type,
+        TangentType::Linear
     );
     app.history.undo(&mut app.doc);
 
@@ -3662,7 +5022,7 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
         CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
         0.0
     ));
-    assert!(app.set_selected_curve_key_interpolation(Interpolation::Step));
+    assert!(app.set_selected_curve_key_interpolation(Interpolation::Constant));
     assert_eq!(app.history.depth(), depth + 1);
     let ctx = lc_shading::ShadingContext::new(&app.texture_cache);
     let stepped = app
@@ -3675,6 +5035,32 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
     assert!(
         (stepped - 0.2).abs() < 1e-4,
         "step interpolation holds the first key"
+    );
+    app.history.undo(&mut app.doc);
+
+    let depth = app.history.depth();
+    assert!(app.select_target_track_key(
+        target,
+        CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
+        0.0
+    ));
+    assert!(app.set_selected_curve_tangent_type(TangentType::Linear, true, true));
+    assert_eq!(app.history.depth(), depth + 1);
+    let typed = app
+        .doc
+        .materials
+        .get(material_id)
+        .unwrap()
+        .animation
+        .clone();
+    assert_eq!(
+        typed
+            .track(AnimProperty::MaterialRoughness)
+            .unwrap()
+            .curve
+            .keys[0]
+            .tangent_out_type,
+        TangentType::Linear
     );
     app.history.undo(&mut app.doc);
 
@@ -4769,6 +6155,423 @@ fn fcurve_paste_works_when_native_clipboard_is_empty() {
 }
 
 #[test]
+fn baking_an_ik_take_is_one_undo_step_and_writes_every_frame() {
+    let (mut app, _root) = test_app("bake-ik-take");
+    let shoulder = app.doc.append_node(
+        NodeKind::Joint {
+            length: 1.0,
+            width: 0.08,
+        },
+        "IK Shoulder",
+        None,
+    );
+    let elbow = app.doc.append_node(
+        NodeKind::Joint {
+            length: 1.0,
+            width: 0.08,
+        },
+        "IK Elbow",
+        Some(shoulder),
+    );
+    let wrist = app.doc.append_node(
+        NodeKind::Joint {
+            length: 1.0,
+            width: 0.08,
+        },
+        "IK Wrist",
+        Some(elbow),
+    );
+    app.doc.scene.get_mut(elbow).unwrap().transform = Transform::from_translation(Vec3::X);
+    app.doc.scene.get_mut(wrist).unwrap().transform = Transform::from_translation(Vec3::X);
+    let target = app.doc.append_node(NodeKind::Null, "IK Goal", None);
+    app.doc.scene.get_mut(target).unwrap().transform =
+        Transform::from_translation(Vec3::new(1.0, 1.2, 0.0));
+    app.doc.scene.get_mut(wrist).unwrap().ik = Some(lc_scene::IkChain::new(target));
+    app.playback.start = 0.0;
+    app.playback.end = 1.0;
+    app.playback.fps = 1.0;
+    app.playback.time = 0.0;
+    let depth = app.history.depth();
+    assert!(app.bake_ik_chain(wrist));
+    assert_eq!(app.history.depth(), depth + 1);
+    for joint in [shoulder, elbow] {
+        let track = app
+            .doc
+            .scene
+            .get(joint)
+            .unwrap()
+            .animation
+            .rotation
+            .as_ref()
+            .expect("bake must create rotation F-curves");
+        assert_eq!(track.keys.len(), 2, "both take ends should be keyed");
+    }
+    assert!(app.history.undo(&mut app.doc).is_some());
+    assert_eq!(app.history.depth(), depth);
+    assert!(app
+        .doc
+        .scene
+        .get(shoulder)
+        .unwrap()
+        .animation
+        .rotation
+        .is_none());
+}
+
+#[test]
+fn morph_weight_fcurve_row_keys_and_undo_redo() {
+    let (mut app, _root) = test_app("morph-fcurve");
+    let id = app.selection.primary().expect("selected cube");
+    app.make_selected_editable();
+    app.doc.scene.get_mut(id).unwrap().modifiers.clear();
+    assert!(app.record_morph_base());
+    let (base, delta) = {
+        let node = app.doc.scene.get_mut(id).unwrap();
+        let base = node.morph.base.clone();
+        let delta = Vec3::Y;
+        node.morph
+            .targets
+            .push(MorphTarget::new("Lift", vec![delta; base.len()]));
+        (base, delta)
+    };
+    let target = AnimTarget::Object(id);
+    assert!(app.set_anim_target(target));
+    let rows = app.curve_rows(target);
+    let row = *rows
+        .iter()
+        .find(|row| row.channel == AnimChannel::MorphWeight && row.morph_target == Some(0))
+        .expect("morph target contributes an F-curve row");
+    assert_eq!(row.property, None);
+    assert_eq!(app.curve_row_label(target, row), "Lift Weight");
+
+    app.history.clear();
+    app.playback.time = 0.0;
+    app.doc.scene.get_mut(id).unwrap().morph.targets[0].weight = 0.0;
+    assert!(app.record_curve_row_key(target, row));
+    app.playback.time = 1.0;
+    app.doc.scene.get_mut(id).unwrap().morph.targets[0].weight = 1.0;
+    assert!(app.record_curve_row_key(target, row));
+    let clip = app.doc.scene.get(id).unwrap().animation.clone();
+    let curve = clip.morph_weights.get(&0).expect("morph weight curve");
+    assert_eq!(curve.keys.len(), 2, "both authored keys must be present");
+    assert!((clip.sample_morph_weight(0, 0.5).unwrap() - 0.5).abs() < 1e-5);
+
+    app.playback.time = 0.5;
+    let posed = app.evaluate().node(id).unwrap().mesh().unwrap().positions[0];
+    assert!(
+        (posed - (base[0] + delta * 0.5)).length() < 1e-4,
+        "evaluated morph weight did not interpolate"
+    );
+
+    app.undo();
+    assert_eq!(
+        app.doc
+            .scene
+            .get(id)
+            .unwrap()
+            .animation
+            .morph_weights
+            .get(&0)
+            .unwrap()
+            .keys
+            .len(),
+        1,
+        "undo must remove the second curve key"
+    );
+    app.redo();
+    assert_eq!(
+        app.doc
+            .scene
+            .get(id)
+            .unwrap()
+            .animation
+            .morph_weights
+            .get(&0)
+            .unwrap()
+            .keys
+            .len(),
+        2,
+        "redo must restore the second curve key"
+    );
+    app.playback.time = 0.5;
+    let posed = app.evaluate().node(id).unwrap().mesh().unwrap().positions[0];
+    assert!(
+        (posed - (base[0] + delta * 0.5)).length() < 1e-4,
+        "redo must restore the evaluated morph deformation"
+    );
+    assert!(app.select_target_track_key(target, CurveTrackId::MorphWeight(0), 0.0));
+    assert!(app.set_selected_curve_key_interpolation(Interpolation::Linear));
+    assert_eq!(
+        app.doc
+            .scene
+            .get(id)
+            .unwrap()
+            .animation
+            .morph_weights
+            .get(&0)
+            .unwrap()
+            .keys[0]
+            .interpolation,
+        Interpolation::Linear,
+        "morph F-curve keys use the shared interpolation path"
+    );
+    assert!(app.select_target_track_key(target, CurveTrackId::MorphWeight(0), 1.0));
+    assert!(app.set_target_curve_tangent(target, CurveTrackId::MorphWeight(0), 1.0, false, -2.0));
+    let key = app
+        .target_clip(target)
+        .unwrap()
+        .morph_weights
+        .get(&0)
+        .unwrap()
+        .keys[1];
+    assert!(key.tangent_manual);
+    assert!((key.tangent_out + 2.0).abs() < 1e-5);
+}
+
+#[test]
+fn fcurve_retime_covers_tag_and_material_targets() {
+    let (mut app, _root) = test_app("fcurve-retime-scopes");
+    let cube = named(&app, "Cube");
+    let source = named(&app, "Sphere");
+    app.selection.select_one(cube);
+    let tag_index = {
+        let node = app.doc.scene.get_mut(cube).unwrap();
+        node.tags
+            .retain(|tag| !matches!(tag, Tag::CopyLocation { .. }));
+        node.tags.push(Tag::CopyLocation {
+            source,
+            offset: Vec3::ZERO,
+            weight: 0.0,
+        });
+        node.tag_animations.clear();
+        node.tags.len() - 1
+    };
+    let tag_target = AnimTarget::Tag(cube, tag_index);
+    {
+        let mut clip = AnimationClip::default();
+        clip.set_key(
+            AnimProperty::CopyLocationWeight,
+            0.0,
+            0.0,
+            Interpolation::Linear,
+        );
+        clip.set_key(
+            AnimProperty::CopyLocationWeight,
+            1.0,
+            1.0,
+            Interpolation::Linear,
+        );
+        app.doc
+            .scene
+            .get_mut(cube)
+            .unwrap()
+            .tag_animations
+            .insert(tag_index as u32, clip);
+    }
+    assert!(app.set_anim_target(tag_target));
+    for time in [0.0, 1.0] {
+        assert!(app.select_target_track_key_additive(
+            tag_target,
+            CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
+            time,
+            true
+        ));
+    }
+    app.history.clear();
+    assert!(app.retime_selected_curve_keys(2.0));
+    assert_eq!(app.history.depth(), 1);
+    let tag_clip = app.target_clip(tag_target).unwrap();
+    assert_eq!(
+        tag_clip
+            .track(AnimProperty::CopyLocationWeight)
+            .unwrap()
+            .curve
+            .keys
+            .iter()
+            .map(|key| key.time)
+            .collect::<Vec<_>>(),
+        vec![0.0, 2.0]
+    );
+    app.undo();
+    let tag_clip = app.target_clip(tag_target).unwrap();
+    assert_eq!(
+        tag_clip
+            .track(AnimProperty::CopyLocationWeight)
+            .unwrap()
+            .curve
+            .keys[1]
+            .time,
+        1.0
+    );
+
+    let material_id = app.selected_material.expect("demo material selection");
+    {
+        let material = app.doc.materials.get_mut(material_id).unwrap();
+        material.animation = AnimationClip::default();
+        material.animation.set_key(
+            AnimProperty::MaterialRoughness,
+            0.0,
+            0.2,
+            Interpolation::Linear,
+        );
+        material.animation.set_key(
+            AnimProperty::MaterialRoughness,
+            1.0,
+            0.8,
+            Interpolation::Linear,
+        );
+    }
+    let material_target = AnimTarget::Material(material_id);
+    assert!(app.set_anim_target(material_target));
+    for time in [0.0, 1.0] {
+        assert!(app.select_target_track_key_additive(
+            material_target,
+            CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
+            time,
+            true
+        ));
+    }
+    app.history.clear();
+    assert!(app.retime_selected_curve_keys(2.0));
+    assert_eq!(app.history.depth(), 1);
+    let material_clip = app.target_clip(material_target).unwrap();
+    assert_eq!(
+        material_clip
+            .track(AnimProperty::MaterialRoughness)
+            .unwrap()
+            .curve
+            .keys[1]
+            .time,
+        2.0
+    );
+    app.undo();
+    assert_eq!(
+        app.target_clip(material_target)
+            .unwrap()
+            .track(AnimProperty::MaterialRoughness)
+            .unwrap()
+            .curve
+            .keys[1]
+            .time,
+        1.0
+    );
+}
+
+#[test]
+fn take_retime_scales_every_channel_in_one_undo_step() {
+    let (mut app, _root) = test_app("take-retime");
+    let cube = named(&app, "Cube");
+    app.selection.select_one(cube);
+    {
+        let node = app.doc.scene.get_mut(cube).unwrap();
+        node.animation = AnimationClip::default();
+        node.animation
+            .set_key(AnimProperty::TranslationX, 1.0, 0.0, Interpolation::Smooth);
+        node.animation
+            .set_key(AnimProperty::TranslationX, 3.0, 1.0, Interpolation::Smooth);
+        node.animation
+            .set_morph_weight_key(0, 1.0, 0.0, Interpolation::Linear);
+        node.animation
+            .set_morph_weight_key(0, 3.0, 1.0, Interpolation::Linear);
+        node.animation
+            .set_rotation_key(1.0, Quat::IDENTITY, Interpolation::Linear);
+        node.animation
+            .set_rotation_key(3.0, Quat::from_rotation_y(1.0), Interpolation::Linear);
+    }
+    app.history.clear();
+    assert!(app.retime_animation_take(cube, 2.0));
+    assert_eq!(app.history.depth(), 1, "take retime is one undo step");
+    let clip = app.doc.scene.get(cube).unwrap().animation.clone();
+    assert_property_curve_times(
+        &app,
+        AnimTarget::Object(cube),
+        AnimProperty::TranslationX,
+        &[2.0, 6.0],
+    );
+    assert_eq!(clip.morph_weights.get(&0).unwrap().keys[1].time, 6.0);
+    assert_eq!(clip.rotation.as_ref().unwrap().keys[1].time, 6.0);
+    assert!(app.status.contains("Retimed take"));
+
+    app.undo();
+    assert_property_curve_times(
+        &app,
+        AnimTarget::Object(cube),
+        AnimProperty::TranslationX,
+        &[1.0, 3.0],
+    );
+    app.redo();
+    assert_property_curve_times(
+        &app,
+        AnimTarget::Object(cube),
+        AnimProperty::TranslationX,
+        &[2.0, 6.0],
+    );
+}
+
+#[test]
+fn morph_targets_capture_weight_and_undo() {
+    let (mut app, _root) = test_app("morph-targets");
+    let id = app.selection.primary().expect("selected cube");
+    app.make_selected_editable();
+    // Morphs are recorded against the editable mesh, before modifiers rebuild
+    // its topology, so exercise the workflow on the raw cube surface.
+    app.doc.scene.get_mut(id).unwrap().modifiers.clear();
+    assert!(app.record_morph_base());
+    assert_eq!(app.history.undo_label().as_deref(), Some("Edit Morph"));
+
+    let (base, moved) = {
+        let node = app.doc.scene.get(id).unwrap();
+        let NodeKind::Mesh {
+            geometry: GeometrySource::Editable { mesh, .. },
+        } = &node.kind
+        else {
+            panic!("expected an editable mesh");
+        };
+        (mesh.positions[0], mesh.positions[0] + Vec3::Y * 2.0)
+    };
+    if let NodeKind::Mesh {
+        geometry: GeometrySource::Editable { mesh, .. },
+    } = &mut app.doc.scene.get_mut(id).unwrap().kind
+    {
+        mesh.positions[0] = moved;
+    }
+    assert!(app.capture_morph_target());
+    let target = &app.doc.scene.get(id).unwrap().morph.targets[0];
+    assert_eq!(target.name, "Morph 1");
+    assert!((target.weight - 0.0).abs() < 1e-6);
+    let delta = target.deltas[0];
+    assert!((delta - Vec3::Y * 2.0).length() < 1e-5);
+
+    let original = app.doc.scene.get(id).unwrap().clone();
+    let mut edited = original.clone();
+    edited.morph.targets[0].weight = 0.5;
+    app.apply_node_edits(id, &original, &edited);
+    app.commit_pending();
+    assert_eq!(app.history.undo_label().as_deref(), Some("Edit Morph"));
+    let posed = app.evaluate();
+    let position = posed.node(id).unwrap().mesh().unwrap().positions[0];
+    assert!(
+        (position - (base + delta * 0.5)).length() < 1e-4,
+        "position {position:?} base {base:?} delta {delta:?} weight {}",
+        app.doc.scene.get(id).unwrap().morph.targets[0].weight
+    );
+
+    app.undo();
+    assert!((app.doc.scene.get(id).unwrap().morph.targets[0].weight - 0.0).abs() < 1e-6);
+    app.undo();
+    assert!(app.doc.scene.get(id).unwrap().morph.targets.is_empty());
+    app.undo();
+    assert!(!app.doc.scene.get(id).unwrap().morph.has_base());
+    app.undo();
+    assert!(matches!(
+        app.doc.scene.get(id).unwrap().kind,
+        NodeKind::Mesh {
+            geometry: GeometrySource::Primitive { .. }
+        }
+    ));
+}
+
+#[test]
 fn fcurve_empty_clipboard_paste_accepts_ctrl_release_before_v() {
     let (mut harness, _root) = InputHarness::new(
         "curve-empty-clipboard-release-order",
@@ -5008,4 +6811,1059 @@ fn fcurve_keyboard_shortcuts_survive_non_text_widget_focus() {
     harness.press_key(egui::Key::V, egui::Modifiers::COMMAND);
     let pasted = harness.app.target_clip(target).unwrap();
     assert!((pasted.sample_or(AnimProperty::TranslationX, 2.0, -1.0) - 4.0).abs() < 1e-4);
+}
+
+#[test]
+fn flip_normal_reverses_the_selected_faces_and_one_undo_restores_them() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-flip-normal",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Point mode is refused: no undo entry, and the status names the reason.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, vec![0, 1, 2, 3]);
+    harness.app.mesh_selected = vec![0, 1, 2, 3];
+    assert!(!harness.app.mesh_flip_normal_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::FlipNormal);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("polygon mode"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Polygon mode with no selected polygon is a no-op without an undo entry.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    assert!(!harness.app.mesh_flip_normal_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::FlipNormal);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        harness.app.doc.signature(),
+        before,
+        "an empty selection must not touch the mesh"
+    );
+    assert!(
+        harness.app.status.contains("Select at least one polygon"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // One selected face: the menu command is enabled and flips exactly that face.
+    harness.app.mesh_components.insert(cube, vec![2]);
+    harness.app.mesh_selected = vec![2];
+    assert!(harness.app.mesh_flip_normal_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Flip Normal").1,
+        "polygon mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    let (original, neighbour, normal) = {
+        let mesh = selected_mesh(&harness.app, cube);
+        (
+            mesh.polygons[2].corners.clone(),
+            mesh.polygons[1].corners.clone(),
+            mesh.face_normal(2),
+        )
+    };
+    harness.app.perform_mesh_action(MeshAction::FlipNormal);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole flip"
+    );
+    let flipped: Vec<_> = original.iter().rev().cloned().collect();
+    {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert_eq!(
+            mesh.polygons[2].corners, flipped,
+            "the selected face reversed exactly"
+        );
+        assert_eq!(
+            mesh.polygons[1].corners, neighbour,
+            "faces outside the selection keep their winding"
+        );
+        assert!(
+            (mesh.face_normal(2) + normal).length() < 1e-5,
+            "the flipped face normal points the other way"
+        );
+        assert!(mesh.validate().is_ok());
+    }
+    assert_eq!(
+        harness.app.mesh_selected,
+        vec![2],
+        "the face selection survives so the flip can be toggled back"
+    );
+
+    // The flipped winding is document state and survives a native round-trip.
+    let text = lc_scene::to_json(&harness.app.doc).unwrap();
+    let loaded = lc_scene::from_json(&text).unwrap();
+    let NodeKind::Mesh { geometry } = &loaded.scene.get(cube).unwrap().kind else {
+        panic!("the cube must load as a mesh");
+    };
+    let loaded_mesh = geometry.mesh().expect("an editable mesh");
+    assert_eq!(
+        loaded_mesh.polygons[2].corners, flipped,
+        "saved winding must match the flipped mesh"
+    );
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        selected_mesh(&harness.app, cube).polygons[2].corners,
+        original,
+        "undo restores the exact prior winding"
+    );
+}
+
+#[test]
+fn collapse_welds_selected_points_and_one_undo_restores_the_mesh() {
+    let (mut harness, _root) =
+        InputHarness::new("input-collapse", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Polygon mode is refused: no undo entry, and the status names the mode.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_collapse_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::Collapse);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.to_lowercase().contains("point"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Point mode with no selected point is a no-op that pushes no undo step.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    assert!(!harness.app.mesh_collapse_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Collapse);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        harness.app.doc.signature(),
+        before,
+        "an empty selection must not touch the mesh"
+    );
+    assert!(
+        harness.app.status.to_lowercase().contains("collapse"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Three corners of one quad: enabled, one vertex at their centroid, one undo.
+    let (before_positions, before_polygons, corners) = {
+        let mesh = selected_mesh(&harness.app, cube);
+        (
+            mesh.positions.clone(),
+            mesh.polygons.clone(),
+            mesh.polygons[0].corners.clone(),
+        )
+    };
+    let collapsed = vec![corners[0].point, corners[1].point, corners[2].point];
+    let centroid = collapsed
+        .iter()
+        .map(|p| before_positions[*p as usize])
+        .sum::<Vec3>()
+        / collapsed.len() as f32;
+    harness.app.mesh_components.insert(cube, collapsed.clone());
+    harness.app.mesh_selected = collapsed.clone();
+    assert!(harness.app.mesh_collapse_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Collapse").1,
+        "point mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    harness.app.perform_mesh_action(MeshAction::Collapse);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole collapse"
+    );
+    let survivor = {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert!(mesh.validate().is_ok());
+        assert_eq!(mesh.positions.len(), before_positions.len() - 2);
+        assert_eq!(
+            mesh.polygons.len(),
+            before_polygons.len() - 1,
+            "the face that collapsed to two corners is gone"
+        );
+        let survivor = mesh
+            .positions
+            .iter()
+            .position(|p| (*p - centroid).length() < 1e-6)
+            .expect("the merged vertex sits at the centroid") as u32;
+        for poly in &mesh.polygons {
+            let mut points: Vec<u32> = poly.corners.iter().map(|c| c.point).collect();
+            points.sort_unstable();
+            points.dedup();
+            assert_eq!(points.len(), poly.corners.len(), "no face repeats a vertex");
+            for corner in &poly.corners {
+                assert!((corner.point as usize) < mesh.positions.len());
+                assert!((corner.uv as usize) < mesh.uvs.len());
+            }
+        }
+        survivor
+    };
+    assert_eq!(
+        harness.app.mesh_selected,
+        vec![survivor],
+        "the selection follows the merged vertex"
+    );
+    assert_eq!(
+        harness.app.mesh_components.get(&cube),
+        Some(&vec![survivor])
+    );
+    let collapsed_mesh = selected_mesh(&harness.app, cube).clone();
+
+    // The rebuilt topology is document state and survives a native round-trip.
+    let text = lc_scene::to_json(&harness.app.doc).unwrap();
+    let loaded = lc_scene::from_json(&text).unwrap();
+    let NodeKind::Mesh { geometry } = &loaded.scene.get(cube).unwrap().kind else {
+        panic!("the cube must load as a mesh");
+    };
+    let loaded_mesh = geometry.mesh().expect("an editable mesh");
+    assert_eq!(loaded_mesh.positions, collapsed_mesh.positions);
+    assert_eq!(loaded_mesh.polygons, collapsed_mesh.polygons);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(
+        mesh.positions, before_positions,
+        "undo restores the exact prior points"
+    );
+    assert_eq!(
+        mesh.polygons, before_polygons,
+        "undo restores the exact prior faces"
+    );
+}
+
+#[test]
+fn disconnect_detaches_selected_faces_and_one_undo_restores_the_mesh() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-disconnect",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Point mode is refused: no undo entry, and the status names the mode.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, vec![0, 1, 2, 3]);
+    harness.app.mesh_selected = vec![0, 1, 2, 3];
+    assert!(!harness.app.mesh_disconnect_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::Disconnect);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.to_lowercase().contains("polygon"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Polygon mode with nothing selected is a no-op that pushes no undo step.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    assert!(!harness.app.mesh_disconnect_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Disconnect);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        harness.app.doc.signature(),
+        before,
+        "an empty selection must not touch the mesh"
+    );
+    assert!(
+        harness.app.status.to_lowercase().contains("disconnect"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // A whole-mesh selection is already one island, so it refuses without undo.
+    let face_count = selected_mesh(&harness.app, cube).polygons.len() as u32;
+    let all: Vec<u32> = (0..face_count).collect();
+    harness.app.mesh_components.insert(cube, all.clone());
+    harness.app.mesh_selected = all;
+    assert!(!harness.app.mesh_disconnect_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Disconnect);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+
+    // One selected face: the menu command is enabled and detaches it in place.
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(harness.app.mesh_disconnect_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Disconnect").1,
+        "polygon mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    let (before_positions, before_polygons, face) = {
+        let mesh = selected_mesh(&harness.app, cube);
+        (
+            mesh.positions.clone(),
+            mesh.polygons.clone(),
+            mesh.polygons[0].clone(),
+        )
+    };
+    harness.app.perform_mesh_action(MeshAction::Disconnect);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole disconnect"
+    );
+    let detached = {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert!(mesh.validate().is_ok());
+        assert_eq!(
+            mesh.positions.len(),
+            before_positions.len() + face.corners.len(),
+            "one copy per point on the cut"
+        );
+        assert_eq!(mesh.polygons.len(), before_polygons.len());
+        assert_eq!(
+            mesh.polygons[1..],
+            before_polygons[1..],
+            "unselected faces are untouched"
+        );
+        for (corner, original) in mesh.polygons[0].corners.iter().zip(face.corners.iter()) {
+            assert_ne!(corner.point, original.point, "cut points are duplicated");
+            assert_eq!(
+                mesh.positions[corner.point as usize], before_positions[original.point as usize],
+                "duplication must not move a point"
+            );
+        }
+        let mut used = vec![false; mesh.positions.len()];
+        for poly in &mesh.polygons {
+            for corner in &poly.corners {
+                assert!((corner.point as usize) < mesh.positions.len());
+                assert!((corner.uv as usize) < mesh.uvs.len());
+                used[corner.point as usize] = true;
+            }
+        }
+        assert!(
+            used.iter().all(|used| *used),
+            "no unused point is left behind"
+        );
+        mesh.clone()
+    };
+    assert_eq!(
+        harness.app.mesh_selected,
+        vec![0],
+        "the face selection stays valid and names the detached island"
+    );
+
+    // The detached topology is document state and survives a native round-trip.
+    let text = lc_scene::to_json(&harness.app.doc).unwrap();
+    let loaded = lc_scene::from_json(&text).unwrap();
+    let NodeKind::Mesh { geometry } = &loaded.scene.get(cube).unwrap().kind else {
+        panic!("the cube must load as a mesh");
+    };
+    let loaded_mesh = geometry.mesh().expect("an editable mesh");
+    assert_eq!(loaded_mesh.positions, detached.positions);
+    assert_eq!(loaded_mesh.polygons, detached.polygons);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(
+        mesh.positions, before_positions,
+        "undo restores the exact prior points"
+    );
+    assert_eq!(
+        mesh.polygons, before_polygons,
+        "undo restores the exact prior faces"
+    );
+}
+
+#[test]
+fn cover_closes_the_selected_hole_and_one_undo_restores_the_mesh() {
+    let (mut harness, _root) =
+        InputHarness::new("input-cover", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    base.polygons.remove(0); // one open four-sided hole
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Point mode is refused: no undo entry, and the status names the mode.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, vec![0, 1, 2, 3]);
+    harness.app.mesh_selected = vec![0, 1, 2, 3];
+    assert!(!harness.app.mesh_cover_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::Cover);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.to_lowercase().contains("polygon"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Polygon mode with nothing selected is a no-op that pushes no undo step.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    assert!(!harness.app.mesh_cover_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Cover);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        harness.app.doc.signature(),
+        before,
+        "an empty selection must not touch the mesh"
+    );
+    assert!(
+        harness.app.status.to_lowercase().contains("cover"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // One face does not ring the hole, so it cannot cover it.
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_cover_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Cover);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+
+    // All five faces ring the hole: enabled, one new face, one undo step.
+    let faces: Vec<u32> = (0..5).collect();
+    harness.app.mesh_components.insert(cube, faces.clone());
+    harness.app.mesh_selected = faces.clone();
+    assert!(harness.app.mesh_cover_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Cover").1,
+        "polygon mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    let (before_positions, before_polygons, before_uvs) = {
+        let mesh = selected_mesh(&harness.app, cube);
+        (
+            mesh.positions.clone(),
+            mesh.polygons.clone(),
+            mesh.uvs.clone(),
+        )
+    };
+    harness.app.perform_mesh_action(MeshAction::Cover);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole cover"
+    );
+    let created;
+    {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert!(mesh.validate().is_ok());
+        assert_eq!(mesh.polygons.len(), before_polygons.len() + 1);
+        assert_eq!(
+            mesh.positions, before_positions,
+            "cover must not move a single point"
+        );
+        assert_eq!(
+            mesh.polygons[..before_polygons.len()].to_vec(),
+            before_polygons,
+            "existing faces keep their corners, UV slots and slots"
+        );
+        assert_eq!(
+            &mesh.uvs[..before_uvs.len()],
+            &before_uvs[..],
+            "existing UV slots are reused"
+        );
+        assert_eq!(mesh.uvs.len(), before_uvs.len() + 4);
+        assert!(mesh.boundary_loops().is_empty(), "the hole is closed");
+        assert!(
+            mesh.edges().iter().all(|edge| edge.faces.len() == 2),
+            "the filled mesh is watertight"
+        );
+        assert!(
+            (mesh.signed_volume() - 1.0).abs() < 1e-4,
+            "the solid is restored: {}",
+            mesh.signed_volume()
+        );
+        for poly in &mesh.polygons {
+            for corner in &poly.corners {
+                assert!((corner.point as usize) < mesh.positions.len());
+                assert!((corner.uv as usize) < mesh.uvs.len());
+            }
+        }
+        created = before_polygons.len() as u32;
+        assert_eq!(mesh.polygons[created as usize].corners.len(), 4);
+    }
+    assert_eq!(
+        harness.app.mesh_selected,
+        vec![created],
+        "the selection names the new face"
+    );
+    assert_eq!(harness.app.mesh_components.get(&cube), Some(&vec![created]));
+    let covered = selected_mesh(&harness.app, cube).clone();
+
+    // The filled topology is document state and survives a native round-trip.
+    let text = lc_scene::to_json(&harness.app.doc).unwrap();
+    let loaded = lc_scene::from_json(&text).unwrap();
+    let NodeKind::Mesh { geometry } = &loaded.scene.get(cube).unwrap().kind else {
+        panic!("the cube must load as a mesh");
+    };
+    let loaded_mesh = geometry.mesh().expect("an editable mesh");
+    assert_eq!(loaded_mesh.positions, covered.positions);
+    assert_eq!(loaded_mesh.polygons, covered.polygons);
+    assert_eq!(loaded_mesh.uvs, covered.uvs);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(
+        mesh.positions, before_positions,
+        "undo restores the exact prior points"
+    );
+    assert_eq!(
+        mesh.polygons, before_polygons,
+        "undo restores the exact prior faces"
+    );
+}
+
+#[test]
+fn create_polygon_appends_the_selected_face_and_one_undo_restores_the_mesh() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-create-polygon",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    base.polygons.remove(0); // one open four-point hole
+    let hole = base.boundary_loops().remove(0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Polygon mode is refused: no undo entry, and the status names the mode.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_create_polygon_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::CreatePolygon);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.to_lowercase().contains("point mode"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Point mode with nothing selected is a no-op that pushes no undo step.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    assert!(!harness.app.mesh_create_polygon_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::CreatePolygon);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        harness.app.doc.signature(),
+        before,
+        "an empty selection must not touch the mesh"
+    );
+    assert!(
+        harness.app.status.to_lowercase().contains("create"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Three of the four border points cannot close the hole.
+    let partial: Vec<u32> = hole[..3].to_vec();
+    harness.app.mesh_components.insert(cube, partial.clone());
+    harness.app.mesh_selected = partial;
+    assert!(!harness.app.mesh_create_polygon_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::CreatePolygon);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+
+    // The whole border: enabled, one new face over the existing points.
+    let mut selected = hole.clone();
+    selected.reverse(); // the mesh adjacency decides the order, not the click order
+    harness.app.mesh_components.insert(cube, selected.clone());
+    harness.app.mesh_selected = selected;
+    assert!(harness.app.mesh_create_polygon_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Create Polygon").1,
+        "point mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    let (before_positions, before_polygons) = {
+        let mesh = selected_mesh(&harness.app, cube);
+        (mesh.positions.clone(), mesh.polygons.clone())
+    };
+    harness.app.perform_mesh_action(MeshAction::CreatePolygon);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole action"
+    );
+    let created = before_polygons.len() as u32;
+    {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert!(mesh.validate().is_ok());
+        assert_eq!(mesh.polygons.len(), before_polygons.len() + 1);
+        assert_eq!(
+            mesh.positions, before_positions,
+            "no point is created or moved"
+        );
+        assert_eq!(
+            mesh.polygons[..before_polygons.len()].to_vec(),
+            before_polygons,
+            "existing faces keep their corners, UV slots and slots"
+        );
+        let face = &mesh.polygons[created as usize];
+        assert_eq!(face.corners.len(), hole.len());
+        let mut face_points: Vec<u32> = face.corners.iter().map(|c| c.point).collect();
+        face_points.sort_unstable();
+        let mut expected = hole.clone();
+        expected.sort_unstable();
+        assert_eq!(face_points, expected, "the face reuses the border points");
+        for corner in &mesh.polygons[created as usize].corners {
+            assert!((corner.point as usize) < mesh.positions.len());
+            assert!((corner.uv as usize) < mesh.uvs.len());
+        }
+        assert!(mesh.boundary_loops().is_empty(), "the hole is closed");
+        assert!(
+            (mesh.signed_volume() - 1.0).abs() < 1e-4,
+            "the solid is restored: {}",
+            mesh.signed_volume()
+        );
+    }
+    assert_eq!(
+        harness.app.mesh_selected,
+        vec![created],
+        "the selection names the new face"
+    );
+    assert_eq!(harness.app.mesh_components.get(&cube), Some(&vec![created]));
+    let created_mesh = selected_mesh(&harness.app, cube).clone();
+
+    // The new face is document state and survives a native round-trip.
+    let text = lc_scene::to_json(&harness.app.doc).unwrap();
+    let loaded = lc_scene::from_json(&text).unwrap();
+    let NodeKind::Mesh { geometry } = &loaded.scene.get(cube).unwrap().kind else {
+        panic!("the cube must load as a mesh");
+    };
+    let loaded_mesh = geometry.mesh().expect("an editable mesh");
+    assert_eq!(loaded_mesh.positions, created_mesh.positions);
+    assert_eq!(loaded_mesh.polygons, created_mesh.polygons);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(
+        mesh.positions, before_positions,
+        "undo restores the exact prior points"
+    );
+    assert_eq!(
+        mesh.polygons, before_polygons,
+        "undo restores the exact prior faces"
+    );
+}
+
+#[test]
+fn optimize_welds_nearby_selected_points_and_one_undo_restores_the_mesh() {
+    let (mut harness, _root) =
+        InputHarness::new("input-optimize", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    // Two quads that meet along a seam of near-duplicate points.
+    let mut mesh = lc_geom::Mesh::new("optimize strip");
+    mesh.positions = vec![
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(1.0004, 0.0, 0.0),
+        Vec3::new(2.0, 0.0, 0.0),
+        Vec3::new(1.0004, 0.0, 1.0),
+        Vec3::new(2.0, 0.0, 1.0),
+    ];
+    mesh.polygons.push(lc_geom::Polygon::new(vec![
+        lc_geom::Corner::new(0, 0),
+        lc_geom::Corner::new(2, 0),
+        lc_geom::Corner::new(3, 0),
+        lc_geom::Corner::new(1, 0),
+    ]));
+    mesh.polygons.push(lc_geom::Polygon::new(vec![
+        lc_geom::Corner::new(4, 0),
+        lc_geom::Corner::new(6, 0),
+        lc_geom::Corner::new(7, 0),
+        lc_geom::Corner::new(5, 0),
+    ]));
+    mesh.uvs = vec![glam::Vec2::ZERO; 8];
+    let before_positions = mesh.positions.clone();
+    let before_polygons = mesh.polygons.clone();
+    set_editable_geometry(&mut harness.app, cube, mesh);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Polygon mode is refused: no undo entry, and the status names the mode.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_optimize_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::Optimize);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.to_lowercase().contains("point mode"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Point mode with nothing selected is a no-op with its own message.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Optimize);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        harness.app.doc.signature(),
+        before,
+        "an empty selection must not touch the mesh"
+    );
+    assert!(
+        harness.app.status.contains("at least two points"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // A zero tolerance is refused before any geometry work.
+    harness.app.mesh_optimize_tolerance = 0.0;
+    harness.app.mesh_components.insert(cube, vec![1, 4]);
+    harness.app.mesh_selected = vec![1, 4];
+    assert!(!harness.app.mesh_optimize_ready());
+    harness.app.perform_mesh_action(MeshAction::Optimize);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("positive optimize tolerance"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Two points further apart than the tolerance do not optimize.
+    harness.app.mesh_optimize_tolerance = 0.001;
+    harness.app.mesh_components.insert(cube, vec![0, 2]);
+    harness.app.mesh_selected = vec![0, 2];
+    assert!(!harness.app.mesh_optimize_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Optimize);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+    assert!(
+        harness.app.status.contains("within the optimize tolerance"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Both seam pairs: enabled, one welded strip, one undo step.
+    let selected: Vec<u32> = vec![1, 3, 4, 6];
+    harness.app.mesh_components.insert(cube, selected.clone());
+    harness.app.mesh_selected = selected.clone();
+    assert!(harness.app.mesh_optimize_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Optimize").1,
+        "point mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    harness.app.perform_mesh_action(MeshAction::Optimize);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole optimize"
+    );
+    {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert!(mesh.validate().is_ok());
+        assert_eq!(mesh.positions.len(), before_positions.len() - 2);
+        assert_eq!(mesh.polygons.len(), before_polygons.len());
+        assert_eq!(
+            mesh.polygons[0], before_polygons[0],
+            "a face away from the weld keeps its corner record"
+        );
+        assert_eq!(mesh.positions[5], before_positions[7]);
+        let seam = mesh
+            .edges()
+            .into_iter()
+            .find(|edge| edge.a == 1 && edge.b == 3)
+            .expect("the welded seam is an edge");
+        assert_eq!(seam.faces.len(), 2, "the weld joins both quads");
+        for poly in &mesh.polygons {
+            for corner in &poly.corners {
+                assert!((corner.point as usize) < mesh.positions.len());
+                assert!((corner.uv as usize) < mesh.uvs.len());
+            }
+        }
+    }
+    assert_eq!(
+        harness.app.mesh_selected,
+        vec![1, 3],
+        "the selection follows the surviving points"
+    );
+    assert_eq!(harness.app.mesh_components.get(&cube), Some(&vec![1, 3]));
+    let optimized = selected_mesh(&harness.app, cube).clone();
+
+    // The welded topology is document state and survives a native round-trip.
+    let text = lc_scene::to_json(&harness.app.doc).unwrap();
+    let loaded = lc_scene::from_json(&text).unwrap();
+    let NodeKind::Mesh { geometry } = &loaded.scene.get(cube).unwrap().kind else {
+        panic!("the cube must load as a mesh");
+    };
+    let loaded_mesh = geometry.mesh().expect("an editable mesh");
+    assert_eq!(loaded_mesh.positions, optimized.positions);
+    assert_eq!(loaded_mesh.polygons, optimized.polygons);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(
+        mesh.positions, before_positions,
+        "undo restores the exact prior points"
+    );
+    assert_eq!(
+        mesh.polygons, before_polygons,
+        "undo restores the exact prior faces"
+    );
+}
+
+#[test]
+fn point_slide_moves_the_selection_and_one_undo_restores_the_mesh() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-point-slide",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    // Two quads sharing an edge; point 0 has exactly two neighbours.
+    let mut mesh = lc_geom::Mesh::new("slide strip");
+    mesh.positions = vec![
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(2.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(2.0, 0.0, 1.0),
+    ];
+    mesh.polygons.push(lc_geom::Polygon::new(vec![
+        lc_geom::Corner::new(0, 0),
+        lc_geom::Corner::new(3, 0),
+        lc_geom::Corner::new(4, 0),
+        lc_geom::Corner::new(1, 0),
+    ]));
+    mesh.polygons.push(lc_geom::Polygon::new(vec![
+        lc_geom::Corner::new(1, 0),
+        lc_geom::Corner::new(4, 0),
+        lc_geom::Corner::new(5, 0),
+        lc_geom::Corner::new(2, 0),
+    ]));
+    mesh.uvs = vec![glam::Vec2::ZERO; 6];
+    set_editable_geometry(&mut harness.app, cube, mesh);
+    // The editor's stored mesh is the byte-for-byte baseline.
+    let before_positions = selected_mesh(&harness.app, cube).positions.clone();
+    let before_polygons = selected_mesh(&harness.app, cube).polygons.clone();
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+
+    // Polygon mode is refused before any position changes.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_point_slide_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::PointSlide);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("point mode"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Point mode with nothing selected is a no-op with its own message.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    harness.app.mesh_components.insert(cube, Vec::new());
+    harness.app.mesh_selected.clear();
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::PointSlide);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+    assert!(
+        harness.app.status.contains("at least one point"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // A fraction outside 0..=1 is refused before any geometry work.
+    harness.app.mesh_slide_fraction = 1.5;
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_point_slide_ready());
+    harness.app.perform_mesh_action(MeshAction::PointSlide);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+    assert!(
+        harness.app.status.contains("slide fraction"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // A zero fraction cannot move anything and is its own no-op message.
+    harness.app.mesh_slide_fraction = 0.0;
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_point_slide_ready());
+    harness.app.perform_mesh_action(MeshAction::PointSlide);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+    assert!(
+        harness.app.status.contains("above 0"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // A selection that names no live point cannot slide either.
+    harness.app.mesh_slide_fraction = 0.5;
+    harness.app.mesh_components.insert(cube, vec![99]);
+    harness.app.mesh_selected = vec![99];
+    assert!(!harness.app.mesh_point_slide_ready());
+    harness.app.perform_mesh_action(MeshAction::PointSlide);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+    assert!(
+        harness.app.status.contains("neighbours"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // A valid point slides half way toward its neighbours in one undo step.
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(harness.app.mesh_point_slide_ready());
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Point Slide").1,
+        "point mode enables the menu command"
+    );
+    harness.open_menu("menu:Tools"); // close the menu again
+    harness.app.perform_mesh_action(MeshAction::PointSlide);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth + 1,
+        "one undo step for the whole slide"
+    );
+    {
+        let mesh = selected_mesh(&harness.app, cube);
+        assert!(mesh.validate().is_ok());
+        let expected = Vec3::new(0.25, 0.0, 0.25);
+        assert!(
+            (mesh.positions[0] - expected).length() < 1e-6,
+            "got {:?}",
+            mesh.positions[0]
+        );
+        for index in 1..mesh.positions.len() {
+            assert_eq!(mesh.positions[index], before_positions[index]);
+        }
+        assert_eq!(
+            mesh.polygons, before_polygons,
+            "sliding points keeps every face corner record"
+        );
+    }
+    assert_eq!(
+        harness.app.mesh_selected,
+        vec![0],
+        "the selection still names the slid point"
+    );
+    let slid = selected_mesh(&harness.app, cube).clone();
+
+    // The slid positions are document state and survive a native round-trip.
+    let text = lc_scene::to_json(&harness.app.doc).unwrap();
+    let loaded = lc_scene::from_json(&text).unwrap();
+    let NodeKind::Mesh { geometry } = &loaded.scene.get(cube).unwrap().kind else {
+        panic!("the cube must load as a mesh");
+    };
+    let loaded_mesh = geometry.mesh().expect("an editable mesh");
+    assert_eq!(loaded_mesh.positions, slid.positions);
+    assert_eq!(loaded_mesh.polygons, slid.polygons);
+
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(
+        mesh.positions, before_positions,
+        "undo restores the exact prior points"
+    );
+    assert_eq!(
+        mesh.polygons, before_polygons,
+        "undo restores the exact prior faces"
+    );
+}
+
+#[test]
+fn import_maps_frame_range_to_playback_seconds() {
+    let (mut app, root) = test_app("import-frame-range");
+    let mut doc = Document::empty();
+    doc.settings.fps = 24.0;
+    doc.settings.frame_start = 12.0;
+    doc.settings.frame_end = 96.0;
+    doc.append_node(NodeKind::Null, "Imported", None);
+    let path = root.path.join("take.lcscene");
+    std::fs::write(&path, lc_scene::to_json(&doc).unwrap()).unwrap();
+
+    app.import_file(path);
+
+    // Documents store frames; the playback clock runs in seconds.
+    assert!((app.playback.fps - 24.0).abs() < 1e-6);
+    assert!(
+        (app.playback.start - 0.5).abs() < 1e-6,
+        "start {}",
+        app.playback.start
+    );
+    assert!(
+        (app.playback.end - 4.0).abs() < 1e-6,
+        "end {}",
+        app.playback.end
+    );
+    assert!((app.playback.time - 0.5).abs() < 1e-6);
 }

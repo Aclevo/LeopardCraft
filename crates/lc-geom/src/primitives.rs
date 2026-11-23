@@ -144,6 +144,56 @@ pub fn sphere_mesh(radius: f32, segments: u32, rings: u32) -> Mesh {
     m
 }
 
+/// Capsule along Y: a cylinder of `height` minus its two hemispherical caps.
+/// The profile is revolved and welded so the poles close cleanly.
+pub fn capsule_mesh(radius: f32, height: f32, segments: u32, rings: u32) -> Mesh {
+    let r = radius.abs().max(1e-4);
+    let h = height.abs().max(r * 2.0);
+    let half = h * 0.5;
+    let cylinder = (half - r).max(0.0);
+    let steps = (rings.clamp(2, 128) / 2).max(2);
+    let mut profile = Vec::with_capacity(steps as usize * 2 + 2);
+    for i in 0..=steps {
+        let a = std::f32::consts::FRAC_PI_2 * i as f32 / steps as f32;
+        profile.push(Vec2::new(r * a.sin(), -cylinder - r * a.cos()));
+    }
+    for i in 0..=steps {
+        let a = std::f32::consts::FRAC_PI_2 * i as f32 / steps as f32;
+        profile.push(Vec2::new(r * a.cos(), cylinder + r * a.sin()));
+    }
+    let mut m = crate::lathe(&profile, segments, 360.0, false);
+    m.name = "Capsule".into();
+    m
+}
+
+/// Flat disc in the XZ plane, facing +Y, as a triangle fan.
+pub fn disc_mesh(radius: f32, segments: u32) -> Mesh {
+    let r = radius.abs().max(1e-4);
+    let segments = segments.clamp(3, 512);
+    let mut m = Mesh::new("Disc");
+    let center = m.add_point(Vec3::ZERO);
+    let center_uv = m.add_uv(Vec2::splat(0.5));
+    let mut ring = Vec::with_capacity(segments as usize);
+    let mut ring_uv = Vec::with_capacity(segments as usize);
+    for i in 0..segments {
+        let a = TAU * i as f32 / segments as f32;
+        ring.push(m.add_point(Vec3::new(r * a.cos(), 0.0, -r * a.sin())));
+        ring_uv.push(m.add_uv(Vec2::new(0.5 + 0.5 * a.cos(), 0.5 + 0.5 * a.sin())));
+    }
+    for i in 0..segments as usize {
+        let next = (i + 1) % segments as usize;
+        m.polygons.push(Polygon {
+            corners: vec![
+                Corner::new(center, center_uv),
+                Corner::new(ring[i], ring_uv[i]),
+                Corner::new(ring[next], ring_uv[next]),
+            ],
+            material_slot: 0,
+        });
+    }
+    m
+}
+
 /// Cylinder along Y with n-gon caps.
 pub fn cylinder_mesh(radius: f32, height: f32, segments: u32) -> Mesh {
     let r = radius.abs().max(1e-4);
@@ -355,6 +405,8 @@ mod tests {
             cone_mesh(1.0, 2.0, 24),
             torus_mesh(1.0, 0.35, 32, 16),
             plane_mesh(4.0, 4.0, 4, 4),
+            capsule_mesh(0.5, 2.0, 24, 12),
+            disc_mesh(1.0, 24),
         ];
         for m in &meshes {
             assert!(m.validate().is_ok(), "{:?}", m.validate().err());
@@ -365,6 +417,35 @@ mod tests {
         assert!(meshes[2].signed_volume() > 0.0);
         assert!(meshes[3].signed_volume() > 0.0);
         assert!(meshes[4].signed_volume() > 0.0);
+        assert!(meshes[6].signed_volume() > 0.0);
+    }
+
+    #[test]
+    fn capsule_has_flat_sides_and_spherical_caps() {
+        let capsule = capsule_mesh(0.5, 3.0, 24, 12);
+        let bounds = capsule.bounds();
+        assert!((bounds.size().y - 3.0).abs() < 1e-3);
+        assert!((bounds.size().x - 1.0).abs() < 1e-3);
+        // The cylindrical waist is straight: every side point sits at radius 0.5
+        // except the rounded cap vertices near either pole.
+        let waist = capsule
+            .positions
+            .iter()
+            .filter(|p| p.y.abs() <= 1.0 + 1e-5)
+            .collect::<Vec<_>>();
+        assert!(waist.len() > 8);
+        assert!(waist
+            .iter()
+            .all(|p| (Vec2::new(p.x, p.z).length() - 0.5).abs() < 1e-3));
+    }
+
+    #[test]
+    fn disc_is_a_flat_fan() {
+        let disc = disc_mesh(2.0, 16);
+        assert_eq!(disc.polygons.len(), 16);
+        assert!(disc.polygons.iter().all(|p| p.corners.len() == 3));
+        assert!(disc.positions.iter().all(|p| p.y.abs() < 1e-6));
+        assert!((disc.bounds().size().x - 4.0).abs() < 1e-4);
     }
 
     #[test]

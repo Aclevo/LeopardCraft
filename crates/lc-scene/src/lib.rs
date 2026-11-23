@@ -7,6 +7,7 @@ pub mod document;
 pub mod eval;
 pub mod format;
 pub mod geometry;
+pub mod ik;
 pub mod light;
 pub mod scene;
 pub mod undo;
@@ -23,12 +24,21 @@ pub use format::{
     from_json, load_native, recover_interrupted_save, recover_interrupted_saves, save_native,
     take_warnings, to_json,
 };
-pub use geometry::{CsgOperation, GeometrySource, Modifier, ModifierInput, Primitive};
+pub use geometry::{
+    CsgOperation, GeometrySource, Modifier, ModifierInput, Primitive, SubdivisionScheme,
+};
+pub use ik::{
+    bake_ik_edits, bake_ik_range_edits, ik_chain_joints, solve_chain, IkChain, IkSolution,
+    JointLimits,
+};
 pub use light::{Light, LightKind};
-pub use scene::{Node, NodeId, NodeKind, NodeProps, Scene, Skin, Subtree, Tag};
+pub use scene::{
+    MorphSet, MorphTarget, Node, NodeId, NodeKind, NodeProps, ProximityWeightOptions, Scene, Skin,
+    Subtree, Tag,
+};
 pub use undo::{
-    AddMaterialCmd, AddNodeCmd, Command, DeleteNodeCmd, History, RemoveMaterialCmd, RenameNodeCmd,
-    ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetAnimationsCmd, SetMaterialCmd,
-    SetNodePropsCmd, SetNodesPropsCmd, SetSettingsCmd, SetShapeCmd, SetShapesCmd,
-    SetTagAnimationCmd, SetTransformCmd, SetTransformsCmd, Shape,
+    AddMaterialCmd, AddNodeCmd, AddNodesCmd, Command, DeleteNodeCmd, History, RemoveMaterialCmd,
+    RenameNodeCmd, ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetAnimationsCmd,
+    SetMaterialCmd, SetMorphCmd, SetNodePropsCmd, SetNodesPropsCmd, SetSettingsCmd, SetShapeCmd,
+    SetShapesCmd, SetTagAnimationCmd, SetTransformCmd, SetTransformsCmd, Shape,
 };

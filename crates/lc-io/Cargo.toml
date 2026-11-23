@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 lc-core = { path = "../lc-core" }
+lc-anim = { path = "../lc-anim" }
 lc-geom = { path = "../lc-geom" }
 lc-scene = { path = "../lc-scene" }
 lc-shading = { path = "../lc-shading" }

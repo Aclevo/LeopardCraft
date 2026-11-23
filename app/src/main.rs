@@ -23,12 +23,20 @@ fn main() {
         Ok(())
     } else if args[0] == "--headless" {
         run_headless(&args[1..])
+    } else if args[0] == "--mcp" {
+        run_mcp(&args[1..])
     } else if args[0].starts_with('-') {
         Err(format!("unknown option '{}'; see --help", args[0]))
     } else {
         let path = PathBuf::from(&args[0]);
-        match lc_io::import(&path) {
-            Ok(doc) => launch_gui(Some(doc), Some(path), startup_warnings),
+        match lc_io::import_with_report(&path) {
+            Ok((doc, report)) => {
+                let mut warnings = startup_warnings;
+                if let Some(summary) = report.summary() {
+                    warnings.push(summary);
+                }
+                launch_gui(Some(doc), Some(path), warnings)
+            }
             Err(e) => Err(e),
         }
     };
@@ -87,7 +95,10 @@ fn print_help() {
            leopardcraft --headless render [options]\n\
            leopardcraft --headless export [options]\n\
            leopardcraft --headless selftest\n\
-           leopardcraft --headless lifecycle\n\n\
+           leopardcraft --headless lifecycle\n\
+           leopardcraft --mcp [--scene <path>]\n\n\
+         MCP options:\n\
+           --scene <path>      scene to load (default: built-in studio)\n\n\
          Render options:\n\
            --scene <path>      scene file (default: built-in studio)\n\
            --out <path>        output .png or .exr (default: render.png)\n\
@@ -127,11 +138,29 @@ fn run_headless(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_mcp(args: &[String]) -> Result<(), String> {
+    let (doc, path) = match flag(args, "--scene") {
+        Some(scene) => {
+            let path = PathBuf::from(scene);
+            let (doc, report) = lc_io::import_with_report(&path)?;
+            if let Some(summary) = report.summary() {
+                eprintln!("warning: {summary}");
+            }
+            (doc, Some(path))
+        }
+        None => (Document::demo(), None),
+    };
+    lc_mcp::McpServer::new(doc, path).serve_stdio()
+}
+
 fn load_document(scene: Option<String>) -> Result<(Document, PathBuf), String> {
     match scene {
         Some(path) => {
             let path = PathBuf::from(path);
-            let doc = lc_io::import(&path)?;
+            let (doc, report) = lc_io::import_with_report(&path)?;
+            if let Some(summary) = report.summary() {
+                eprintln!("warning: {summary}");
+            }
             Ok((doc, path))
         }
         None => Ok((Document::demo(), PathBuf::new())),

@@ -1,5 +1,6 @@
 //! Scene graph: hierarchical nodes, transforms, tags and skins.
 
+use crate::ik::{IkChain, JointLimits};
 use crate::{Camera, GeometrySource, Light, Modifier};
 use glam::{Mat4, Vec3};
 use lc_anim::AnimationClip;
@@ -111,6 +112,26 @@ pub struct Skin {
     pub weights: Vec<[f32; 4]>,
 }
 
+/// Controls for the proximity auto-weight pass. Cheetah3D documents a bind
+/// dropoff rate and a maximum influence count; the exponent blends those into
+/// one deterministic inverse-distance falloff.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProximityWeightOptions {
+    pub dropoff: f32,
+    pub strength: f32,
+    pub max_influences: usize,
+}
+
+impl Default for ProximityWeightOptions {
+    fn default() -> Self {
+        Self {
+            dropoff: 2.0,
+            strength: 0.6,
+            max_influences: 4,
+        }
+    }
+}
+
 impl Skin {
     pub fn new(joints: Vec<NodeId>, inverse_bind: Vec<Mat4>) -> Self {
         Self {
@@ -130,6 +151,384 @@ impl Skin {
     pub fn bind_all_to_first(&mut self, vertex_count: usize) {
         self.joint_indices = vec![[0, 0, 0, 0]; vertex_count];
         self.weights = vec![[1.0, 0.0, 0.0, 0.0]; vertex_count];
+    }
+
+    /// Leave every vertex unweighted. Such vertices deliberately stay at their
+    /// rest positions until painted; they do not silently fall back to joint 0.
+    pub fn clear_weights(&mut self, vertex_count: usize) {
+        self.joint_indices = vec![[0, 0, 0, 0]; vertex_count];
+        self.weights = vec![[0.0, 0.0, 0.0, 0.0]; vertex_count];
+    }
+
+    /// Replace all weights with normalized proximity weights to the joint bone
+    /// segments. Each `segments` entry must correspond to the same `joints`
+    /// index and is `(head, tail)` in mesh space. `dropoff` and `strength`
+    /// increase how quickly distant joints lose influence; `max_influences` is
+    /// clamped to the four available slots.
+    pub fn auto_weight_proximity(
+        &mut self,
+        positions: &[Vec3],
+        segments: &[(Vec3, Vec3)],
+        options: ProximityWeightOptions,
+    ) -> bool {
+        if self.joints.is_empty() || segments.len() != self.joints.len() {
+            return false;
+        }
+        let max_influences = options.max_influences.clamp(1, 4);
+        let dropoff = if options.dropoff.is_finite() {
+            options.dropoff.clamp(0.05, 16.0)
+        } else {
+            ProximityWeightOptions::default().dropoff
+        };
+        let strength = if options.strength.is_finite() {
+            options.strength.clamp(0.0, 1.0)
+        } else {
+            ProximityWeightOptions::default().strength
+        };
+        let exponent = dropoff * (0.35 + 1.65 * strength);
+        self.joint_indices = vec![[0; 4]; positions.len()];
+        self.weights = vec![[0.0; 4]; positions.len()];
+        for (vertex, position) in positions.iter().enumerate() {
+            let mut ranked: Vec<(usize, f32)> = segments
+                .iter()
+                .enumerate()
+                .map(|(joint, (head, tail))| {
+                    let distance = point_segment_distance(*position, *head, *tail);
+                    (joint, distance)
+                })
+                .collect();
+            let closest = ranked
+                .iter()
+                .map(|(_, distance)| *distance)
+                .fold(f32::INFINITY, f32::min);
+            for (_, distance) in &mut ranked {
+                let ratio = (closest + 0.05) / (*distance + 0.05);
+                *distance = ratio.max(0.0).powf(exponent);
+            }
+            ranked.sort_by(|(joint_a, score_a), (joint_b, score_b)| {
+                score_b
+                    .total_cmp(score_a)
+                    .then_with(|| joint_a.cmp(joint_b))
+            });
+            let mut total = 0.0;
+            for (slot, (joint, score)) in ranked.into_iter().take(max_influences).enumerate() {
+                self.joint_indices[vertex][slot] = joint as u32;
+                self.weights[vertex][slot] = score.max(0.0);
+                total += score.max(0.0);
+            }
+            if total > 1e-8 {
+                for weight in &mut self.weights[vertex] {
+                    *weight /= total;
+                }
+            } else {
+                self.joint_indices[vertex] = [0; 4];
+                self.weights[vertex] = [0.0; 4];
+            }
+            self.compact_vertex(vertex);
+        }
+        true
+    }
+
+    /// Weight assigned to `joint` (an index into `joints`) for `vertex`.
+    pub fn influence(&self, vertex: usize, joint: usize) -> f32 {
+        if joint >= self.joints.len() {
+            return 0.0;
+        }
+        let Some(indices) = self.joint_indices.get(vertex) else {
+            return 0.0;
+        };
+        let weights = self.weights.get(vertex).copied().unwrap_or_default();
+        indices
+            .iter()
+            .zip(weights)
+            .find(|(index, _)| **index as usize == joint)
+            .map(|(_, weight)| weight)
+            .unwrap_or(0.0)
+    }
+
+    /// Set one joint's influence on a vertex and renormalize the remaining
+    /// four slots. A new influence takes a free slot or replaces the smallest
+    /// one, so a vertex never carries more than four joints.
+    pub fn set_influence(&mut self, vertex: usize, joint: usize, weight: f32) -> bool {
+        if joint >= self.joints.len() || vertex >= self.vertex_count() {
+            return false;
+        }
+        let weight = if weight.is_finite() {
+            weight.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let indices = &mut self.joint_indices[vertex];
+        let weights = &mut self.weights[vertex];
+        if let Some(slot) = indices.iter().position(|index| *index as usize == joint) {
+            weights[slot] = weight;
+        } else if weight > 0.0 {
+            let slot = weights
+                .iter()
+                .position(|weight| *weight <= 0.0)
+                .or_else(|| {
+                    weights
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                        .map(|(slot, _)| slot)
+                })
+                .unwrap_or(0);
+            indices[slot] = joint as u32;
+            weights[slot] = weight;
+        }
+        self.compact_vertex(vertex);
+        self.normalize_vertex(vertex);
+        true
+    }
+
+    /// Replace every influence on a vertex with one joint. Used by the
+    /// replace brush so a painted area does not retain unrelated joints.
+    pub fn set_exclusive_influence(&mut self, vertex: usize, joint: usize, weight: f32) -> bool {
+        if joint >= self.joints.len() || vertex >= self.vertex_count() {
+            return false;
+        }
+        let weight = if weight.is_finite() {
+            weight.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.joint_indices[vertex] = [joint as u32, 0, 0, 0];
+        self.weights[vertex] = [weight, 0.0, 0.0, 0.0];
+        self.compact_vertex(vertex);
+        self.normalize_vertex(vertex);
+        true
+    }
+
+    /// Drop zero and out-of-range slots, merge duplicate joints, keep the four
+    /// strongest influences and sort them for deterministic serialization.
+    pub fn compact_vertex(&mut self, vertex: usize) {
+        if vertex >= self.vertex_count() {
+            return;
+        }
+        let mut pairs: Vec<(u32, f32)> = self.joint_indices[vertex]
+            .iter()
+            .copied()
+            .zip(self.weights[vertex])
+            .filter(|(index, weight)| {
+                (*index as usize) < self.joints.len() && weight.is_finite() && *weight > 0.0
+            })
+            .collect();
+        pairs.sort_by(|(joint_a, weight_a), (joint_b, weight_b)| {
+            weight_b
+                .total_cmp(weight_a)
+                .then_with(|| joint_a.cmp(joint_b))
+        });
+        let mut merged: Vec<(u32, f32)> = Vec::with_capacity(4);
+        for (joint, weight) in pairs {
+            if let Some((_, total)) = merged.iter_mut().find(|(other, _)| *other == joint) {
+                *total += weight;
+            } else if merged.len() < 4 {
+                merged.push((joint, weight));
+            }
+        }
+        merged.sort_by(|(joint_a, weight_a), (joint_b, weight_b)| {
+            weight_b
+                .total_cmp(weight_a)
+                .then_with(|| joint_a.cmp(joint_b))
+        });
+        let mut indices = [0u32; 4];
+        let mut weights = [0.0f32; 4];
+        for (slot, (joint, weight)) in merged.into_iter().enumerate() {
+            indices[slot] = joint;
+            weights[slot] = weight;
+        }
+        self.joint_indices[vertex] = indices;
+        self.weights[vertex] = weights;
+    }
+
+    /// Normalize a vertex to unit total influence when it has any influence.
+    /// A fully cleared vertex remains unweighted and stays at its rest position.
+    pub fn normalize_vertex(&mut self, vertex: usize) {
+        if vertex >= self.vertex_count() {
+            return;
+        }
+        if self.joints.is_empty() {
+            self.weights[vertex] = [0.0; 4];
+            return;
+        }
+        let mut sum = 0.0;
+        for weight in &mut self.weights[vertex] {
+            if !weight.is_finite() || *weight <= 0.0 {
+                *weight = 0.0;
+            } else {
+                sum += *weight;
+            }
+        }
+        if sum > 1e-8 {
+            for weight in &mut self.weights[vertex] {
+                *weight /= sum;
+            }
+        } else {
+            self.joint_indices[vertex] = [0, 0, 0, 0];
+            self.weights[vertex] = [0.0, 0.0, 0.0, 0.0];
+        }
+    }
+
+    /// Repair imported or loaded weights: lengths match the mesh, joint indices
+    /// are in range, duplicate/zero influences are removed, and every vertex is
+    /// normalized to four or fewer influences.
+    pub fn sanitize(&mut self, vertex_count: usize) {
+        if self.joints.is_empty() {
+            self.joint_indices.clear();
+            self.weights.clear();
+            return;
+        }
+        self.joint_indices.resize(vertex_count, [0; 4]);
+        self.weights.resize(vertex_count, [0.0; 4]);
+        self.joint_indices.truncate(vertex_count);
+        self.weights.truncate(vertex_count);
+        for vertex in 0..vertex_count {
+            self.compact_vertex(vertex);
+            self.normalize_vertex(vertex);
+        }
+    }
+}
+
+/// One recorded vertex-offset pose for a mesh. Cheetah3D calls these morph
+/// targets. The manual does not document a numeric weight range; LeopardCraft's
+/// clean-room choice is to clamp to `0..=1` when the pose is applied.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MorphTarget {
+    pub name: String,
+    #[serde(default)]
+    pub deltas: Vec<Vec3>,
+    #[serde(default)]
+    pub weight: f32,
+}
+
+impl MorphTarget {
+    pub fn new(name: impl Into<String>, deltas: Vec<Vec3>) -> Self {
+        Self {
+            name: name.into(),
+            deltas,
+            weight: 0.0,
+        }
+    }
+}
+
+/// A mesh's morph base and additive target poses. The base is the rest shape
+/// recorded before the first target; deltas are relative to it, so a target
+/// keeps its meaning while the live mesh is restored and posed again.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MorphSet {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base: Vec<Vec3>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<MorphTarget>,
+}
+
+impl MorphSet {
+    pub fn is_empty(&self) -> bool {
+        self.base.is_empty() && self.targets.is_empty()
+    }
+
+    pub fn has_base(&self) -> bool {
+        !self.base.is_empty()
+    }
+
+    /// First unused `Morph N` name for a newly captured target.
+    pub fn unique_target_name(&self) -> String {
+        for i in 1..10_000 {
+            let name = format!("Morph {i}");
+            if !self.targets.iter().any(|target| target.name == name) {
+                return name;
+            }
+        }
+        "Morph".into()
+    }
+
+    /// Add every target's weighted offsets to `positions`. LeopardCraft clamps
+    /// weights to `0..=1` as a clean-room range choice (the Cheetah3D Morph
+    /// manual leaves the range unstated); targets recorded against another
+    /// vertex count are skipped so a topology change cannot corrupt evaluation.
+    pub fn apply(&self, positions: &mut [Vec3]) {
+        self.apply_weighted(positions, &[]);
+    }
+
+    /// Apply targets using explicit weights (sampled from a take); missing
+    /// entries fall back to each target's authored weight.
+    pub fn apply_weighted(&self, positions: &mut [Vec3], weights: &[f32]) {
+        for (index, target) in self.targets.iter().enumerate() {
+            let authored = weights.get(index).copied().unwrap_or(target.weight);
+            if !authored.is_finite() {
+                continue;
+            }
+            let weight = authored.clamp(0.0, 1.0);
+            if weight <= 0.0 || target.deltas.len() != positions.len() {
+                continue;
+            }
+            for (position, delta) in positions.iter_mut().zip(&target.deltas) {
+                if delta.is_finite() {
+                    *position += *delta * weight;
+                }
+            }
+        }
+    }
+
+    /// Restore the recorded rest shape. Returns false when the live mesh no
+    /// longer has the recorded vertex count.
+    pub fn restore_base(&self, positions: &mut [Vec3]) -> bool {
+        if self.base.len() != positions.len() {
+            return false;
+        }
+        positions.copy_from_slice(&self.base);
+        true
+    }
+
+    /// Repair imported data: finite poses, clamped weights, unique non-empty
+    /// names and target topology matching the recorded base and live mesh.
+    pub fn sanitize(&mut self, vertex_count: Option<usize>) {
+        if !self.base.iter().all(|position| position.is_finite()) {
+            self.base.clear();
+            self.targets.clear();
+            return;
+        }
+        if self.base.is_empty() {
+            // Targets without a recorded base have no reference shape.
+            self.targets.clear();
+            return;
+        }
+        if !self.base.is_empty() {
+            self.targets
+                .retain(|target| target.deltas.len() == self.base.len());
+        }
+        if let Some(count) = vertex_count {
+            if !self.base.is_empty() && self.base.len() != count {
+                self.base.clear();
+                self.targets.clear();
+                return;
+            }
+            self.targets.retain(|target| target.deltas.len() == count);
+        }
+        self.targets
+            .retain(|target| target.deltas.iter().all(|delta| delta.is_finite()));
+        let mut used = HashSet::new();
+        for (index, target) in self.targets.iter_mut().enumerate() {
+            target.weight = if target.weight.is_finite() {
+                target.weight.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let base = if target.name.trim().is_empty() {
+                format!("Morph {}", index + 1)
+            } else {
+                target.name.trim().to_string()
+            };
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while used.contains(&name) {
+                name = format!("{base} {suffix}");
+                suffix += 1;
+            }
+            used.insert(name.clone());
+            target.name = name;
+        }
     }
 }
 
@@ -225,6 +624,14 @@ pub struct Node {
     pub modifiers: Vec<Modifier>,
     #[serde(default)]
     pub skin: Option<Skin>,
+    #[serde(default, skip_serializing_if = "MorphSet::is_empty")]
+    pub morph: MorphSet,
+    /// Optional IK chain driven from this joint's origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ik: Option<IkChain>,
+    /// Optional local rotation limits for this Joint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_limits: Option<JointLimits>,
     #[serde(default)]
     pub locked: bool,
 }
@@ -248,6 +655,9 @@ impl Node {
             tag_animations: BTreeMap::new(),
             modifiers: Vec::new(),
             skin: None,
+            morph: MorphSet::default(),
+            ik: None,
+            rotation_limits: None,
             locked: false,
         }
     }
@@ -327,6 +737,12 @@ pub struct NodeProps {
     pub material: Option<MaterialId>,
     pub material_slots: BTreeMap<u16, MaterialId>,
     pub tags: Vec<Tag>,
+    /// Per-tag clips keyed by tag index. They travel with the tag list so
+    /// removing a tag in the inspector (or undoing that removal) keeps every
+    /// clip attached to the tag it was recorded on.
+    pub tag_animations: BTreeMap<u32, AnimationClip>,
+    pub ik: Option<IkChain>,
+    pub rotation_limits: Option<JointLimits>,
 }
 
 impl NodeProps {
@@ -339,6 +755,9 @@ impl NodeProps {
             material: node.material,
             material_slots: node.material_slots.clone(),
             tags: node.tags.clone(),
+            tag_animations: node.tag_animations.clone(),
+            ik: node.ik.clone(),
+            rotation_limits: node.rotation_limits.clone(),
         }
     }
 
@@ -350,6 +769,9 @@ impl NodeProps {
         node.material = self.material;
         node.material_slots = self.material_slots.clone();
         node.tags = self.tags.clone();
+        node.tag_animations = self.tag_animations.clone();
+        node.ik = self.ik.clone();
+        node.rotation_limits = self.rotation_limits.clone();
     }
 }
 
@@ -463,6 +885,15 @@ impl Scene {
                 return Err(format!("node {} already exists", node.id));
             }
         }
+        // Validate every reference before touching the scene so a rejected
+        // insert cannot leave a dangling child link behind.
+        for node in &nodes {
+            for child in &node.children {
+                if !ids.contains(child) && !self.nodes.contains_key(child) {
+                    return Err(format!("subtree references missing child {child}"));
+                }
+            }
+        }
         if let Some(p) = parent {
             let parent_node = self
                 .nodes
@@ -477,13 +908,6 @@ impl Scene {
             self.roots.insert(idx, root);
         }
         let mut inserted = nodes;
-        for node in &inserted {
-            for child in &node.children {
-                if !ids.contains(child) && !self.nodes.contains_key(child) {
-                    return Err(format!("subtree references missing child {child}"));
-                }
-            }
-        }
         // Repair parent pointers from the authoritative child lists.
         let mut parent_map: std::collections::HashMap<NodeId, NodeId> =
             std::collections::HashMap::new();
@@ -780,10 +1204,42 @@ impl Scene {
                     h.write_u32(*tag_index);
                     h.write_u64(clip.signature());
                 }
+                if let Some(ik) = &n.ik {
+                    h.write_u64(ik.target);
+                    h.write_u64(ik.pole.unwrap_or(0));
+                    h.write_u64(ik.chain_length as u64);
+                    h.write_u64(ik.iterations as u64);
+                    h.write_f32(ik.tolerance);
+                    h.write_f32(ik.damping);
+                    h.write_u64(ik.enabled as u64);
+                }
+                if let Some(limits) = &n.rotation_limits {
+                    h.write_u64(limits.enabled as u64);
+                    for value in [
+                        limits.min.x,
+                        limits.min.y,
+                        limits.min.z,
+                        limits.max.x,
+                        limits.max.y,
+                        limits.max.z,
+                    ] {
+                        h.write_f32(value);
+                    }
+                }
             }
         }
         h.finish()
     }
+}
+
+fn point_segment_distance(point: Vec3, head: Vec3, tail: Vec3) -> f32 {
+    let segment = tail - head;
+    let length_sq = segment.length_squared();
+    if length_sq <= 1e-12 {
+        return (point - head).length();
+    }
+    let t = ((point - head).dot(segment) / length_sq).clamp(0.0, 1.0);
+    (point - (head + segment * t)).length()
 }
 
 #[cfg(test)]
@@ -847,6 +1303,22 @@ mod tests {
     }
 
     #[test]
+    fn rejected_subtree_insert_leaves_the_scene_untouched() {
+        let mut scene = Scene::new();
+        let root = mesh_node(&mut scene, "Root", None);
+        let mut orphan = Node::new(scene.alloc_id(), "Orphan", NodeKind::Null);
+        orphan.children.push(999);
+        let before = scene.clone();
+
+        assert!(scene
+            .insert_subtree(vec![orphan], Some(root), None)
+            .is_err());
+        assert_eq!(scene, before, "a rejected insert must not mutate the scene");
+        assert!(scene.get(root).unwrap().children.is_empty());
+        assert_eq!(scene.roots, vec![root]);
+    }
+
+    #[test]
     fn duplicate_remaps_ids_and_names() {
         let mut scene = Scene::new();
         let a = mesh_node(&mut scene, "Cube", None);
@@ -859,5 +1331,142 @@ mod tests {
         let copied_child = scene.get(copy).unwrap().children[0];
         assert_ne!(copied_child, b);
         assert_eq!(scene.get(copied_child).unwrap().parent, Some(copy));
+    }
+
+    #[test]
+    fn skin_painting_normalizes_influences_and_keeps_four_slots() {
+        let mut skin = Skin::new(vec![10, 11, 12, 13, 14], vec![Mat4::IDENTITY; 5]);
+        skin.bind_all_to_first(2);
+        assert_eq!(skin.influence(0, 0), 1.0);
+        assert_eq!(skin.influence(0, 1), 0.0);
+
+        assert!(skin.set_influence(0, 1, 1.0));
+        assert!((skin.influence(0, 0) - 0.5).abs() < 1e-6);
+        assert!((skin.influence(0, 1) - 0.5).abs() < 1e-6);
+
+        for joint in 2..5 {
+            assert!(skin.set_influence(0, joint, 0.4));
+        }
+        let mut total = 0.0;
+        let mut used = std::collections::BTreeSet::new();
+        for (index, weight) in skin.joint_indices[0].iter().zip(skin.weights[0]) {
+            assert!((*index as usize) < skin.joints.len());
+            assert!(used.insert(*index), "a joint cannot occupy two slots");
+            assert!(weight >= 0.0);
+            total += weight;
+        }
+        assert!((total - 1.0).abs() < 1e-6);
+        assert_eq!(used.len(), 4);
+    }
+
+    #[test]
+    fn skin_sanitize_repairs_lengths_indices_weights_and_duplicates() {
+        let mut skin = Skin::new(vec![10, 11, 12], vec![Mat4::IDENTITY; 3]);
+        skin.joint_indices = vec![[0, 0, 1, 0], [9, 2, 2, 0], [1, 0, 0, 0], [0, 0, 0, 0]];
+        skin.weights = vec![
+            [0.25, 0.25, 0.5, 0.0],
+            [1.0, 0.5, 0.5, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+            [f32::NAN, 0.0, 0.0, 0.0],
+        ];
+        skin.sanitize(3);
+        assert_eq!(skin.joint_indices.len(), 3);
+        assert_eq!(skin.weights.len(), 3);
+        for (indices, weights) in skin.joint_indices.iter().zip(&skin.weights) {
+            let total: f32 = weights.iter().sum();
+            assert!(total < 1e-6 || (total - 1.0).abs() < 1e-6);
+            let mut used = std::collections::BTreeSet::new();
+            for (index, weight) in indices.iter().zip(weights) {
+                if *weight <= 0.0 {
+                    continue;
+                }
+                assert!((*index as usize) < skin.joints.len());
+                assert!(used.insert(*index), "duplicate joint slots must merge");
+            }
+        }
+        assert_eq!(skin.influence(2, 0), 0.0);
+    }
+
+    #[test]
+    fn proximity_weights_are_normalized_bounded_and_nearest() {
+        let mut skin = Skin::new(vec![10, 11, 12], vec![Mat4::IDENTITY; 3]);
+        let positions = [
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.5, 0.0),
+        ];
+        let segments = [
+            (Vec3::new(-2.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)),
+            (Vec3::new(1.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)),
+            (Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, 3.0, 0.0)),
+        ];
+        assert!(skin.auto_weight_proximity(
+            &positions,
+            &segments,
+            ProximityWeightOptions {
+                dropoff: 2.0,
+                strength: 0.6,
+                max_influences: 2,
+            },
+        ));
+        for weights in skin.weights.iter().take(positions.len()) {
+            let total: f32 = weights.iter().sum();
+            assert!((total - 1.0).abs() < 1e-5);
+            assert!(weights.iter().filter(|w| **w > 0.0).count() <= 2);
+        }
+        assert!(skin.influence(0, 0) > skin.influence(0, 1));
+        assert!(skin.influence(1, 1) > skin.influence(1, 0));
+        assert!(skin.influence(2, 2) > skin.influence(2, 0));
+
+        let bind = |dropoff: f32, strength: f32, max_influences: usize| {
+            let mut variant = Skin::new(vec![10, 11, 12], vec![Mat4::IDENTITY; 3]);
+            assert!(variant.auto_weight_proximity(
+                &positions,
+                &segments,
+                ProximityWeightOptions {
+                    dropoff,
+                    strength,
+                    max_influences,
+                },
+            ));
+            variant
+        };
+
+        let single = bind(2.0, 0.6, 1);
+        for weights in single.weights.iter().take(positions.len()) {
+            assert_eq!(weights.iter().filter(|weight| **weight > 0.0).count(), 1);
+        }
+        assert_ne!(
+            single.weights[0], skin.weights[0],
+            "max influences must change how many joints contribute"
+        );
+
+        let soft = bind(2.0, 0.1, 2);
+        let sharp = bind(2.0, 0.9, 2);
+        assert!(
+            soft.influence(0, 1) > sharp.influence(0, 1),
+            "higher strength must reduce a distant joint's influence"
+        );
+
+        let shallow = bind(0.5, 0.6, 2);
+        let steep = bind(4.0, 0.6, 2);
+        assert!(
+            shallow.influence(0, 1) > steep.influence(0, 1),
+            "higher dropoff must reduce a distant joint's influence"
+        );
+    }
+
+    #[test]
+    fn cleared_weights_stay_unweighted_instead_of_falling_to_the_root() {
+        let mut skin = Skin::new(vec![10, 11], vec![Mat4::IDENTITY; 2]);
+        skin.clear_weights(2);
+        assert_eq!(skin.influence(0, 0), 0.0);
+        skin.normalize_vertex(0);
+        assert_eq!(skin.influence(0, 0), 0.0);
+        assert_eq!(skin.weights[0], [0.0; 4]);
+        skin.clear_weights(2);
+        skin.sanitize(2);
+        assert_eq!(skin.influence(0, 0), 0.0);
+        assert_eq!(skin.weights[0], [0.0; 4]);
     }
 }
