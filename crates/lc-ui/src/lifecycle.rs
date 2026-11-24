@@ -296,6 +296,10 @@ impl DocumentLifecycle {
         self.dirty = is_dirty(doc, self.saved_signature);
     }
 
+    pub(super) fn file_path(&self) -> Option<&Path> {
+        self.file_path.as_deref()
+    }
+
     pub(super) fn is_dirty(&self) -> bool {
         self.dirty
     }

@@ -101,6 +101,7 @@ fn test_app(recovery_dir: &Path, autosave_interval: Duration) -> LeopardApp {
         lifecycle,
         allow_close: false,
         status: "Ready — demo studio loaded".into(),
+        live_bridge: None,
         show_about: false,
         hierarchy_filter: String::new(),
         focus_search: false,

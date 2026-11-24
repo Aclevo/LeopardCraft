@@ -13,11 +13,14 @@ researched Cheetah3D feature matrix, and `TODO.md` tracks feature work.
 
 The remaining `TODO.md` backlog is planned as missions G30–G39 in
 [`docs/agents/goals/ROADMAP.md`](docs/agents/goals/ROADMAP.md). G30–G35 are
-complete, as is [`G38.md`](docs/agents/goals/G38.md); G36, G37 and G39 are
-partially complete with their remaining items recorded in `TODO.md` (G36 is down
-to the Stam-Loop hybrid masks and G39 to attaching the server to a running
-editor, and the research decisions for both are recorded there); the one item
-still needing the user's own approval is the interactive Claude Code session. A
+complete, as is [`G38.md`](docs/agents/goals/G38.md); G36 is complete too,
+including the Stam-Loop hybrid, while G37 and G39 remain partially complete with
+their remaining items recorded in `TODO.md`. G39's live-editor attachment is
+implemented and tested headlessly (bridge, token registry, attach routing,
+selection, editor wiring); the menu toggle is confirmed present in a running
+editor, and what remains is one attach run against a live session. The
+interactive Claude Code session has been approved by the user and now lists the
+LeopardCraft tools. A
 new
 session should read the roadmap before dispatching, and update the mission
 status when it lands.
@@ -147,12 +150,15 @@ EvaluatedScene -> wgpu viewport overlay      crates/lc-ui
 - UI state lives in `LeopardApp` (`crates/lc-ui/src/app.rs`), with panels in
   `panels.rs`/`panels_more.rs`, toolbar/menu code in `shell.rs`, the wgpu
   viewport in `viewport.rs`, and selection/action tests in `selection_tests.rs`.
-- The MCP server (`crates/lc-mcp/src/server.rs`, `tools.rs` and `http.rs`)
-  speaks newline-delimited JSON-RPC over stdio by default and over the opt-in
-  Streamable HTTP transport (`--mcp-http`, loopback only). It supports the
-  `2025-06-18` `initialize` handshake and the `2026-07-28` handshake-free
+- The MCP server (`crates/lc-mcp/src/server.rs`, `tools.rs`, `http.rs` and
+  `bridge.rs`) speaks newline-delimited JSON-RPC over stdio by default and over
+  the opt-in Streamable HTTP transport (`--mcp-http`, loopback only). It supports
+  the `2025-06-18` `initialize` handshake and the `2026-07-28` handshake-free
   revision, publishes resource subscriptions and prompt templates, and owns a
-  separate document; it is not attached to a running editor window.
+  separate document by default. `--attach` connects it to a running editor's
+  opt-in live bridge (`Tools -> Live Agent Bridge`): a loopback HTTP/JSON
+  endpoint whose per-session token lives in a user-only registry, with the
+  editor's UI thread applying one request at a time under its own undo history.
 
 ## Where to change what
 
@@ -294,7 +300,7 @@ this section with `tools/list`:
 `remove_animation_key`, `create_take`, `activate_take`, `update_take`,
 `delete_take`, `get_mesh`, `edit_mesh`, `edit_uv`, `list_materials`, `undo`,
 `redo`, `save_scene`, `open_scene`, `new_scene`, `export_scene`,
-`render_image`.
+`render_image`, `select_objects`.
 
 See `README.md` for their parameters and grouping.
 

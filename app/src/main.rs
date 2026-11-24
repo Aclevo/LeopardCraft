@@ -98,11 +98,12 @@ fn print_help() {
            leopardcraft --headless export [options]\n\
            leopardcraft --headless selftest\n\
            leopardcraft --headless lifecycle\n\
-           leopardcraft --mcp [--scene <path>]\n\
-           leopardcraft --mcp-http [--addr <host:port>] [--scene <path>]\n\n\
+           leopardcraft --mcp [--scene <path>] [--attach]\n\
+           leopardcraft --mcp-http [--addr <host:port>] [--scene <path>] [--attach]\n\n\
          MCP options:\n\
            --scene <path>      scene to load (default: built-in studio)\n\
-           --addr <host:port>  loopback address for --mcp-http (default: 127.0.0.1:8765)\n\n\
+           --addr <host:port>  loopback address for --mcp-http (default: 127.0.0.1:8765)\n\
+           --attach            attach to a running editor's live session\n\n\
          Render options:\n\
            --scene <path>      scene file (default: built-in studio)\n\
            --out <path>        output .png or .exr (default: render.png)\n\
@@ -157,14 +158,32 @@ fn startup_document(args: &[String]) -> Result<(Document, Option<PathBuf>), Stri
 }
 
 fn run_mcp(args: &[String]) -> Result<(), String> {
-    let (doc, path) = startup_document(args)?;
-    lc_mcp::McpServer::new(doc, path).serve_stdio()
+    let server = mcp_server(args)?;
+    server.serve_stdio()
 }
 
 fn run_mcp_http(args: &[String]) -> Result<(), String> {
-    let (doc, path) = startup_document(args)?;
+    let server = mcp_server(args)?;
     let addr = flag(args, "--addr").unwrap_or_else(|| lc_mcp::DEFAULT_HTTP_ADDR.to_string());
-    lc_mcp::McpServer::new(doc, path).serve_http(&addr)
+    server.serve_http(&addr)
+}
+
+/// Build the MCP server, attaching to a running editor when `--attach` is
+/// given. Attachment augments the server: its private document stays as the
+/// fallback for a session that detaches, and discovery prefers the environment
+/// override over the session registry so several open editors stay addressable.
+fn mcp_server(args: &[String]) -> Result<lc_mcp::McpServer, String> {
+    let (doc, path) = startup_document(args)?;
+    let mut server = lc_mcp::McpServer::new(doc, path);
+    if args.iter().any(|flag| flag == "--attach") {
+        let client = lc_mcp::LiveClient::discover()?;
+        eprintln!(
+            "attached to the live editor session on 127.0.0.1:{}",
+            client.entry().port
+        );
+        server.attach(client);
+    }
+    Ok(server)
 }
 
 fn load_document(scene: Option<String>) -> Result<(Document, PathBuf), String> {

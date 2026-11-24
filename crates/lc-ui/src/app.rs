@@ -5,6 +5,7 @@ use self::lifecycle::{
     is_native_scene, AutosaveOutcome, DocumentLifecycle, GuardChoice, GuardResult, PendingAction,
     SaveKind, StartupOutcome,
 };
+use self::live::LiveSession;
 use self::recovery::RecoveryStore;
 use self::selection::Selection;
 use crate::icons::{self, Icon};
@@ -19,6 +20,7 @@ use lc_anim::{
 };
 use lc_core::{look_at_quat, ray_triangle, Pcg32, Transform};
 use lc_geom::Mesh;
+use lc_mcp::bridge::BridgeServer;
 use lc_render::{PathTracer, RenderScene};
 use lc_scene::{
     bake_ik_range_edits, ik_chain_joints, AddNodeCmd, Camera, Command, Document, Environment,
@@ -50,6 +52,8 @@ mod documents;
 mod lifecycle;
 #[path = "lifecycle_harness.rs"]
 mod lifecycle_harness;
+#[path = "live.rs"]
+mod live;
 #[path = "mesh_edit.rs"]
 mod mesh_edit;
 #[path = "panels.rs"]
@@ -875,6 +879,8 @@ pub struct LeopardApp {
     lifecycle: DocumentLifecycle,
     allow_close: bool,
     status: String,
+    /// The opt-in live-agent endpoint, present only while the user enabled it.
+    live_bridge: Option<BridgeServer>,
     show_about: bool,
     hierarchy_filter: String,
     focus_search: bool,
@@ -1020,6 +1026,7 @@ impl LeopardApp {
             lifecycle,
             allow_close: false,
             status: "Ready — demo studio loaded".into(),
+            live_bridge: None,
             show_about: false,
             hierarchy_filter: String::new(),
             focus_search: false,
@@ -1546,6 +1553,68 @@ impl LeopardApp {
         }
     }
 
+    /// Turn the editor into an attachable MCP session, or back off. The token is
+    /// generated per session and published in a user-only registry file, and the
+    /// endpoint binds loopback only. Off is the default and the engine never
+    /// opens a socket on its own.
+    fn toggle_live_bridge(&mut self) {
+        if self.live_bridge.take().is_some() {
+            self.status = "Live agent bridge off".into();
+            return;
+        }
+        let name = self
+            .lifecycle
+            .file_path()
+            .and_then(|path| path.file_stem())
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| "LeopardCraft".into());
+        match BridgeServer::start(&name) {
+            Ok(server) => {
+                self.status = format!(
+                    "Live agent bridge on 127.0.0.1:{} — attach with `leopardcraft --mcp --attach`",
+                    server.port()
+                );
+                self.live_bridge = Some(server);
+            }
+            Err(error) => self.status = format!("Live agent bridge failed: {error}"),
+        }
+    }
+
+    /// Answer the requests the live-agent endpoint queued since the last frame.
+    /// Each one is answered exactly once, on this thread, so tool calls never
+    /// race the document or the viewport.
+    fn service_live_bridge(&mut self, ctx: &egui::Context) {
+        let Some(bridge) = self.live_bridge.as_ref() else {
+            return;
+        };
+        let jobs = bridge.drain();
+        if jobs.is_empty() {
+            return;
+        }
+        let path = self.lifecycle.file_path().map(|path| path.to_path_buf());
+        let dirty = self.lifecycle.is_dirty();
+        let changed = {
+            let mut session = LiveSession {
+                doc: &mut self.doc,
+                history: &mut self.history,
+                path,
+                dirty,
+                selection: &mut self.selection,
+            };
+            for job in jobs {
+                let answer = live::handle(&mut session, &job.request);
+                job.reply(answer);
+            }
+            session.path
+        };
+        if changed != self.lifecycle.file_path().map(|path| path.to_path_buf()) {
+            self.lifecycle.loaded(&self.doc, changed);
+        }
+        self.selection.retain_existing(&self.doc.scene);
+        self.invalidate_pending();
+        ctx.request_repaint();
+    }
+
     fn invalidate_pending(&mut self) {
         self.pending_transform = None;
         self.pending_shape = None;
@@ -1634,6 +1703,7 @@ impl eframe::App for LeopardApp {
         self.handle_shortcuts(&ctx);
 
         self.poll_render(&ctx);
+        self.service_live_bridge(&ctx);
         self.log_status();
         self.autosave_tick(&ctx);
         self.shell(root);

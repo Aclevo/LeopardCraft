@@ -12,10 +12,12 @@
 //! HTTP transport on a loopback endpoint, and resource subscriptions and prompt
 //! templates are served over both.
 
+pub mod bridge;
 mod http;
 mod server;
 mod tools;
 
+pub use bridge::{BridgeJob, BridgeServer, EditorEntry, LiveClient};
 pub use http::{HttpTransport, HTTP_ENDPOINT};
 pub use server::{
     McpServer, DEFAULT_HTTP_ADDR, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION, SCENE_URI,

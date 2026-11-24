@@ -106,6 +106,7 @@ fn test_app(label: &str) -> (LeopardApp, TestRoot) {
         lifecycle,
         allow_close: false,
         status: "Ready — demo studio loaded".into(),
+        live_bridge: None,
         show_about: false,
         hierarchy_filter: String::new(),
         focus_search: false,

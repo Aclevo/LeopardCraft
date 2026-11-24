@@ -1206,27 +1206,27 @@ edge-mode toggle undo, native round-trip and legacy document loading.
 - [x] Creases visible outside Edge mode: the viewport draws full creases in
       blue and fractional creases in a weight-blended blue in point, polygon
       and object modes. Test: `creased_edges_are_drawn_outside_edge_mode`.
-- [ ] Exact Stam-Loop hybrid rules from Stam's published scheme. Researched
-      2026-11-24 (source 44; the paper's own two-pass factorization is restated
-      with explicit masks in source 45): there is no quad/triangle staging
-      policy left to decide. One iteration is a single unified operator, not a
-      per-region pass — a linear subdivision step (split every edge once; each
-      quad into four quads, each triangle into three quads, and each n-gon
-      quadrangulated through a centroid first) followed by one weighted
-      averaging pass whose masks reduce to Catmull-Clark on quad-only rings and
-      Loop on triangle-only rings, with a mixed mask where quads and triangles
-      meet (given `n_e` edges and `n_q` quads around the vertex, `alpha = 1 / (1
-      + n_e/2 + n_q/4)` with edge weight `alpha/2` and face weight `alpha/4`),
-      and an optional vertex-correction pass (paper Table 1) for bounded
-      curvature. Cheetah3D's Subdivision modifier page (source 5) names the same
-      scheme and fixes no separate staging either: it only says Stam-Loop "uses
-      the best properties from the Catmull-Clark and the Loop subdivision
-      scheme" and "behaves much better on mixed meshes which include both quads
-      and triangles". Still to pin down before coding: the paper's Figures 3–4
-      masks and the correction sign exist only as low-resolution figure text in
-      the public PDF, so they need transcription or a reference implementation;
-      the topology is settled, and a mixed cage must never be fully
-      triangulated.
+- [x] Exact Stam-Loop hybrid rules from Stam's published scheme. Implemented
+      2026-11-24 (sources 44 and 45) as one operator per iteration: every n-gon
+      is split into n quads around its centroid — three for a triangle, four for
+      a quad — and the old vertices, edge points and face points take the rule
+      of the region they sit in: Catmull-Clark masks on quad-only rings, Loop's
+      vertex and edge masks on triangle-only rings, and the paper's mixed mask
+      where the two meet (`alpha = 1 / (1 + n_e/2 + n_f/4)` on the vertex,
+      `alpha/2` on each edge midpoint and `alpha/4` on each face centroid, solved
+      over the actual ring so the weights sum to one). A mixed cage therefore
+      stays all quads. An edge between a quad and a triangle takes the mean of
+      the two edge rules, because the paper's boundary mask survives only as
+      figure text; creases, fractional weights, seams, extra UV sets and
+      material slots keep their existing handling. The paper's optional
+      vertex-correction pass (Table 1) is not applied: it exists to recover the
+      Catmull-Clark and Loop masks from a uniform averaging pass, and those
+      masks are applied exactly per region here. Tests:
+      `stam_loop_reduces_to_catmull_clark_on_quad_and_ngon_cages` (exact
+      equality), `stam_loop_uses_loop_rules_on_a_triangle_only_cage`,
+      `stam_loop_positions_each_region_with_its_own_rule` (mask values, region
+      split, affine invariance) and the updated
+      `stam_loop_is_distinct_on_a_mixed_quad_triangle_cage` (all quads).
 - [x] Displacement, formula, magnet, polygon-reduction, Laplacian smooth and
       wrap modifiers. `Modifier::Displacement` offsets points along their
       area-weighted normals by deterministic value noise (amplitude, frequency,
@@ -1517,34 +1517,42 @@ document.
       variable expansion.
 - [ ] Attach to a running editor window so an agent can manipulate the live
       session and its selection instead of a separate in-memory document.
-      Researched 2026-11-24 against shipping editor integrations and recorded as
-      the decision, so implementation is the remaining work:
-      (1) **Transport** — loopback TCP with HTTP/JSON on `127.0.0.1` only, not a
-      Unix socket. Every surveyed host is a loopback HTTP/JSON endpoint: Unity's
-      in-Editor MCP bridge (`localhost:8080/mcp` plus a plugin WebSocket),
-      Unreal's in-editor `ModelContextProtocol` plugin, Maya's `commandPort`
-      INET socket, and UnityMCP-VRC's per-Editor `HttpListener`. It is also what
-      an MCP client already speaks, so the editor half needs no new protocol.
-      (2) **Trust** — an explicit in-editor enable toggle, plus a
-      cryptographically random per-session token that every command must carry,
-      the token written to a user-only (`0600`) registry file, plus an `Origin`
-      allow-list of loopback origins so a web page cannot reach the endpoint
-      through DNS rebinding. Unreal ships exactly that allow-list and states it
-      has no other authentication; Maya documents its unauthenticated command
-      port as executing any command with the user's permissions, which is the
-      failure mode to avoid. Unreal and Unity MCP both serialise tool calls on
-      the editor's main thread, one at a time.
-      (3) **Discovery** — a registry file listing name, port, pid and token per
-      running editor, with an environment override for pinning one instance.
-      UnityMCP-VRC (dynamic ports published to a shared registry) and OpenEngine
-      (`GE_EDITOR_DEBUG_PORT`, explicit flag wins) both use that registry-plus-
-      override shape instead of a fixed port, which is what makes several open
-      editors addressable.
-      (4) **Ownership** — attaching augments rather than replaces: while
-      attached, tools read and write the editor's own live document and
-      selection through its UI thread, one request at a time, each call an undo
-      entry, and the editor stays the only document owner. The server's private
-      document is the fallback only when nothing is attached.
+      **Implemented 2026-11-24; blocked on verification inside a real editor
+      window** (the toggle and a live attach need a display session, which this
+      pass could not reach). The implementation follows the researched contract
+      and adds: `lc-mcp/src/bridge.rs` — loopback HTTP/JSON at `POST /command`,
+      a 32-byte token from `/dev/urandom` required as `Authorization: Bearer`,
+      an atomic `0600` registry (name, port, pid, token; `$XDG_RUNTIME_DIR` or
+      `LEOPARDCRAFT_BRIDGE_REGISTRY`), a loopback-only `Origin` allow-list,
+      `503` when the UI thread does not answer within three seconds, and a
+      `LiveClient` with registry or `LEOPARDCRAFT_EDITOR_ENDPOINT`/
+      `LEOPARDCRAFT_EDITOR_TOKEN` discovery that refuses to guess between
+      several open editors; `lc-ui/src/live.rs` and a `Tools -> Live Agent
+      Bridge` toggle that services one request per frame on the UI thread and
+      runs each tool through the shared `McpServer` implementation on the
+      editor's own document and history (one undo entry per call); `--attach`
+      on `--mcp`/`--mcp-http`, which routes tool calls, `undo`/`redo`, the scene
+      resources and the new `select_objects` tool to the editor and adds a
+      `selection` field to `get_scene`, with the server's private document as
+      the fallback when not attached. Headless tests cover the token/Origin
+      rejection, busy answers, `0600` registry, attach routing and fallback,
+      live selection and live undo (`attach_routes_tools_resources_and_undo_to_
+      the_live_editor`, `bridge_answers_busy_when_the_editor_does_not_drain`,
+      `bridge_requires_the_session_token_and_reports_the_editor_busy`,
+      `registry_file_is_private_and_prunes_replaced_entries`,
+      `origin_allow_list_accepts_loopback_origins_only`,
+      `editor_host_services_bridge_requests_over_the_loopback_endpoint`, plus the
+      three `crates/lc-ui/src/live.rs` host tests). Still to prove by hand:
+      enabling the toggle
+      in a running editor and attaching to it (the user confirmed on 2026-11-24
+      that **Tools -> Live Agent Bridge** is present in the running editor, and
+      the session registry file was created and cleaned up, but no live entry
+      existed when the attach could be exercised). The researched contract still
+      holds: loopback HTTP/JSON rather than a Unix socket, an explicit
+      in-editor toggle plus a per-session token in a `0600` registry and a
+      loopback `Origin` allow-list, registry-plus-environment discovery, and
+      attachment that augments the server rather than replacing the editor's
+      document ownership.
 - [x] Modifier-stack authoring tools: `add_modifier`, `update_modifier`,
       `remove_modifier` and `move_modifier` accept the same snake_case modifier
       objects `get_object` returns, validate the target object, finite
@@ -1714,8 +1722,20 @@ briefs and the orchestration playbook live under `docs/agents/`.
       wire id and local loading only requires a non-empty `id` and `model`. The
       blocker is the agent allowlist, so the working lane host is Codebuff
       (credits/API key) or Claude Code — Freebuff hours cannot fund lane agents.
-- [ ] Approve the project-scoped server in an interactive Claude Code session
+- [x] Approve the project-scoped server in an interactive Claude Code session
       (user consent), then confirm `/mcp` lists the LeopardCraft tools.
+      Confirmed by the user on 2026-11-24: Claude Code detects the project-scoped
+      server and lists the LeopardCraft tools. Preconditions verified before the
+      approval: `claude`
+      2.1.327 is installed; `claude mcp list` in the repository root resolves the
+      project-scoped entry to `${CLAUDE_PROJECT_DIR}/scripts/mcp-server.sh` and
+      reports ⏸ Pending approval (run `claude` to approve), which is the
+      expected pre-approval state; and the launcher answers the protocol
+      directly (two response lines, empty stderr, 34 tools including
+      `select_objects`, instructions naming `--attach`). The approval itself is
+      per-user client state; the real-process smoke test
+      (`app/tests/mcp_smoke.rs`) covers the launch and handshake the approval
+      gates.
 
 ## Suggested order
 

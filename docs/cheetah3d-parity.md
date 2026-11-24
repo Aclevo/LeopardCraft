@@ -79,7 +79,7 @@ parity.
 | Modelling — splines | 9 spline types | 1 spline object with linear, Bézier and smooth interpolation | Partial | No separate Helix, Spiral, Text, Path or similar creators |
 | Modelling — polygon tools | Extrude, inner extrude, bevel, bridge, collapse, cover, create polygon, crumple, disconnect, edge rotate, fill hole, flip normal, jigsaw, normal move/rotate/scale, optimize, point slide, ring cut, scalpel, shell, split, triangulate, weld, array and clone | Extrude, inset, bevel, ring cut, weld, collapse, bridge, fill hole with border-click tool, cover, create polygon, flip normal, split, disconnect, optimize, point slide, shell, triangulate with Shortest Diagonal/Quad Pair, Clone with Copies/Holes/Direction/Scale/Rotation/variations, scalpel between two boundary picks, component move/rotate/scale, material assignment | Partial | Scalpel cuts one polygon between two edge or point picks and the click tool chains as documented (a cut's end point becomes the next start, ESC resets, source 43), with the polygon under the pointer resolving the face when two picks share an edge; Split copies the polygons instead of moving them (source 40), and Shell uses typed thickness/Inside/Angle/Quantize fields instead of the documented drag gesture (source 41) |
 | Modelling — modifiers | Roughly 18 documented modifiers including subdivision, displacement, formula, magnet, polygon reduction, smooth and wrap | 21: subdivision (Catmull-Clark, Stam-Loop or Linear), extrude/bevel faces, array, symmetry, boolean, bend, taper, twist, shear, bulge, spherify, displacement, magnet, lathe, sweep, ring cut, formula, Laplacian smooth, polygon reduction and wrap, with shared Cage/Type controls on the deformers | Partial | Displacement reads a procedural noise field instead of a texture, Formula is a clean-room per-axis expression dialect, and Laplacian smooth, polygon reduction and wrap are named approximations of undocumented pages; Boolean and subdivision favour robustness over speed |
-| Modelling — subdivision | Catmull-Clark, Stam-Loop and linear subdivision; creased edges under the smooth schemes | Catmull-Clark, Stam-Loop and Linear schemes; full and fractional per-edge creases honoured by both smooth schemes and visible in every selection mode; watertight face-selective Subdivide tool; Constrained/Unconstrained/Cage Type on the deformers | Partial | Stam-Loop is still a clean-room Loop-on-triangulated-cage approximation, not the documented hybrid: Cheetah3D's Subdivision modifier says Stam-Loop "behaves much better on mixed meshes which include both quads and triangles" (source 5) while LeopardCraft triangulates the whole cage first, and the published two-pass hybrid (sources 44 and 45) is researched but not implemented |
+| Modelling — subdivision | Catmull-Clark, Stam-Loop and linear subdivision; creased edges under the smooth schemes | Catmull-Clark, Stam-Loop and Linear schemes; full and fractional per-edge creases honoured by both smooth schemes and visible in every selection mode; watertight face-selective Subdivide tool; Constrained/Unconstrained/Cage Type on the deformers | Partial | Stam-Loop follows the published hybrid (sources 44 and 45): quads stay quads, triangles split into three quads, quad-only rings use Catmull-Clark masks, triangle-only rings use Loop masks and mixed rings use the paper's alpha mask. The optional Table 1 vertex correction and the figure-only mixed-edge mask are not reproduced — a quad/triangle edge takes the mean of both edge rules — and displacement reads a noise field instead of a texture |
 | Modelling — booleans | Union, subtract, intersect | Union, subtract, intersect BSP boolean modifier | Yes | Mesh operand is chosen in the modifier stack |
 | UV | UV editor, cubic/spherical/flat/cylindrical/frontal mapping, ABF/LSCM unwrap, Autoseam, pinned UVs, UV PDF | UV view with multi-point selection, seam authoring (toggle/all/loop/clear), multi-point pins, chart move/rotate/scale, shelf packing with padding/rotation/alignment, weld/split/align/distribute/flip/rotate/numeric entry, UV0/UV1/… sets, per-texture UV set binding, checker and distortion overlays | Partial | No ABF/LSCM, Autoseam or UV PDF export; charts are a seams-and-angle splitter and packing is a shelf packer, not a distortion-minimising solver |
 | Materials | Node materials, PBR/Principled workflow, procedural textures | Node material graph, Principled surface, procedural noise, texture cache | Partial | Core authoring path exists; not every Cheetah node type is present |
@@ -820,10 +820,17 @@ schemes, including creased edges, are:
   own object has no operand and leaves the mesh alone.
 - **Subdivision** now offers **Catmull-Clark**, **Stam-Loop** and **Linear**
   schemes beside its level count, which now defaults to 2 like Cheetah3D.
-  Catmull-Clark produces quads from any n-gon. Stam-Loop triangulates the
-  cage and applies Loop edge and vertex rules, producing four triangles per
-  triangle, so mixed quad/triangle cages take a different path from both other
-  schemes. Linear splits every n-gon into n quads around its centroid and
+  Catmull-Clark produces quads from any n-gon. Stam-Loop is the published
+  hybrid (sources 44 and 45): each iteration splits every n-gon into n quads
+  around its centroid — three for a triangle, four for a quad — and positions
+  the old vertices, edge points and face points with Catmull-Clark masks on
+  quad-only rings, Loop masks on triangle-only rings and Stam and Loop's mixed
+  mask (`alpha` on the vertex, `alpha/2` on each edge midpoint, `alpha/4` on
+  each face centroid) where the two meet, so a mixed cage stays all quads. An
+  edge between a quad and a triangle takes the mean of the two edge rules, and
+  the optional Table 1 vertex correction is omitted because the pure regions
+  already use the exact Catmull-Clark and Loop masks. Linear splits every n-gon
+  into n quads around its centroid and
   shares edge midpoints between neighbours, keeping the surface watertight
   without smoothing it. Old documents without a scheme load as Catmull-Clark,
   and new modifiers default to it.
@@ -840,7 +847,7 @@ schemes, including creased edges, are:
   crease rule by the smallest incident weight. A vertex with three or more
   creases blends from smooth to pinned the same way, and a single crease stays
   smooth. Both child edges inherit the parent weight, so fractional creases
-  survive further levels. Stam-Loop blends its Loop edge point and crease
+  survive further levels. Stam-Loop blends its region's edge point and crease
   vertex rule by the same weights. Linear subdivision deliberately ignores
   crease sharpness, so its geometry is unchanged; the crease marks and weights
   are still split onto child edges for later editing. Loading normalizes
@@ -867,12 +874,11 @@ multiple iteration counts, linear crease independence, material-style
 serialization and legacy documents with neither crease data nor a scheme
 field.
 
-Deliberate gaps: Stam-Loop here is a clean-room Loop-on-triangulated-cage
-approximation of the documented mixed quad/triangle scheme, not a verified
-reimplementation of Stam's published hybrid rules. That remains the one open
-part of the subdivision item; the public manual does not specify how quad and
-triangle regions should be staged, so implementing it needs a product decision
-on the hybrid topology policy. Displacement, Formula, Magnet, Laplacian Smooth,
+Deliberate gaps: Stam-Loop follows the published hybrid topology and masks, but
+the paper's optional vertex-correction table and its figure-only mixed-edge mask
+are not reproduced: pure regions use the exact Catmull-Clark and Loop masks, and
+an edge between a quad and a triangle takes the mean of the two edge rules.
+Displacement, Formula, Magnet, Laplacian Smooth,
 Polygon Reduction and Wrap now exist as clean-room readings of the documented
 modifier names; the pages that would pin their exact parameters (a texture input
 for Displacement, Cheetah3D's formula dialect, its decimation algorithm) are not
@@ -1239,9 +1245,9 @@ Clean-room approximations and what closing them would need:
    Split, Shell, Triangulate, Flip Normal, Collapse, Disconnect, Optimize, Point
    Slide, Clone, Scalpel and the Displacement, Formula, Magnet, Laplacian
    Smooth, Polygon Reduction and Wrap modifiers are in place; the Scalpel's
-   click chaining now follows source 43, and the exact Stam-Loop hybrid (sources
-   44 and 45) remains; each is a self-contained operation with a clear undo
-   boundary.
+   click chaining now follows source 43, and the Stam-Loop hybrid follows the
+   masks in sources 44 and 45; each is a self-contained operation with a clear
+   undo boundary.
 5. **Scripting/plugin surface** — valuable for parity, but it needs an API
    design and cannot be reduced to a single feature slice. A headless MCP server
    now provides external agent automation, but embedded scripting and a plugin

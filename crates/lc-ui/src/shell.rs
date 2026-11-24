@@ -987,6 +987,16 @@ impl LeopardApp {
                         "Fill Hole tool off".into()
                     };
                 }
+                let bridge_label = if self.live_bridge.is_some() {
+                    "Live Agent Bridge ✓"
+                } else {
+                    "Live Agent Bridge"
+                };
+                if recorded_button_enabled(ui, "Tools:Live Agent Bridge", true, bridge_label)
+                    .clicked()
+                {
+                    self.toggle_live_bridge();
+                }
                 let scalpel_tool_label = if self.scalpel_tool {
                     "Scalpel Tool ✓"
                 } else {

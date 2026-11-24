@@ -314,7 +314,7 @@ fn exercise_server(client: &mut McpClient, root: &Path, temp: &Path) {
         .as_array()
         .expect("tools/list returns an array")
         .clone();
-    assert_eq!(tools.len(), 33, "unexpected advertised tool count");
+    assert_eq!(tools.len(), 34, "unexpected advertised tool count");
     assert_documented_tools(root, &tools);
     assert_tool_schemas(&tools);
 

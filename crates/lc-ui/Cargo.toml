@@ -12,7 +12,9 @@ lc-shading = { path = "../lc-shading" }
 lc-anim = { path = "../lc-anim" }
 lc-render = { path = "../lc-render" }
 lc-io = { path = "../lc-io" }
+lc-mcp = { path = "../lc-mcp" }
 glam.workspace = true
+serde_json.workspace = true
 bytemuck.workspace = true
 serde.workspace = true
 eframe.workspace = true

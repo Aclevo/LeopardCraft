@@ -1281,11 +1281,13 @@ dependencies = [
  "lc-core",
  "lc-geom",
  "lc-io",
+ "lc-mcp",
  "lc-render",
  "lc-scene",
  "lc-shading",
  "pollster",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

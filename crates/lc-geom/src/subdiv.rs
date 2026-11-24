@@ -451,92 +451,120 @@ fn linear_once(mesh: &Mesh) -> Mesh {
     out
 }
 
-/// Stam-Loop-style subdivision for mixed quad/triangle cages. The cage is
-/// triangulated and each triangle is split into four using Loop edge and
-/// vertex rules. Authored creases and mesh boundaries use the sharp rules and
-/// are inherited by both child edges.
+/// Stam & Loop's hybrid quad/triangle subdivision (sources 44 and 45).
+///
+/// One iteration is a single operator. Every n-gon is split into n quads around
+/// its centroid — three quads for a triangle, four for a quad — and then the old
+/// vertices, edge points and face points are positioned with the rule for the
+/// region they sit in: Catmull-Clark's masks where every surrounding face is a
+/// quad (or an n-gon), Loop's masks where every surrounding face is a triangle,
+/// and the paper's mixed mask where the two regions meet. A mixed vertex takes
+/// `alpha` for itself, `alpha/2` for each edge midpoint around it and `alpha/4`
+/// for each face centroid, with `alpha` solved so the weights of the actual ring
+/// sum to one; an edge with a quad on one side and a triangle on the other takes
+/// the mean of the Catmull-Clark and Loop edge rules, because the paper's
+/// ordinary-boundary mask survives only as figure text. Authored creases and
+/// boundaries keep the sharp rules. The paper's optional vertex-correction pass
+/// is not applied: it recovers the Catmull-Clark and Loop masks from a uniform
+/// averaging pass, and this implementation applies those masks directly.
 pub fn stam_loop(mesh: &Mesh, levels: u32) -> Mesh {
     let mut out = mesh.clone();
     for _ in 0..levels.min(6) {
         if out.polygons.is_empty() {
             break;
         }
-        out = loop_once(&triangulated_for_loop(&out));
+        out = hybrid_once(&out);
     }
     carry_extra_uv_sets(mesh, levels, &mut out, stam_loop);
     out
 }
 
-fn triangulated_for_loop(mesh: &Mesh) -> Mesh {
-    let mut out = Mesh {
-        name: mesh.name.clone(),
-        positions: mesh.positions.clone(),
-        uvs: mesh.uvs.clone(),
-        extra_uvs: mesh.extra_uvs.clone(),
-        polygons: Vec::with_capacity(mesh.polygons.len() * 2),
-        creases: mesh.creases.clone(),
-        crease_weights: mesh.crease_weights.clone(),
-        seams: mesh.seams.clone(),
-        pinned_uvs: mesh.pinned_uvs.clone(),
-    };
-    if out.uvs.len() < out.positions.len() {
-        out.uvs.resize(out.positions.len(), Vec2::ZERO);
-    }
-    for (fi, poly) in mesh.polygons.iter().enumerate() {
-        for tri in mesh.polygon_triangles(fi) {
-            let corners = tri
-                .iter()
-                .map(|&corner| poly.corners[corner])
-                .collect::<Vec<_>>();
-            out.polygons.push(Polygon {
-                corners,
-                material_slot: poly.material_slot,
-            });
-        }
-    }
-    out.normalize_creases();
-    out
-}
+/// An undirected edge of the cage with the opposite corner of every face
+/// around it, which the Loop and mixed edge rules need.
+type HybridEdge = (u32, u32, Vec<(usize, u32)>);
 
-/// An undirected edge with the (triangle, opposite point) pair of every
-/// adjacent face, used by the Loop rules.
-type LoopEdge = (u32, u32, Vec<(usize, u32)>);
-
-fn loop_once(mesh: &Mesh) -> Mesh {
+fn hybrid_once(mesh: &Mesh) -> Mesh {
     let npoints = mesh.positions.len();
-    let mut edge_index: HashMap<(u32, u32), usize> = HashMap::new();
-    let mut edges: Vec<LoopEdge> = Vec::new();
+    let face_count = mesh.polygons.len();
+    let is_triangle: Vec<bool> = mesh
+        .polygons
+        .iter()
+        .map(|poly| poly.corners.len() == 3)
+        .collect();
+
+    // Face centroids, which are also the face points of the split.
+    let mut face_pos = Vec::with_capacity(face_count);
+    let mut face_uv = Vec::with_capacity(face_count);
     for (fi, poly) in mesh.polygons.iter().enumerate() {
-        if poly.corners.len() != 3 {
-            continue;
-        }
-        let p = [
-            poly.corners[0].point,
-            poly.corners[1].point,
-            poly.corners[2].point,
-        ];
-        for i in 0..3 {
-            let a = p[i];
-            let b = p[(i + 1) % 3];
-            let opposite = p[(i + 2) % 3];
+        let pts = mesh.polygon_points(fi);
+        face_pos.push(if pts.is_empty() {
+            Vec3::ZERO
+        } else {
+            pts.iter().copied().sum::<Vec3>() / pts.len() as f32
+        });
+        let uvs = poly.corners.iter().map(|c| mesh.uv_of(c)).sum::<Vec2>();
+        face_uv.push(if poly.corners.is_empty() {
+            Vec2::ZERO
+        } else {
+            uvs / poly.corners.len() as f32
+        });
+    }
+
+    // Unique undirected edges with the opposite corner of every adjacent face,
+    // which the Loop edge rule needs.
+    let mut edge_index: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut edges: Vec<HybridEdge> = Vec::new();
+    for (fi, poly) in mesh.polygons.iter().enumerate() {
+        let n = poly.corners.len();
+        for i in 0..n {
+            let a = poly.corners[i].point;
+            let b = poly.corners[(i + 1) % n].point;
             if a == b {
                 continue;
             }
             let key = key(a, b);
             match edge_index.get(&key) {
-                Some(&index) => edges[index].2.push((fi, opposite)),
+                Some(&index) => {
+                    if !edges[index].2.iter().any(|(face, _)| *face == fi) {
+                        edges[index].2.push((fi, poly.corners[(i + 2) % n].point));
+                    }
+                }
                 None => {
                     edge_index.insert(key, edges.len());
-                    edges.push((key.0, key.1, vec![(fi, opposite)]));
+                    edges.push((key.0, key.1, vec![(fi, poly.corners[(i + 2) % n].point)]));
                 }
             }
         }
     }
+    let n_edges = edges.len();
 
+    let mut positions = Vec::with_capacity(npoints + n_edges + face_count);
+    let mut uvs = Vec::with_capacity(npoints + n_edges + face_count);
+    for p in &mesh.positions {
+        positions.push(*p);
+    }
+
+    let mut point_faces: Vec<Vec<usize>> = vec![Vec::new(); npoints];
+    let mut point_edges: Vec<Vec<usize>> = vec![Vec::new(); npoints];
     let mut point_neighbours: Vec<Vec<u32>> = vec![Vec::new(); npoints];
     let mut point_uv_sum = vec![Vec2::ZERO; npoints];
     let mut point_uv_count = vec![0u32; npoints];
-    for (a, b, _) in &edges {
+    for (fi, poly) in mesh.polygons.iter().enumerate() {
+        for c in &poly.corners {
+            if c.point as usize >= npoints {
+                continue;
+            }
+            let pf = &mut point_faces[c.point as usize];
+            if !pf.contains(&fi) {
+                pf.push(fi);
+            }
+            point_uv_sum[c.point as usize] += mesh.uv_of(c);
+            point_uv_count[c.point as usize] += 1;
+        }
+    }
+    for (ei, (a, b, _)) in edges.iter().enumerate() {
+        point_edges[*a as usize].push(ei);
+        point_edges[*b as usize].push(ei);
         if !point_neighbours[*a as usize].contains(b) {
             point_neighbours[*a as usize].push(*b);
         }
@@ -544,35 +572,70 @@ fn loop_once(mesh: &Mesh) -> Mesh {
             point_neighbours[*b as usize].push(*a);
         }
     }
-    for poly in &mesh.polygons {
-        for c in &poly.corners {
-            if let Some(sum) = point_uv_sum.get_mut(c.point as usize) {
-                *sum += mesh.uv_of(c);
-                point_uv_count[c.point as usize] += 1;
+    let point_uv: Vec<Vec2> = (0..npoints)
+        .map(|i| {
+            if point_uv_count[i] > 0 {
+                point_uv_sum[i] / point_uv_count[i] as f32
+            } else {
+                Vec2::ZERO
             }
-        }
-    }
+        })
+        .collect();
+    uvs.extend_from_slice(&point_uv);
 
-    let mut positions = Vec::with_capacity(npoints + edges.len());
-    let mut uvs = Vec::with_capacity(npoints + edges.len());
-    for p in 0..npoints {
-        let pos = mesh.positions[p];
-        let neighbours = &point_neighbours[p];
-        let mut sharp: Vec<(u32, f32)> = Vec::new();
-        for &other in neighbours {
-            let (a, b, adjacent) = &edges[edge_index[&key(p as u32, other)]];
+    // Boundary edges behave as full creases and authored creases blend the
+    // smooth rule toward the sharp crease rule, as in the Catmull-Clark path.
+    let sharp_neighbours = |p: usize| -> Vec<(u32, f32)> {
+        let mut ns: Vec<(u32, f32)> = Vec::new();
+        for &ei in &point_edges[p] {
+            let (a, b, adjacent) = &edges[ei];
             let weight = if adjacent.len() < 2 {
                 1.0
             } else {
                 mesh.crease_weight(*a, *b)
             };
-            if weight > 0.0 {
-                sharp.push((other, weight));
+            if weight <= 0.0 {
+                continue;
+            }
+            let other = if *a as usize == p {
+                *b
+            } else if *b as usize == p {
+                *a
+            } else {
+                continue;
+            };
+            if let Some(existing) = ns.iter_mut().find(|(point, _)| *point == other) {
+                existing.1 = existing.1.max(weight);
+            } else {
+                ns.push((other, weight));
             }
         }
-        let smooth = if neighbours.is_empty() {
-            pos
-        } else {
+        ns
+    };
+
+    let mut new_points = Vec::with_capacity(npoints);
+    for p in 0..npoints {
+        let pos = mesh.positions[p];
+        let faces = &point_faces[p];
+        if faces.is_empty() {
+            new_points.push(pos);
+            continue;
+        }
+        let triangles = faces.iter().filter(|fi| is_triangle[**fi]).count();
+        let smooth = if triangles == 0 {
+            // Catmull-Clark vertex rule.
+            let f = faces.iter().map(|&fi| face_pos[fi]).sum::<Vec3>() / faces.len() as f32;
+            let mut r = Vec3::ZERO;
+            for &ei in &point_edges[p] {
+                let (a, b, _) = edges[ei];
+                r += (mesh.positions[a as usize] + mesh.positions[b as usize]) * 0.5;
+            }
+            r /= point_edges[p].len().max(1) as f32;
+            let n = faces.len() as f32;
+            (f + r * 2.0 + pos * (n - 3.0)) / n
+        } else if triangles == faces.len() {
+            // Loop vertex rule.
+            let neighbours = &point_neighbours[p];
             let n = neighbours.len() as f32;
             let beta = if neighbours.len() == 3 {
                 3.0 / 16.0
@@ -584,90 +647,124 @@ fn loop_once(mesh: &Mesh) -> Mesh {
                 .map(|&i| mesh.positions[i as usize])
                 .sum::<Vec3>();
             pos * (1.0 - n * beta) + sum * beta
+        } else {
+            // Stam & Loop's mixed mask: `beta = alpha/2` on the edge midpoints
+            // and `gamma = alpha/4` on the face centroids, with `alpha` fixed by
+            // requiring the weights of this ring to sum to one.
+            let n_e = point_edges[p].len() as f32;
+            let n_f = faces.len() as f32;
+            let alpha = 1.0 / (1.0 + n_e / 2.0 + n_f / 4.0);
+            let edge_sum = point_edges[p]
+                .iter()
+                .map(|&ei| {
+                    let (a, b, _) = edges[ei];
+                    (mesh.positions[a as usize] + mesh.positions[b as usize]) * 0.5
+                })
+                .sum::<Vec3>();
+            let face_sum = faces.iter().map(|&fi| face_pos[fi]).sum::<Vec3>();
+            pos * alpha + edge_sum * (alpha / 2.0) + face_sum * (alpha / 4.0)
         };
-        let next = if sharp.len() >= 2 {
+        let sharp = sharp_neighbours(p);
+        if sharp.len() >= 2 {
             let sharp_pos = if sharp.len() > 2 {
                 pos
             } else {
-                pos * 0.75
-                    + (mesh.positions[sharp[0].0 as usize] + mesh.positions[sharp[1].0 as usize])
-                        * 0.125
+                let sum = mesh.positions[sharp[0].0 as usize] + mesh.positions[sharp[1].0 as usize];
+                pos * 0.75 + sum * 0.125
             };
             let strength = sharp
                 .iter()
                 .map(|(_, weight)| *weight)
                 .fold(1.0_f32, f32::min);
-            smooth.lerp(sharp_pos, strength)
+            new_points.push(smooth.lerp(sharp_pos, strength));
         } else {
-            smooth
-        };
-        positions.push(next);
-        uvs.push(if point_uv_count[p] > 0 {
-            point_uv_sum[p] / point_uv_count[p] as f32
-        } else {
-            Vec2::ZERO
-        });
+            new_points.push(smooth);
+        }
+    }
+    for (i, p) in new_points.into_iter().enumerate() {
+        positions[i] = p;
     }
 
-    let mut edge_points = Vec::with_capacity(edges.len());
-    for (a, b, opposite) in &edges {
+    // Edge points: the Catmull-Clark rule on a quad edge, the Loop rule on a
+    // triangle edge and their mean on an edge between the two regions.
+    let mut edge_point_index = Vec::with_capacity(n_edges);
+    for (a, b, adjacent) in &edges {
         let pa = mesh.positions[*a as usize];
         let pb = mesh.positions[*b as usize];
-        let sharpness = if opposite.len() < 2 {
+        let sharpness = if adjacent.len() < 2 {
             1.0
         } else {
             mesh.crease_weight(*a, *b)
         };
-        let smooth = if opposite.len() < 2 {
-            (pa + pb) * 0.5
+        let midpoint = (pa + pb) * 0.5;
+        let midpoint_uv = (point_uv[*a as usize] + point_uv[*b as usize]) * 0.5;
+        let (smooth, smooth_uv) = if adjacent.len() < 2 {
+            (midpoint, midpoint_uv)
         } else {
-            let c = mesh.positions[opposite[0].1 as usize];
-            let d = mesh.positions[opposite[1].1 as usize];
-            (pa + pb) * 0.375 + (c + d) * 0.125
+            let first = adjacent[0].0;
+            let second = adjacent[1].0;
+            let cc = (pa + pb + face_pos[first] + face_pos[second]) * 0.25;
+            let cc_uv =
+                (point_uv[*a as usize] + point_uv[*b as usize] + face_uv[first] + face_uv[second])
+                    * 0.25;
+            let loop_rule = (pa + pb) * 0.375
+                + (mesh.positions[adjacent[0].1 as usize] + mesh.positions[adjacent[1].1 as usize])
+                    * 0.125;
+            let loop_uv = midpoint_uv;
+            match (is_triangle[first], is_triangle[second]) {
+                (false, false) => (cc, cc_uv),
+                (true, true) => (loop_rule, loop_uv),
+                _ => ((cc + loop_rule) * 0.5, (cc_uv + loop_uv) * 0.5),
+            }
         };
-        let pos = smooth.lerp((pa + pb) * 0.5, sharpness);
-        let uv = (mesh.uvs.get(*a as usize).copied().unwrap_or(Vec2::ZERO)
-            + mesh.uvs.get(*b as usize).copied().unwrap_or(Vec2::ZERO))
-            * 0.5;
+        let pos = smooth.lerp(midpoint, sharpness);
+        let uv = smooth_uv.lerp(midpoint_uv, sharpness);
+        let idx = positions.len();
         positions.push(pos);
         uvs.push(uv);
-        edge_points.push((positions.len() - 1) as u32);
+        edge_point_index.push(idx);
+    }
+    let face_base = positions.len();
+    for fi in 0..face_count {
+        positions.push(face_pos[fi]);
+        uvs.push(face_uv[fi]);
     }
 
-    let mut polys = Vec::with_capacity(mesh.polygons.len() * 4);
-    for poly in &mesh.polygons {
-        if poly.corners.len() != 3 {
+    // Faces: an n-gon becomes n quads around its centroid, so a triangle
+    // becomes three quads and a quad four, and no cage is triangulated.
+    let mut polys = Vec::with_capacity(face_count * 4);
+    for (fi, poly) in mesh.polygons.iter().enumerate() {
+        let n = poly.corners.len();
+        if n < 3 {
             continue;
         }
-        let p = [
-            poly.corners[0].point,
-            poly.corners[1].point,
-            poly.corners[2].point,
-        ];
-        let e01 = edge_points[edge_index[&key(p[0], p[1])]];
-        let e12 = edge_points[edge_index[&key(p[1], p[2])]];
-        let e20 = edge_points[edge_index[&key(p[2], p[0])]];
-        for corners in [
-            [p[0], e01, e20],
-            [e01, p[1], e12],
-            [e20, e12, p[2]],
-            [e01, e12, e20],
-        ] {
+        for i in 0..n {
+            let prev = poly.corners[(i + n - 1) % n].point;
+            let cur = poly.corners[i].point;
+            let next = poly.corners[(i + 1) % n].point;
+            let e1 = edge_index[&key(prev, cur)];
+            let e2 = edge_index[&key(cur, next)];
+            let corners = vec![
+                Corner::new(cur, cur),
+                Corner::new(edge_point_index[e2] as u32, edge_point_index[e2] as u32),
+                Corner::new((face_base + fi) as u32, (face_base + fi) as u32),
+                Corner::new(edge_point_index[e1] as u32, edge_point_index[e1] as u32),
+            ];
             polys.push(Polygon {
-                corners: corners
-                    .into_iter()
-                    .map(|point| Corner::new(point, point))
-                    .collect(),
+                corners,
                 material_slot: poly.material_slot,
             });
         }
     }
 
+    // Split authored creases and seams onto both child edges, preserving each
+    // fractional crease weight, so sharpness and UV chart borders survive
+    // further subdivision levels.
     let mut creases = Vec::new();
     let mut crease_weights = Vec::new();
     let mut seams = Vec::new();
     for (ei, (a, b, _)) in edges.iter().enumerate() {
-        let mid = edge_points[ei];
+        let mid = edge_point_index[ei] as u32;
         let weight = mesh.crease_weight(*a, *b);
         push_crease(&mut creases, &mut crease_weights, *a, mid, weight);
         push_crease(&mut creases, &mut crease_weights, mid, *b, weight);
@@ -1283,12 +1380,257 @@ mod tests {
         let linear = linear(&cage, 2);
         assert!(cc.polygons.iter().all(|p| p.corners.len() == 4));
         assert!(linear.polygons.iter().all(|p| p.corners.len() == 4));
-        assert!(stam.polygons.iter().all(|p| p.corners.len() == 3));
+        assert!(
+            stam.polygons.iter().all(|p| p.corners.len() == 4),
+            "Stam-Loop must quadrangulate a mixed cage instead of triangulating it"
+        );
         assert!(stam.validate().is_ok());
         assert_ne!(cc.signature(), stam.signature());
         assert_ne!(linear.signature(), stam.signature());
         assert!((cc.signed_volume() - stam.signed_volume()).abs() > 1e-4);
         assert!((linear.signed_volume() - stam.signed_volume()).abs() > 1e-4);
+    }
+
+    #[test]
+    fn stam_loop_reduces_to_catmull_clark_on_quad_and_ngon_cages() {
+        let pentagon = Mesh::from_polygons(
+            "pentagon",
+            (0..5)
+                .map(|i| {
+                    let angle = std::f32::consts::TAU * i as f32 / 5.0;
+                    Vec3::new(angle.cos(), 0.0, angle.sin())
+                })
+                .collect(),
+            vec![vec![0, 1, 2, 3, 4]],
+        );
+        for cage in [
+            primitives::box_mesh(2.0, 2.0, 2.0),
+            primitives::plane_mesh(3.0, 3.0, 3, 3),
+            pentagon,
+        ] {
+            for levels in [1u32, 2] {
+                assert_eq!(
+                    stam_loop(&cage, levels),
+                    catmull_clark(&cage, levels),
+                    "a cage of quads and n-gons must follow the Catmull-Clark masks at level {levels}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stam_loop_uses_loop_rules_on_a_triangle_only_cage() {
+        let cube = primitives::box_mesh(2.0, 2.0, 2.0);
+        let faces = (0..cube.polygons.len() as u32).collect::<Vec<_>>();
+        let cage = crate::ops::triangulate_faces(&cube, &faces);
+        assert!(cage.polygons.iter().all(|p| p.corners.len() == 3));
+
+        let out = stam_loop(&cage, 1);
+        assert_eq!(out.polygons.len(), cage.polygons.len() * 3);
+        assert!(out.polygons.iter().all(|p| p.corners.len() == 4));
+
+        // Old vertices keep Loop's vertex mask, including the valence-three
+        // special case that a triangulated cube hits at every corner.
+        for (index, position) in cage.positions.iter().enumerate() {
+            let neighbours = cage
+                .edges()
+                .into_iter()
+                .filter_map(|edge| {
+                    if edge.a as usize == index {
+                        Some(edge.b)
+                    } else if edge.b as usize == index {
+                        Some(edge.a)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert!(!neighbours.is_empty());
+            let n = neighbours.len() as f32;
+            let beta = if neighbours.len() == 3 {
+                3.0 / 16.0
+            } else {
+                3.0 / (8.0 * n)
+            };
+            let sum = neighbours
+                .iter()
+                .map(|i| cage.positions[*i as usize])
+                .sum::<Vec3>();
+            let expected = *position * (1.0 - n * beta) + sum * beta;
+            assert!(
+                out.positions[index].distance(expected) < 1e-5,
+                "vertex {index} did not use Loop's vertex mask"
+            );
+        }
+
+        // An interior edge takes Loop's edge rule with both opposite corners.
+        let edge = cage
+            .edges()
+            .into_iter()
+            .find(|edge| edge.faces.len() == 2)
+            .unwrap();
+        let opposite = |face: u32| {
+            let poly = &cage.polygons[face as usize];
+            poly.corners
+                .iter()
+                .map(|c| c.point)
+                .find(|p| *p != edge.a && *p != edge.b)
+                .unwrap()
+        };
+        let expected = (cage.positions[edge.a as usize] + cage.positions[edge.b as usize]) * 0.375
+            + (cage.positions[opposite(edge.faces[0]) as usize]
+                + cage.positions[opposite(edge.faces[1]) as usize])
+                * 0.125;
+        assert!(
+            out.positions.iter().any(|p| p.distance(expected) < 1e-5),
+            "the triangle-only cage did not place Loop's edge point"
+        );
+    }
+
+    #[test]
+    fn stam_loop_positions_each_region_with_its_own_rule() {
+        let cage = mixed_quad_triangle_cage();
+        let hybrid = stam_loop(&cage, 1);
+        let cc = catmull_clark(&cage, 1);
+        assert!(hybrid.validate().is_ok());
+
+        let ring = |point: usize| {
+            cage.polygons
+                .iter()
+                .enumerate()
+                .filter(|(_, poly)| poly.corners.iter().any(|c| c.point as usize == point))
+                .map(|(fi, _)| fi)
+                .collect::<Vec<_>>()
+        };
+        let quad_only = (0..cage.positions.len())
+            .filter(|point| {
+                let faces = ring(*point);
+                !faces.is_empty() && faces.iter().all(|fi| cage.polygons[*fi].corners.len() != 3)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            quad_only.len(),
+            4,
+            "the far side of the cage stays quad-only"
+        );
+        for point in quad_only {
+            assert!(
+                hybrid.positions[point].distance(cc.positions[point]) < 1e-6,
+                "quad-only vertex {point} left the Catmull-Clark mask"
+            );
+        }
+
+        // The two corners of the triangulated face are mixed and take the
+        // paper's mask, so they must differ from Catmull-Clark's positions.
+        let mixed = (0..cage.positions.len())
+            .filter(|point| {
+                let faces = ring(*point);
+                faces.iter().any(|fi| cage.polygons[*fi].corners.len() == 3)
+                    && faces.iter().any(|fi| cage.polygons[*fi].corners.len() != 3)
+            })
+            .collect::<Vec<_>>();
+        assert!(!mixed.is_empty());
+        // A mixed vertex is placed by Stam & Loop's mask: alpha on the vertex
+        // itself, alpha/2 on every edge midpoint around it and alpha/4 on every
+        // face centroid, with alpha solved so the weights sum to one.
+        let mut differs = 0;
+        for point in mixed {
+            let faces = ring(point);
+            let midpoints = cage
+                .edges()
+                .into_iter()
+                .filter_map(|edge| {
+                    if edge.a as usize == point {
+                        Some(edge.b)
+                    } else if edge.b as usize == point {
+                        Some(edge.a)
+                    } else {
+                        None
+                    }
+                })
+                .map(|other| (cage.positions[point] + cage.positions[other as usize]) * 0.5)
+                .collect::<Vec<_>>();
+            let centroids = faces
+                .iter()
+                .map(|fi| {
+                    let pts = cage.polygon_points(*fi);
+                    pts.iter().copied().sum::<Vec3>() / pts.len() as f32
+                })
+                .collect::<Vec<_>>();
+            let alpha = 1.0 / (1.0 + midpoints.len() as f32 / 2.0 + faces.len() as f32 / 4.0);
+            let expected = cage.positions[point] * alpha
+                + midpoints.iter().copied().sum::<Vec3>() * (alpha / 2.0)
+                + centroids.iter().copied().sum::<Vec3>() * (alpha / 4.0);
+            assert!(
+                hybrid.positions[point].distance(expected) < 1e-6,
+                "mixed vertex {point} did not take Stam & Loop's mask"
+            );
+            if hybrid.positions[point].distance(cc.positions[point]) > 1e-5 {
+                differs += 1;
+            }
+        }
+        assert!(
+            differs > 0,
+            "the mixed mask must move at least one vertex off Catmull-Clark"
+        );
+
+        // An edge with a quad on one side and a triangle on the other takes the
+        // mean of the Catmull-Clark and Loop edge rules.
+        let mixed_edge = cage
+            .edges()
+            .into_iter()
+            .find(|edge| {
+                edge.faces.len() == 2
+                    && edge
+                        .faces
+                        .iter()
+                        .any(|fi| cage.polygons[*fi as usize].corners.len() == 3)
+                    && edge
+                        .faces
+                        .iter()
+                        .any(|fi| cage.polygons[*fi as usize].corners.len() != 3)
+            })
+            .expect("the mixed cage must have a quad/triangle edge");
+        let opposite = |face: u32| {
+            cage.polygons[face as usize]
+                .corners
+                .iter()
+                .map(|c| c.point)
+                .find(|p| *p != mixed_edge.a && *p != mixed_edge.b)
+                .unwrap()
+        };
+        let pa = cage.positions[mixed_edge.a as usize];
+        let pb = cage.positions[mixed_edge.b as usize];
+        let cc_edge = (pa
+            + pb
+            + face_centre(&cage, mixed_edge.faces[0] as usize)
+            + face_centre(&cage, mixed_edge.faces[1] as usize))
+            * 0.25;
+        let loop_edge = (pa + pb) * 0.375
+            + (cage.positions[opposite(mixed_edge.faces[0]) as usize]
+                + cage.positions[opposite(mixed_edge.faces[1]) as usize])
+                * 0.125;
+        let expected = (cc_edge + loop_edge) * 0.5;
+        assert!(
+            hybrid.positions.iter().any(|p| p.distance(expected) < 1e-5),
+            "a quad/triangle edge did not average the two edge rules"
+        );
+
+        // Every mask sums to one, so translating the cage translates every
+        // point of the result by the same offset.
+        let offset = Vec3::new(0.75, -1.25, 2.0);
+        let mut moved = cage.clone();
+        for p in &mut moved.positions {
+            *p += offset;
+        }
+        let shifted = stam_loop(&moved, 1);
+        assert_eq!(shifted.positions.len(), hybrid.positions.len());
+        for (a, b) in shifted.positions.iter().zip(&hybrid.positions) {
+            assert!(
+                a.distance(*b + offset) < 1e-5,
+                "the mixed Stam-Loop mask is not affine invariant"
+            );
+        }
     }
 
     #[test]

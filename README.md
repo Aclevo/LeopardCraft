@@ -394,9 +394,12 @@ The panel provides:
   mesh's centre line by an angle spread along an axis). The **Subdivision
   Surface** modifier offers Catmull-Clark,
   Stam-Loop and Linear schemes, defaults to two iterations, and honours edge
-  creases under the two smooth schemes, including fractional crease weights;
-  Linear subdivision increases density without smoothing the surface, keeps the
-  mesh watertight and ignores crease sharpness.
+  creases under the two smooth schemes, including fractional crease weights.
+  Stam-Loop keeps a quad cage quad and splits each triangle into three quads,
+  then uses Catmull-Clark masks on quad rings, Loop masks on triangle rings and
+  the published mixed mask where the two meet, so a mixed cage never gets
+  triangulated; Linear subdivision increases density without smoothing the
+  surface, keeps the mesh watertight and ignores crease sharpness.
 - The Boolean modifier is created with **Add Boolean** in the modifier stack and
   chooses a mesh as Union, Subtract or Intersect operand; **Add Wrap** picks the
   mesh it wraps around. Add Modifier enables only entries whose geometry input
@@ -546,7 +549,8 @@ The server implements both MCP protocol generations: the `2025-06-18`
   `add_modifier`, `update_modifier`, `remove_modifier`, `move_modifier`,
   `create_material`, `update_material`, `set_animation_key`,
   `remove_animation_key`, `create_take`, `activate_take`, `update_take`,
-  `delete_take`, `edit_mesh`, `edit_uv`, `undo` and `redo`. Modifier tools
+  `delete_take`, `edit_mesh`, `edit_uv`, `undo`, `redo` and `select_objects`
+  (object selection in an attached editor). Modifier tools
   accept the same snake_case objects `get_object` reports, check the target and
   parameters before editing, and record one undo entry per call. Material tools
   accept the complete shader graph `get_material` returns (nodes, links and
@@ -570,8 +574,38 @@ id or an exact name. Edits go through the editor's undo commands, so `undo`
 reverses one tool call at a time, and the server tracks the document's path and
 dirty state across saves. Mesh edits use explicit component indices supplied
 with each request instead of a persistent editor selection, so the same payload
-works headlessly. The server is a separate headless process: it does not attach
-to a running editor window.
+works headlessly. Without `--attach` the server is a separate headless process
+with its own document; `--attach` points it at a running editor session instead.
+
+### Attaching to a running editor
+
+**Tools -> Live Agent Bridge** in the editor starts an opt-in loopback endpoint
+and prints its port in the status bar; the menu item shows a check mark while it
+is on, and turning it off (or closing the editor) closes the endpoint and removes
+its registry entry. Nothing is opened by default, and the listener binds
+`127.0.0.1` only.
+
+The endpoint is HTTP/JSON at `POST /command` and its trust model is deliberately
+small: a 32-byte token generated per session from the operating system entropy
+source, which every request must send as `Authorization: Bearer <token>`, and an
+`Origin` allow-list that accepts only loopback origins (or no `Origin` at all, as
+native clients send). The token is published in a `0600` registry next to the
+port and the editor's pid — `$XDG_RUNTIME_DIR/leopardcraft/editors.json` by
+default — so several open editors stay addressable. The file is atomic-written
+and `LEOPARDCRAFT_BRIDGE_REGISTRY` moves it.
+
+`leopardcraft --mcp --attach` (also with `--mcp-http`) finds that registry and
+attaches. The server then routes every tool call, `undo`/`redo`, the scene
+resources and `select_objects` to the editor's live document and selection; each
+edit is one entry in the editor's own undo history, and `get_scene` gains a
+`selection` field. The editor's UI thread answers one request at a time, so a
+busy or dialog-blocked editor answers `503 editor busy` instead of racing the
+document, and a refused request changes nothing. The server's private document
+stays as the fallback for a session that is not attached.
+
+`LEOPARDCRAFT_EDITOR_ENDPOINT` (e.g. `http://127.0.0.1:47011`) plus
+`LEOPARDCRAFT_EDITOR_TOKEN` pin one editor directly and win over the registry;
+without them, `--attach` refuses to guess when more than one editor is running.
 
 ### HTTP transport, subscriptions and prompts
 

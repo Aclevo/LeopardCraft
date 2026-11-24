@@ -23,6 +23,9 @@ second source of scene truth.
 - `mesh_edit.rs` — editable-mesh, component selection, UV and mesh tools.
 - `animation.rs` — timeline targets, F-curve keys, clipboard and retiming.
 - `dialogs.rs` — menu-driven file, guard, recovery and about dialogs.
+- `live.rs` — the opt-in live-agent bridge host: turns one bridge request into
+  a snapshot, a tool call on the editor's own document/history or a selection
+  change, one request per frame on the UI thread.
 - `viewport_ui.rs` — viewport frame, navigation, picking, gizmo and overlays.
 - `panels.rs`, `panels_more.rs` — Properties, Tags, Materials, mesh editing,
   skinning, splines, render settings.

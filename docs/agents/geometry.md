@@ -21,7 +21,7 @@ clock.
 - `uv.rs` — projections (UV0 and any set), automatic unwrap, seam-aware
   charts, relaxation, chart transform/packing, UV slot operations and
   distortion measurement.
-- `subdiv.rs` — Catmull-Clark, Stam-Loop and linear subdivision.
+- `subdiv.rs` — Catmull-Clark, Stam-Loop (the published quad/triangle hybrid) and linear subdivision.
 - `csg.rs` — BSP booleans; `bvh.rs` — ray acceleration.
 - `primitives.rs`, `spline.rs` — parametric builders and curves.
 - `crates/lc-core/src/lib.rs` — transforms, AABB, rays, PCG32, colour,

@@ -59,6 +59,7 @@ pub(crate) fn exists(name: &str) -> bool {
             | "new_scene"
             | "export_scene"
             | "render_image"
+            | "select_objects"
     )
 }
 
@@ -113,6 +114,7 @@ pub(crate) fn call(
         "new_scene" => server.new_scene(args),
         "export_scene" => server.export_scene(args),
         "render_image" => server.render_image(args),
+        "select_objects" => server.select_objects(args),
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -664,6 +666,30 @@ fn definitions() -> Vec<Value> {
                     "path": { "type": "string", "description": "Target .obj, .stl, .glb, .gltf, .lcscene or .json path." }
                 }),
                 &["path"],
+            ),
+            false,
+            false,
+        ),
+        tool(
+            "select_objects",
+            "Select objects",
+            "Set the running editor's object selection. Requires the server to be attached to a \
+             live editor (--attach, with Tools -> Live Agent Bridge enabled). Objects accept numeric \
+             ids or exact names; mode is replace (default), add or toggle. An empty list clears it.",
+            schema(
+                json!({
+                    "objects": {
+                        "type": "array",
+                        "description": "Object ids or exact names, in selection order.",
+                        "items": { "type": ["integer", "string"] }
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "add", "toggle"],
+                        "description": "How the objects join the current selection."
+                    }
+                }),
+                &["objects"],
             ),
             false,
             false,

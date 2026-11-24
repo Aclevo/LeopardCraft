@@ -1,8 +1,9 @@
 //! JSON-RPC dispatch and the stdio transport for the MCP server.
 
+use crate::bridge::LiveClient;
 use crate::tools;
 use lc_scene::{Document, History};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -19,8 +20,16 @@ pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8765";
 
 const INSTRUCTIONS: &str = "LeopardCraft is an offline 3D modelling application. \
 Call get_scene or list_objects before editing. Object arguments accept a numeric id or an exact name. \
-Edits, undo and redo operate on the server's in-memory document; save_scene writes it to disk and \
-render_image path-traces it with the document camera. A running editor window is not attached.";
+Edits, undo and redo go through the document's undo commands; save_scene writes it to disk and \
+render_image path-traces it with the document camera.";
+
+const ATTACHED_INSTRUCTIONS: &str = "LeopardCraft is attached to the editor's live session. \
+Tool calls, undo, redo and selection act on the document the user is editing; nothing is written to a \
+separate copy. get_scene includes the editor's current object selection, and select_objects changes it.";
+
+const DETACHED_INSTRUCTIONS: &str =
+    "LeopardCraft owns an in-memory document that is not a running \
+editor window. Start the server with --attach to operate on the editor's live session instead.";
 
 /// A LeopardCraft document exposed as an MCP server.
 pub struct McpServer {
@@ -30,6 +39,10 @@ pub struct McpServer {
     pub(crate) dirty: bool,
     subscriptions: BTreeSet<String>,
     pending: Vec<Value>,
+    /// The editor session this server is attached to, if any. While attached,
+    /// every tool call and resource belongs to that live document; the fields
+    /// above stay as the fallback for when nothing is attached.
+    live: Option<LiveClient>,
 }
 
 impl McpServer {
@@ -42,7 +55,81 @@ impl McpServer {
             dirty,
             subscriptions: BTreeSet::new(),
             pending: Vec::new(),
+            live: None,
         }
+    }
+
+    /// Build a server around an existing document and history. The live bridge
+    /// uses this so a tool call runs against the editor's own session, under
+    /// the editor's undo history, without copying either.
+    pub fn with_history(doc: Document, path: Option<PathBuf>, history: History) -> Self {
+        let mut server = Self::new(doc, path);
+        server.history = history;
+        server
+    }
+
+    /// Give the document, path and history back, for example after the editor's
+    /// UI thread ran one tool call on its live session.
+    pub fn into_parts(self) -> (Document, Option<PathBuf>, History) {
+        (self.doc, self.path, self.history)
+    }
+
+    /// Attach to a running editor. Tool calls and resources then describe its
+    /// live document and selection instead of the private one.
+    pub fn attach(&mut self, client: LiveClient) {
+        self.live = Some(client);
+    }
+
+    pub fn detach(&mut self) -> bool {
+        self.live.take().is_some()
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.live.is_some()
+    }
+
+    pub fn live(&self) -> Option<&LiveClient> {
+        self.live.as_ref()
+    }
+
+    /// Run one tool against this server's document and history. The live bridge
+    /// host calls this on the editor's UI thread, one request at a time.
+    pub fn call_tool_value(
+        &mut self,
+        name: &str,
+        arguments: &Map<String, Value>,
+    ) -> Result<Value, String> {
+        if !tools::exists(name) {
+            return Err(format!("Unknown tool: {name}"));
+        }
+        tools::call(self, name, arguments)
+    }
+
+    /// Set the attached editor's object selection.
+    pub(crate) fn select_objects(&mut self, args: &Map<String, Value>) -> Result<Value, String> {
+        let Some(client) = self.live.as_ref() else {
+            return Err(
+                "Object selection lives in the editor; start the server with --attach and enable \
+                 Tools -> Live Agent Bridge, or use select_objects only while attached."
+                    .into(),
+            );
+        };
+        let objects = args
+            .get("objects")
+            .ok_or("Missing 'objects': an array of object ids or exact names")?;
+        let objects = objects
+            .as_array()
+            .ok_or("'objects' must be an array of object ids or exact names")?;
+        let mode = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("replace");
+        if !matches!(mode, "replace" | "add" | "toggle") {
+            return Err(format!(
+                "Unknown selection mode '{mode}'; use replace, add or toggle"
+            ));
+        }
+        client.select(objects, mode)
     }
 
     /// Take the notifications queued since the last call. Transports write them
@@ -120,9 +207,9 @@ impl McpServer {
         };
 
         let result = match method.as_str() {
-            "initialize" => Ok(initialize_result()),
+            "initialize" => Ok(initialize_result(self.is_attached())),
             "ping" => Ok(json!({})),
-            "server/discover" => Ok(discover_result()),
+            "server/discover" => Ok(discover_result(self.is_attached())),
             "tools/list" => Ok(tools::list_result()),
             "tools/call" => self.call_tool(&params),
             "resources/list" => Ok(resources_list_result()),
@@ -234,6 +321,21 @@ impl McpServer {
         let arguments = arguments
             .as_object()
             .expect("arguments were normalized to an object");
+        if self.live.is_some() {
+            // Selection is editor state rather than a document edit, so it uses
+            // the bridge's dedicated op instead of a tool round-trip.
+            if name == "select_objects" {
+                return Ok(match self.select_objects(arguments) {
+                    Ok(payload) => tool_success(payload),
+                    Err(message) => tool_error(message),
+                });
+            }
+            let client = self.live.as_ref().expect("attached");
+            return Ok(match client.call_tool(name, arguments) {
+                Ok(payload) => tool_success(payload),
+                Err(message) => tool_error(message),
+            });
+        }
         match tools::call(self, name, arguments) {
             Ok(payload) => Ok(tool_success(payload)),
             Err(message) => Ok(tool_error(message)),
@@ -246,9 +348,19 @@ impl McpServer {
             .and_then(Value::as_str)
             .ok_or((-32602, "Missing resource uri".to_string()))?;
         let text = match uri {
-            SCENE_URI => lc_scene::to_json(&self.doc).map_err(|error| (-32603, error))?,
-            SUMMARY_URI => serde_json::to_string_pretty(&self.summary_payload())
-                .map_err(|error| (-32603, error.to_string()))?,
+            SCENE_URI => match self.live.as_ref() {
+                Some(client) => client.scene_json().map_err(|error| (-32603, error))?,
+                None => lc_scene::to_json(&self.doc).map_err(|error| (-32603, error))?,
+            },
+            SUMMARY_URI => match self.live.as_ref() {
+                Some(client) => {
+                    let snapshot = client.snapshot().map_err(|error| (-32603, error))?;
+                    serde_json::to_string_pretty(&snapshot)
+                        .map_err(|error| (-32603, error.to_string()))?
+                }
+                None => serde_json::to_string_pretty(&self.summary_payload())
+                    .map_err(|error| (-32603, error.to_string()))?,
+            },
             other => return Err((-32602, format!("Resource not found: {other}"))),
         };
         Ok(cacheable(json!({
@@ -303,20 +415,29 @@ fn known_resource_uri(params: &Value) -> Result<String, (i64, String)> {
     }
 }
 
-fn initialize_result() -> Value {
+fn instructions(attached: bool) -> String {
+    let status = if attached {
+        ATTACHED_INSTRUCTIONS
+    } else {
+        DETACHED_INSTRUCTIONS
+    };
+    format!("{INSTRUCTIONS} {status}")
+}
+
+fn initialize_result(attached: bool) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": capabilities(),
         "serverInfo": server_info(),
-        "instructions": INSTRUCTIONS
+        "instructions": instructions(attached)
     })
 }
 
-fn discover_result() -> Value {
+fn discover_result(attached: bool) -> Value {
     json!({
         "supportedVersions": [LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION],
         "capabilities": capabilities(),
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions(attached),
         "ttlMs": 0,
         "cacheScope": "private"
     })

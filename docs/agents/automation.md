@@ -9,12 +9,16 @@ anything.
 
 Expose LeopardCraft to agents and scripts without a GUI, over a clean stdio
 protocol and a deterministic headless CLI. The MCP server owns its own
-`Document` and `History`; it is not attached to a running editor.
+`Document` and `History`; `--attach` connects it to a running editor's opt-in
+live bridge instead, and the private document stays the fallback.
 
 ## Entry points
 
 - `crates/lc-mcp/src/server.rs` — JSON-RPC loop, handshake/discovery, protocol
   errors, resources and subscriptions, prompt dispatch, stdio framing.
+- `crates/lc-mcp/src/bridge.rs` — the live-editor endpoint (`POST /command`,
+  session token, `0600` registry, loopback `Origin` allow-list, busy answers),
+  discovery through the registry or the environment, and the attach client.
 - `crates/lc-mcp/src/http.rs` — opt-in Streamable HTTP transport on a loopback
   endpoint, with the Server-Sent Events stream for resource updates and the
   `Mcp-Session-Id` session rules (400 without the header, 404 for an unknown or
@@ -46,6 +50,10 @@ protocol and a deterministic headless CLI. The MCP server owns its own
 - The engine remains offline; no telemetry, network or wall-clock dependence in
   tool behavior. The Streamable HTTP transport is opt-in, binds loopback only,
   tracks `Mcp-Session-Id` sessions, and is never required by the stdio path.
+- Live attachment is opt-in on both ends. While attached, tool calls go to the
+  editor's live document and selection and each edit is one entry in the
+  editor's history; a refused or busy request must leave no partial edit. The
+  token is never printed or written outside the `0600` registry.
 
 ## Interfaces and boundaries
 
