@@ -15,11 +15,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || {
 }
 
 status=0
+failed=()
 
 run() {
     printf '\n==> %s\n' "$*"
     if ! "$@"; then
         printf 'FAILED: %s\n' "$*" >&2
+        failed+=("$*")
         status=1
     fi
 }
@@ -28,12 +30,19 @@ run cargo fmt --all -- --check
 run cargo clippy --workspace --all-targets -- -D warnings
 run cargo test --workspace
 run cargo test -p leopardcraft --test mcp_smoke
+# Check the working tree and the index: `git diff --check` alone ignores
+# changes that are already staged for commit.
 run git diff --check
+run git diff --cached --check
 
 if [ "$status" -eq 0 ]; then
     printf '\nAll checks passed.\n'
 else
-    printf '\nOne or more checks failed.\n' >&2
+    printf '\nFailed checks:\n' >&2
+    for check in "${failed[@]}"; do
+        printf '  - %s\n' "$check" >&2
+    done
+    printf 'One or more checks failed.\n' >&2
 fi
 
 exit "$status"

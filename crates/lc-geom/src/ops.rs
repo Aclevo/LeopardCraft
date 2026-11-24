@@ -2408,11 +2408,10 @@ mod tests {
             Vec3::new(0.25, 0.0, 0.25),
             "a half slide stops half way to the midpoint"
         );
-        for index in 1..positions.len() {
-            assert_eq!(
-                out.positions[index], positions[index],
-                "point {index} moved"
-            );
+        assert_eq!(out.positions.len(), positions.len());
+        for (index, (actual, expected)) in out.positions.iter().zip(&positions).enumerate().skip(1)
+        {
+            assert_eq!(actual, expected, "point {index} moved");
         }
         assert_eq!(out.polygons, polygons, "faces keep their corner records");
         assert!(out.validate().is_ok());
