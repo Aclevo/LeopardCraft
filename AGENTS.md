@@ -13,13 +13,11 @@ researched Cheetah3D feature matrix, and `TODO.md` tracks feature work.
 
 The remaining `TODO.md` backlog is planned as missions G30–G39 in
 [`docs/agents/goals/ROADMAP.md`](docs/agents/goals/ROADMAP.md). G30–G35 are
-complete, as is [`G38.md`](docs/agents/goals/G38.md); G36 is complete too,
-including the Stam-Loop hybrid, while G37 and G39 remain partially complete with
-their remaining items recorded in `TODO.md`. G39's live-editor attachment is
-implemented and tested headlessly (bridge, token registry, attach routing,
-selection, editor wiring); the menu toggle is confirmed present in a running
-editor, and what remains is one attach run against a live session. The
-interactive Claude Code session has been approved by the user and now lists the
+complete, as is [`G38.md`](docs/agents/goals/G38.md); G36 and G39 are complete
+too, including the Stam-Loop hybrid and verified live-editor attachment (the MCP
+server attaches to a running editor's document and selection). G37 remains
+partially complete with its remaining items recorded in `TODO.md`, and the
+interactive Claude Code session has been approved by the user and lists the
 LeopardCraft tools. A
 new
 session should read the roadmap before dispatching, and update the mission

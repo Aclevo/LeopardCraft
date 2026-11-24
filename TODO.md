@@ -1515,44 +1515,39 @@ document.
       tools, checks the advertised schemas and compares the tool inventory with
       `AGENTS.md`; a second check launches through `.mcp.json` with Claude Code's
       variable expansion.
-- [ ] Attach to a running editor window so an agent can manipulate the live
+- [x] Attach to a running editor window so an agent can manipulate the live
       session and its selection instead of a separate in-memory document.
-      **Implemented 2026-11-24; blocked on verification inside a real editor
-      window** (the toggle and a live attach need a display session, which this
-      pass could not reach). The implementation follows the researched contract
-      and adds: `lc-mcp/src/bridge.rs` — loopback HTTP/JSON at `POST /command`,
-      a 32-byte token from `/dev/urandom` required as `Authorization: Bearer`,
-      an atomic `0600` registry (name, port, pid, token; `$XDG_RUNTIME_DIR` or
-      `LEOPARDCRAFT_BRIDGE_REGISTRY`), a loopback-only `Origin` allow-list,
-      `503` when the UI thread does not answer within three seconds, and a
-      `LiveClient` with registry or `LEOPARDCRAFT_EDITOR_ENDPOINT`/
-      `LEOPARDCRAFT_EDITOR_TOKEN` discovery that refuses to guess between
-      several open editors; `lc-ui/src/live.rs` and a `Tools -> Live Agent
-      Bridge` toggle that services one request per frame on the UI thread and
-      runs each tool through the shared `McpServer` implementation on the
-      editor's own document and history (one undo entry per call); `--attach`
-      on `--mcp`/`--mcp-http`, which routes tool calls, `undo`/`redo`, the scene
-      resources and the new `select_objects` tool to the editor and adds a
-      `selection` field to `get_scene`, with the server's private document as
-      the fallback when not attached. Headless tests cover the token/Origin
-      rejection, busy answers, `0600` registry, attach routing and fallback,
-      live selection and live undo (`attach_routes_tools_resources_and_undo_to_
-      the_live_editor`, `bridge_answers_busy_when_the_editor_does_not_drain`,
+      Implemented 2026-11-24: `lc-mcp/src/bridge.rs` — loopback HTTP/JSON at
+      `POST /command`, a 32-byte token from `/dev/urandom` required as
+      `Authorization: Bearer`, an atomic `0600` registry (name, port, pid,
+      token; `$XDG_RUNTIME_DIR` or `LEOPARDCRAFT_BRIDGE_REGISTRY`), a
+      loopback-only `Origin` allow-list, `503` when the UI thread does not answer
+      within three seconds, and a `LiveClient` with registry or
+      `LEOPARDCRAFT_EDITOR_ENDPOINT`/`LEOPARDCRAFT_EDITOR_TOKEN` discovery that
+      refuses to guess between several open editors; `lc-ui/src/live.rs` and the
+      `Tools -> Live Agent Bridge` toggle service one request per frame on the UI
+      thread and run each tool through the shared `McpServer` implementation on
+      the editor's own document and history (one undo entry per call); `--attach`
+      on `--mcp`/`--mcp-http` routes tool calls, `undo`/`redo`, the scene
+      resources and `select_objects` to the editor and adds a `selection` field
+      to `get_scene`, with the server's private document as the fallback when not
+      attached. Tests: `attach_routes_tools_resources_and_undo_to_the_live_editor`,
+      `bridge_answers_busy_when_the_editor_does_not_drain`,
       `bridge_requires_the_session_token_and_reports_the_editor_busy`,
       `registry_file_is_private_and_prunes_replaced_entries`,
       `origin_allow_list_accepts_loopback_origins_only`,
       `editor_host_services_bridge_requests_over_the_loopback_endpoint`, plus the
-      three `crates/lc-ui/src/live.rs` host tests). Still to prove by hand:
-      enabling the toggle
-      in a running editor and attaching to it (the user confirmed on 2026-11-24
-      that **Tools -> Live Agent Bridge** is present in the running editor, and
-      the session registry file was created and cleaned up, but no live entry
-      existed when the attach could be exercised). The researched contract still
-      holds: loopback HTTP/JSON rather than a Unix socket, an explicit
-      in-editor toggle plus a per-session token in a `0600` registry and a
-      loopback `Origin` allow-list, registry-plus-environment discovery, and
-      attachment that augments the server rather than replacing the editor's
-      document ownership.
+      three other `crates/lc-ui/src/live.rs` host tests.
+      Verified 2026-11-24 against the running editor with the toggle on (registry
+      entry `LeopardCraft`, port 39247, live pid): the real
+      `leopardcraft --mcp --attach` session reported `attached to the live editor
+      session`; `get_scene` returned the live 13-object document with
+      `selection: {"names": ["Torus"], "objects": [11], "primary": 11}` — the
+      editor's own selection, not a copy; `select_objects {"objects":
+      ["Ground"], "mode": "replace"}` returned `{"names": ["Ground"], "objects":
+      [8], "primary": 8}`; and a fresh, independent attach read `Ground` back
+      from `get_scene`, proving the editor's selection had changed. The original
+      `Torus` selection was restored afterwards.
 - [x] Modifier-stack authoring tools: `add_modifier`, `update_modifier`,
       `remove_modifier` and `move_modifier` accept the same snake_case modifier
       objects `get_object` returns, validate the target object, finite

@@ -89,12 +89,11 @@ same change. The integrator runs the full gate afterwards.
 ## TODO mapping
 
 Own `TODO.md` section 7 (MCP automation) and the MCP/CLI limitations in
-`README.md`. Attaching to a live editor remains open, but its contract is
-decided and recorded in `TODO.md` §7: a loopback HTTP/JSON endpoint with a
-per-session token published in a `0600` registry, an Origin allow-list, one
-request at a time on the editor's UI thread, and attach augmenting rather than
-replacing the editor's document. Coordinate contract needs with the owning lane
-before starting.
+`README.md`. Live-editor attachment is implemented and verified: a loopback
+HTTP/JSON endpoint with a per-session token published in a `0600` registry, an
+Origin allow-list, one request at a time on the editor's UI thread, and an attach
+that augments rather than replaces the editor's document. Coordinate contract
+needs with the owning lane before starting.
 
 ## Handoff
 
