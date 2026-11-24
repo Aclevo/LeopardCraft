@@ -89,6 +89,7 @@ xkbcommon and Vulkan development packages listed in
 | `packaging` | Distribution packaging inputs |
 | `docs/cheetah3d-parity.md` | Researched Cheetah3D parity matrix, sources and gaps |
 | `docs/agents` | Multi-agent lane briefs and the orchestration playbook |
+| `.agents` | Freebuff/Codebuff CLI lane agents and coordinator |
 | `TODO.md` | Planned and completed feature work by workstream |
 
 ## Architecture
@@ -149,8 +150,9 @@ The repository is split into six non-overlapping write scopes so several agents
 can work on different parts of the software in parallel. `docs/agents/README.md`
 is the orchestration playbook: lane dependencies, shared contracts, task packets,
 handoffs, merge order and integration checks. Each lane has a brief with its
-entry points, invariants and tests; `.claude/agents/lc-*.md` exposes the same
-lanes as project subagents.
+entry points, invariants and tests. `.claude/agents/lc-*.md` exposes the same
+lanes as Claude Code project subagents; `.agents/lc-*.ts` and
+`.agents/lc-coordinator.ts` expose them to the Freebuff/Codebuff CLI.
 
 | Lane | Write scope | Brief | Check |
 | --- | --- | --- | --- |
@@ -164,8 +166,8 @@ lanes as project subagents.
 The main/orchestrating session is the integrator. It owns `AGENTS.md`,
 `CLAUDE.md`, `README.md`, `TODO.md`, `Cargo.toml`/`Cargo.lock`,
 `scripts/check.sh`, `scripts/check-lane.sh`, `.github/`, `packaging/`,
-`docs/cheetah3d-parity.md`, `docs/agents/README.md` and `.claude/agents/`. Each
-lane owns its brief and its write scope.
+`docs/cheetah3d-parity.md`, `docs/agents/README.md`, `.claude/agents/` and
+`.agents/`. Each lane owns its brief and its write scope.
 
 - A lane edits only its own paths and brief. A cross-lane need is a handoff with
   the exact requested API, never an edit in another crate.
@@ -178,6 +180,8 @@ lane owns its brief and its write scope.
 - A lane check is the fast inner loop; the integrator runs `scripts/check.sh`
   after merging and before calling a batch done. A contract change needs the
   full gate before dependent lanes start.
+- `.claude/agents/` and `.agents/` are thin host adapters over the same six
+  lanes. Change them with the lane table and `scripts/check-lane.sh`.
 - The automation lane may edit only the `## MCP tool inventory` section of this
   file and the MCP tool list in `README.md` when tools change; every other root
   document edit goes through the integrator.

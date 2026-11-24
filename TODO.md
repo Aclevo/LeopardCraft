@@ -1143,6 +1143,11 @@ briefs and the orchestration playbook live under `docs/agents/`.
       six lanes, each loading the root instructions, playbook and lane brief.
 - [x] Add `scripts/check-lane.sh <lane>` for per-lane formatting, clippy and
       tests, leaving `scripts/check.sh` as the full integration gate.
+- [x] Mirror the six lanes for the Freebuff/Codebuff CLI in `.agents/`, with an
+      `lc-coordinator` that dispatches them and a shared, overridable model
+      constant.
+- [x] Document the `.agents` trust gate, Projects access, model selection and
+      CLI usage in `.agents/README.md`.
 - [ ] Approve the project-scoped server in an interactive Claude Code session
       (user consent), then confirm `/mcp` lists the LeopardCraft tools.
 

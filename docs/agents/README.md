@@ -32,6 +32,16 @@ contract-sensitive and reports them explicitly. `lc-ui` deliberately stays one
 lane: `app.rs` is the editor's shared state hub, so splitting the UI across
 parallel agents would create constant conflicts.
 
+The lane briefs are host-agnostic. Two thin adapters expose the same lanes:
+
+- `.claude/agents/lc-*.md` — Claude Code project subagents.
+- `.agents/lc-*.ts` plus `.agents/lc-coordinator.ts` — Freebuff/Codebuff CLI
+  local agents. See [`../../.agents/README.md`](../../.agents/README.md) for the
+  trust gate, Projects access and the shared model constant.
+
+Both adapters are integrator-owned and change with the lane table and
+`scripts/check-lane.sh`.
+
 ## Shared files
 
 Root documents, build metadata and orchestration tooling are owned by the
@@ -177,8 +187,9 @@ follow-ups:     small discovered gaps, not a redesign proposal
 ## Maintaining the setup
 
 The lane table here, the summary in `AGENTS.md`, the case mapping in
-`scripts/check-lane.sh` and the six wrappers in `.claude/agents/` describe the
-same six lanes. Change them together in one integrator edit. If a crate is added
+`scripts/check-lane.sh`, the six wrappers in `.claude/agents/` and the six
+definitions plus coordinator in `.agents/` describe the same six lanes. Change
+them together in one integrator edit. If a crate is added
 or split, give it an owning lane, a brief, a check mapping and a subagent
 wrapper, or fold it into an existing lane explicitly.
 

@@ -62,9 +62,10 @@ AI coding agents should start with [`AGENTS.md`](AGENTS.md) for the architecture
 map, task recipes and conventions; `scripts/check.sh` runs the full workspace
 gate, including a real MCP handshake smoke test. The repository is split into
 six agent lanes with scoped briefs under [`docs/agents/`](docs/agents/README.md);
-`scripts/check-lane.sh <lane>` runs one lane's fast gate, and `.claude/agents/`
-exposes the same lanes as project subagents. The project-scoped `.mcp.json`
-exposes the MCP server to compatible clients.
+`scripts/check-lane.sh <lane>` runs one lane's fast gate, `.claude/agents/`
+exposes the same lanes as Claude Code project subagents, and `.agents/` provides
+a Freebuff/Codebuff CLI coordinator plus the six lanes. The project-scoped
+`.mcp.json` exposes the MCP server to compatible clients.
 
 The native scene format is pretty-printed JSON with a format/version header. It is
 validated and sanitized on load. Document signatures ignore allocator counters, so
