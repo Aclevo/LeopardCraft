@@ -109,9 +109,11 @@ Manager window.
   skin binding and weight painting; mesh-editing tools; spline control points.
   Modifier, skin and direct UV-point controls edit the primary object only.
 - **Node Materials** — material shelf with shaded sphere previews and an
-  editable light-canvas shader graph with Principled, noise, voronoi, ramp,
-  math, texture, normal and emission nodes. Material roughness and metallic
-  honour material-scope animation keys during evaluation.
+  editable light-canvas shader graph with Principled BSDF and noise, voronoi,
+  checker, color-ramp, image-texture, RGB, value and bump nodes; the graph also
+  evaluates gradient, texture-coordinate, geometry, fresnel, normal-map,
+  mapping, math and mix nodes stored in a material. Material roughness and
+  metallic honour material-scope animation keys during evaluation.
 - **UV Editor** — planar/box/cylindrical/spherical projection, auto-unwrap and
   relaxation apply to every selected editable mesh. Edges marked as UV seams
   with mesh-edge **Toggle Seam** (Mesh Editing Edge mode, `Selection -> Toggle
@@ -448,7 +450,8 @@ The real-time viewport is a wgpu render pass into an offscreen texture that egui
 composites with overlays. The offline renderer is a CPU path tracer with:
 
 - perspective, orthographic and panoramic camera ray generation;
-- environment/HDRI backgrounds and sun/point/area lights;
+- environment/HDRI backgrounds and directional/sun, point, area and spot
+  lights (spot cones with an inner/outer angle ramp and a falloff radius);
 - next-event estimation, GGX specular, diffuse and dielectric transmission;
 - reflections, refraction, shadows, depth of field and progressive accumulation;
 - ACES tone mapping to PNG and linear half-float scanline EXR output.
@@ -492,7 +495,7 @@ mathematics and open format specifications, with original code.
 
 ## Status and limitations
 
-LeopardCraft is an early 0.1 implementation. The engine and document model are
+LeopardCraft is an early 0.2 implementation. The engine and document model are
 usable and covered by tests, but the editor is not yet a replacement for a mature
 production modeller. The researched Cheetah3D feature matrix is in
 [`docs/cheetah3d-parity.md`](docs/cheetah3d-parity.md). Known limitations:
@@ -510,7 +513,7 @@ production modeller. The researched Cheetah3D feature matrix is in
   document and writes files, but does not attach to a running editor or expose
   modifier-stack, material-graph, animation or component-level authoring tools.
 - GPU compute baking is not implemented; offline rendering is CPU-side.
-- The 0.1 tree is native-first; a WASM/WebGPU application target is not wired up
+- The 0.2 tree is native-first; a WASM/WebGPU application target is not wired up
   yet.
 - Render export is single-frame. Animation playback is available in the editor,
   but there is no batch image-sequence render command yet.
