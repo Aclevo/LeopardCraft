@@ -1109,7 +1109,8 @@ document.
 
 Keep the repository easy to navigate and verify for AI coding agents. The
 canonical instructions live in `AGENTS.md`; `CLAUDE.md` points Claude-based
-agents at the same file so there is one source of truth.
+agents at the same file so there is one source of truth. Multi-agent lane
+briefs and the orchestration playbook live under `docs/agents/`.
 
 - [x] Add `AGENTS.md` with ground rules, commands, a workspace/architecture
       map, task-to-file recipes, conventions, testing guidance and the MCP
@@ -1132,6 +1133,16 @@ agents at the same file so there is one source of truth.
       project entry from the repository root and a subdirectory, and the
       automated smoke test covers the same command without requiring Claude
       Code in CI.
+- [x] Split the repository into six non-overlapping agent lanes with scoped
+      briefs under `docs/agents/` covering owned paths, entry points,
+      invariants, cross-lane interfaces and lane checks.
+- [x] Document the orchestration model in `docs/agents/README.md`: lane
+      dependencies, shared contracts, task packets, parallel rounds, handoff
+      format and integration order.
+- [x] Add project-scoped Claude Code subagents in `.claude/agents/` mapping the
+      six lanes, each loading the root instructions, playbook and lane brief.
+- [x] Add `scripts/check-lane.sh <lane>` for per-lane formatting, clippy and
+      tests, leaving `scripts/check.sh` as the full integration gate.
 - [ ] Approve the project-scoped server in an interactive Claude Code session
       (user consent), then confirm `/mcp` lists the LeopardCraft tools.
 

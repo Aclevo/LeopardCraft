@@ -52,6 +52,9 @@ cargo run -p leopardcraft -- --headless export \
 # and git diff --check
 scripts/check.sh
 
+# Fast per-lane check for one agent lane (see "Multi-agent lanes")
+scripts/check-lane.sh geometry
+
 # MCP smoke test alone: real binary, initialize + tools/list + tool calls
 cargo test -p leopardcraft --test mcp_smoke
 
@@ -82,9 +85,10 @@ xkbcommon and Vulkan development packages listed in
 | `crates/lc-mcp` | Model Context Protocol stdio server and its scene tools |
 | `crates/lc-ui` | eframe editor: viewport, panels, timeline, material graph, lifecycle |
 | `app/tests/mcp_smoke.rs` | Real-process MCP handshake, config launch and tool-inventory checks |
-| `scripts` | Full-gate checker and the cwd-independent MCP launcher |
+| `scripts` | Full-gate and per-lane checkers and the cwd-independent MCP launcher |
 | `packaging` | Distribution packaging inputs |
 | `docs/cheetah3d-parity.md` | Researched Cheetah3D parity matrix, sources and gaps |
+| `docs/agents` | Multi-agent lane briefs and the orchestration playbook |
 | `TODO.md` | Planned and completed feature work by workstream |
 
 ## Architecture
@@ -138,6 +142,45 @@ EvaluatedScene -> wgpu viewport overlay      crates/lc-ui
 | UI workflow or panel | `lc-ui/src/app.rs` plus `panels.rs`/`panels_more.rs` | `selection.rs` predicates, `selection_tests.rs`, README controls |
 | MCP tool | `lc-mcp/src/tools.rs` | protocol/error tests in `lc-mcp/src/server.rs`, real-process checks in `app/tests/mcp_smoke.rs`, the MCP tool inventory below, README tool list |
 | Rendering feature | `lc-render/src/scene.rs`, `tracer.rs`, `output.rs` | selftest/render tests, README limitations |
+
+## Multi-agent lanes
+
+The repository is split into six non-overlapping write scopes so several agents
+can work on different parts of the software in parallel. `docs/agents/README.md`
+is the orchestration playbook: lane dependencies, shared contracts, task packets,
+handoffs, merge order and integration checks. Each lane has a brief with its
+entry points, invariants and tests; `.claude/agents/lc-*.md` exposes the same
+lanes as project subagents.
+
+| Lane | Write scope | Brief | Check |
+| --- | --- | --- | --- |
+| geometry | `crates/lc-core`, `crates/lc-geom` | `docs/agents/geometry.md` | `scripts/check-lane.sh geometry` |
+| document | `crates/lc-anim`, `crates/lc-scene` | `docs/agents/document.md` | `scripts/check-lane.sh document` |
+| rendering | `crates/lc-shading`, `crates/lc-render` | `docs/agents/rendering.md` | `scripts/check-lane.sh rendering` |
+| interchange | `crates/lc-io` | `docs/agents/interchange.md` | `scripts/check-lane.sh interchange` |
+| editor | `crates/lc-ui` | `docs/agents/editor.md` | `scripts/check-lane.sh editor` |
+| automation | `crates/lc-mcp`, `app`, `scripts/mcp-server.sh`, `.mcp.json` | `docs/agents/automation.md` | `scripts/check-lane.sh automation` |
+
+The main/orchestrating session is the integrator. It owns `AGENTS.md`,
+`CLAUDE.md`, `README.md`, `TODO.md`, `Cargo.toml`/`Cargo.lock`,
+`scripts/check.sh`, `scripts/check-lane.sh`, `.github/`, `packaging/`,
+`docs/cheetah3d-parity.md`, `docs/agents/README.md` and `.claude/agents/`. Each
+lane owns its brief and its write scope.
+
+- A lane edits only its own paths and brief. A cross-lane need is a handoff with
+  the exact requested API, never an edit in another crate.
+- Shared contracts are `scene.rs`, `geometry.rs`, `eval.rs`, `undo.rs`,
+  `format.rs`, the `lc-anim` channel registry, `EvaluatedScene` and the MCP tool
+  inventory. The owning lane lands a contract change first, names its consumers,
+  and dependent lanes wait.
+- Additive APIs and backward-compatible defaults come first. Never copy
+  evaluation, serialization or undo logic into another crate to avoid waiting.
+- A lane check is the fast inner loop; the integrator runs `scripts/check.sh`
+  after merging and before calling a batch done. A contract change needs the
+  full gate before dependent lanes start.
+- The automation lane may edit only the `## MCP tool inventory` section of this
+  file and the MCP tool list in `README.md` when tools change; every other root
+  document edit goes through the integrator.
 
 ## Cheetah3D parity work
 
@@ -194,7 +237,9 @@ EvaluatedScene -> wgpu viewport overlay      crates/lc-ui
 - The ignored `warning_stderr_child` test is an intentional child-process helper;
   leave it ignored.
 - Run focused tests while iterating, then `scripts/check.sh` before finishing.
-  Re-run the affected check after any repair; do not report an earlier pass as
+  A lane uses `scripts/check-lane.sh <lane>` as its fast inner loop; the
+  orchestrating/integrating session runs the full gate after merging. Re-run
+  the affected check after any repair; do not report an earlier pass as
   covering a later edit. MCP changes need the real-process smoke test
   (`app/tests/mcp_smoke.rs`) in addition to unit tests.
 - GUI checks require launching the editor; headless tests cannot prove visual

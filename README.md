@@ -60,7 +60,10 @@ output and OBJ/STL/GLB round-trips in a temporary directory.
 
 AI coding agents should start with [`AGENTS.md`](AGENTS.md) for the architecture
 map, task recipes and conventions; `scripts/check.sh` runs the full workspace
-gate, including a real MCP handshake smoke test. The project-scoped `.mcp.json`
+gate, including a real MCP handshake smoke test. The repository is split into
+six agent lanes with scoped briefs under [`docs/agents/`](docs/agents/README.md);
+`scripts/check-lane.sh <lane>` runs one lane's fast gate, and `.claude/agents/`
+exposes the same lanes as project subagents. The project-scoped `.mcp.json`
 exposes the MCP server to compatible clients.
 
 The native scene format is pretty-printed JSON with a format/version header. It is
