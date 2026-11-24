@@ -6,10 +6,15 @@
 //! with an optional pole. Longer (and shorter) chains use damped cyclic
 //! coordinate descent. Neither solver stretches bones: unreachable targets are
 //! clamped to the chain's reach.
+//!
+//! A chain may also name a Spline node instead of relying on its point target.
+//! Spline IK samples that curve into a world-space polyline and aims each bone
+//! at a point one bone length further along it, so the chain hugs the curve as
+//! a chain of chords without stretching; see [`solve_spline_chain`].
 
 use crate::{Document, NodeId, NodeKind, Scene};
 use glam::{Mat4, Quat, Vec3};
-use lc_anim::{AnimationClip, Interpolation};
+use lc_anim::{AnimationClip, ChannelTarget, Interpolation};
 use lc_core::Transform;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +25,7 @@ const DEFAULT_CHAIN_LENGTH: usize = 2;
 const DEFAULT_ITERATIONS: usize = 24;
 const DEFAULT_TOLERANCE: f32 = 1e-3;
 const DEFAULT_DAMPING: f32 = 1.0;
+const DEFAULT_STIFFNESS: f32 = 1.0;
 const DEFAULT_LIMIT_DEGREES: f32 = 180.0;
 const MAX_LIMIT_DEGREES: f32 = 360.0;
 
@@ -165,6 +171,17 @@ pub struct IkChain {
     /// Fraction of each CCD correction applied per pass. 1 is a full step.
     #[serde(default = "default_damping")]
     pub damping: f32,
+    /// Optional Spline node whose curve drives the chain in place of the point
+    /// target. A missing or non-spline node falls back to the point target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spline: Option<NodeId>,
+    /// Fraction of each solver correction applied per pass. 1 is a full solve,
+    /// 0 leaves the rest pose untouched and values between land in the middle.
+    #[serde(
+        default = "default_stiffness",
+        skip_serializing_if = "stiffness_is_default"
+    )]
+    pub stiffness: f32,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -185,6 +202,49 @@ fn default_damping() -> f32 {
     DEFAULT_DAMPING
 }
 
+fn default_stiffness() -> f32 {
+    DEFAULT_STIFFNESS
+}
+
+fn stiffness_is_default(stiffness: &f32) -> bool {
+    (*stiffness - DEFAULT_STIFFNESS).abs() <= f32::EPSILON
+}
+
+/// Blend every solved joint back toward its pre-solve rotation by the chain's
+/// stiffness. Doing this once, after the solve, makes stiffness mean the same
+/// thing on the analytic, CCD and spline paths: 1 keeps the full solve, 0 keeps
+/// the rest pose and values between land partway. Limits are re-clamped after
+/// the blend so a soft solve never escapes them.
+fn soften_pose(
+    scene: &Scene,
+    chain: &IkChain,
+    base: &[(NodeId, Transform)],
+    locals: &mut BTreeMap<NodeId, Transform>,
+) {
+    let stiffness = chain.stiffness.clamp(0.0, 1.0);
+    if !stiffness.is_finite() || stiffness >= 1.0 {
+        return;
+    }
+    for (id, base) in base {
+        if let Some(local) = locals.get_mut(id) {
+            local.rotation = base.rotation.slerp(local.rotation, stiffness);
+            let _ = clamp_joint_local(scene, *id, local);
+        }
+    }
+}
+
+/// Local rotations of `joints` as they are before a solve, so a soft solve can
+/// blend back toward the authored pose.
+fn pre_solve_rotations(
+    joints: &[NodeId],
+    locals: &BTreeMap<NodeId, Transform>,
+) -> Vec<(NodeId, Transform)> {
+    joints
+        .iter()
+        .filter_map(|id| locals.get(id).map(|local| (*id, *local)))
+        .collect()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -198,6 +258,8 @@ impl IkChain {
             iterations: DEFAULT_ITERATIONS,
             tolerance: DEFAULT_TOLERANCE,
             damping: DEFAULT_DAMPING,
+            spline: None,
+            stiffness: DEFAULT_STIFFNESS,
             enabled: true,
         }
     }
@@ -217,6 +279,12 @@ impl IkChain {
                 self.damping.clamp(0.0, 1.0)
             } else {
                 DEFAULT_DAMPING
+            },
+            spline: self.spline,
+            stiffness: if self.stiffness.is_finite() {
+                self.stiffness.clamp(0.0, 1.0)
+            } else {
+                DEFAULT_STIFFNESS
             },
             enabled: self.enabled,
         }
@@ -410,6 +478,7 @@ fn solve_two_bone(
         target_position,
         pole_position,
     } = *context;
+    let base_locals = pre_solve_rotations(joints, locals);
     let initial_pose = pose_chain(scene, joints, tip, locals, root_parent_world)?;
     let a = world_position(initial_pose.joints[0]);
     let b = world_position(initial_pose.joints[1]);
@@ -528,6 +597,7 @@ fn solve_two_bone(
         }
     }
 
+    soften_pose(scene, chain, &base_locals, locals);
     clamp_chain_locals(scene, joints, locals);
     let final_pose = pose_chain(scene, joints, tip, locals, root_parent_world)?;
     let final_tip = world_position(final_pose.tip);
@@ -554,6 +624,7 @@ fn solve_ccd(
         target_position,
         pole_position,
     } = *context;
+    let base_locals = pre_solve_rotations(joints, locals);
     let initial = pose_chain(scene, joints, tip, locals, root_parent_world)?;
     let root_position = world_position(initial.joints[0]);
     let mut max_reach = 0.0;
@@ -602,6 +673,7 @@ fn solve_ccd(
             } else {
                 q_world
             };
+
             let parent_world = if index == 0 {
                 root_parent_world
             } else {
@@ -661,6 +733,7 @@ fn solve_ccd(
     if solution.iterations == 0 {
         solution.iterations = 1;
     }
+    soften_pose(scene, chain, &base_locals, locals);
     clamp_chain_locals(scene, joints, locals);
     let pose = pose_chain(scene, joints, tip, locals, root_parent_world)?;
     solution.tip_position = world_position(pose.tip);
@@ -670,6 +743,223 @@ fn solve_ccd(
         .filter_map(|id| locals.get(id).map(|local| (*id, local.rotation)))
         .collect();
     Some(solution)
+}
+
+/// World-space polyline of a Spline node with each point's cumulative arc
+/// length. A non-spline node, non-finite transform or repeated points that
+/// collapse the curve yield fewer than two points, which disables the spline
+/// path.
+fn spline_polyline(scene: &Scene, spline: NodeId, spline_world: Mat4) -> Vec<(Vec3, f32)> {
+    let Some(node) = scene.get(spline) else {
+        return Vec::new();
+    };
+    let NodeKind::Spline { spline: definition } = &node.kind else {
+        return Vec::new();
+    };
+    let mut polyline: Vec<(Vec3, f32)> = Vec::new();
+    let mut length = 0.0f32;
+    for point in definition.sample() {
+        let world = spline_world.transform_point3(point);
+        if !world.is_finite() {
+            return Vec::new();
+        }
+        if let Some((previous, _)) = polyline.last() {
+            let step = (world - *previous).length();
+            if !step.is_finite() {
+                return Vec::new();
+            }
+            if step <= EPSILON {
+                continue;
+            }
+            length += step;
+        }
+        polyline.push((world, length));
+    }
+    polyline
+}
+
+/// Point on the polyline at `arc`, clamped to its ends.
+fn polyline_position(polyline: &[(Vec3, f32)], arc: f32) -> Option<Vec3> {
+    let last = polyline.len().checked_sub(1)?;
+    if last == 0 {
+        return None;
+    }
+    if arc >= polyline[last].1 {
+        return Some(polyline[last].0);
+    }
+    let mut index = 0;
+    while index + 1 < last && polyline[index + 1].1 < arc {
+        index += 1;
+    }
+    let (start, start_arc) = polyline[index];
+    let (end, end_arc) = polyline[index + 1];
+    let span = end_arc - start_arc;
+    let t = if span > EPSILON {
+        ((arc - start_arc) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some(start + (end - start) * t)
+}
+
+/// Arc length and position of the polyline point closest to `point`.
+fn nearest_polyline_point(polyline: &[(Vec3, f32)], point: Vec3) -> Option<(f32, Vec3)> {
+    let mut best: Option<(f32, f32, Vec3)> = None;
+    for window in polyline.windows(2) {
+        let (start, start_arc) = window[0];
+        let (end, end_arc) = window[1];
+        let segment = end - start;
+        let length_squared = segment.length_squared();
+        if !length_squared.is_finite() || length_squared <= EPSILON {
+            continue;
+        }
+        let t = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
+        let closest = start + segment * t;
+        let distance = (point - closest).length_squared();
+        if !distance.is_finite() {
+            continue;
+        }
+        let better = match best {
+            Some((best_distance, _, _)) => distance < best_distance,
+            None => true,
+        };
+        if better {
+            best = Some((distance, start_arc + (end_arc - start_arc) * t, closest));
+        }
+    }
+    best.map(|(_, arc, closest)| (arc, closest))
+}
+
+/// Number of world-space passes over a spline chain. Each bone is aimed from
+/// its parent's frame, so a second pass removes most of the residual chord
+/// error that a sharp curve or a joint limit introduces.
+const SPLINE_PASSES: usize = 2;
+
+/// Solve a chain against a Spline node instead of a point goal.
+///
+/// Clean-room semantics (the public Cheetah3D pages advertise Spline IK without
+/// defining its solver): sample the spline into a world-space polyline, then
+/// aim every bone at the curve point one bone length further along from that
+/// joint's projection onto the curve. Bones keep their exact length because the
+/// solve only rotates, so the chain approximates the curve as a chain of chords
+/// and the tip reports its distance from the nearest curve point. A curve
+/// shorter than the chain leaves the remaining bones aimed at its end and the
+/// solution is marked clamped. Joint rotation limits clamp after every
+/// correction. Returns `None` when the node is not a Spline, the curve has
+/// fewer than two distinct samples, or the chain has no movable joints.
+pub fn solve_spline_chain(
+    scene: &Scene,
+    tip: NodeId,
+    chain: &IkChain,
+    locals: &BTreeMap<NodeId, Transform>,
+    worlds: &BTreeMap<NodeId, Mat4>,
+    spline: NodeId,
+    spline_world: Mat4,
+) -> Option<IkSolution> {
+    if !chain.enabled || !matches!(scene.get(tip)?.kind, NodeKind::Joint { .. }) {
+        return None;
+    }
+    let chain = chain.sanitized();
+    let joints = ik_chain_joints(scene, tip, &chain);
+    if joints.is_empty() || !spline_world.is_finite() {
+        return None;
+    }
+    let polyline = spline_polyline(scene, spline, spline_world);
+    if polyline.len() < 2 {
+        return None;
+    }
+    let curve_end = polyline[polyline.len() - 1].1;
+    if !curve_end.is_finite() || curve_end <= EPSILON {
+        return None;
+    }
+    let root_parent_world = scene
+        .get(joints[0])
+        .and_then(|node| node.parent)
+        .and_then(|parent| worlds.get(&parent).copied())
+        .unwrap_or(Mat4::IDENTITY);
+
+    let mut chain_locals = BTreeMap::new();
+    for id in &joints {
+        chain_locals.insert(*id, local_transform(scene, locals, *id)?);
+    }
+    clamp_chain_locals(scene, &joints, &mut chain_locals);
+
+    // Bone lengths from the authored pose: the solve rotates only, so these
+    // stay exact and give every joint its place along the curve.
+    let base_locals = pre_solve_rotations(&joints, &chain_locals);
+    let initial_pose = pose_chain(scene, &joints, tip, &chain_locals, root_parent_world)?;
+    let mut bone_lengths = Vec::with_capacity(joints.len());
+    for index in 0..joints.len() {
+        let start = world_position(initial_pose.joints[index]);
+        let end = if index + 1 < joints.len() {
+            world_position(initial_pose.joints[index + 1])
+        } else {
+            world_position(initial_pose.tip)
+        };
+        let length = (end - start).length();
+        if !length.is_finite() {
+            return None;
+        }
+        bone_lengths.push(length);
+    }
+    let chain_length: f32 = bone_lengths.iter().sum();
+
+    for _ in 0..SPLINE_PASSES {
+        for index in 0..joints.len() {
+            let pose = pose_chain(scene, &joints, tip, &chain_locals, root_parent_world)?;
+            let start = world_position(pose.joints[index]);
+            let child = if index + 1 < joints.len() {
+                world_position(pose.joints[index + 1])
+            } else {
+                world_position(pose.tip)
+            };
+            let Some((arc, _)) = nearest_polyline_point(&polyline, start) else {
+                continue;
+            };
+            let goal_arc = (arc + bone_lengths[index]).min(curve_end);
+            let Some(goal) = polyline_position(&polyline, goal_arc) else {
+                continue;
+            };
+            let Some(current) = unit_direction(child - start) else {
+                continue;
+            };
+            let Some(desired) = unit_direction(goal - start) else {
+                continue;
+            };
+            let rotation = Quat::from_rotation_arc(current, desired);
+            let parent_world = if index == 0 {
+                root_parent_world
+            } else {
+                pose.joints[index - 1]
+            };
+            if let Some(local) = chain_locals.get_mut(&joints[index]) {
+                apply_world_rotation(parent_world, local, rotation);
+                clamp_joint_local(scene, joints[index], local);
+            }
+        }
+    }
+
+    soften_pose(scene, &chain, &base_locals, &mut chain_locals);
+    clamp_chain_locals(scene, &joints, &mut chain_locals);
+    let final_pose = pose_chain(scene, &joints, tip, &chain_locals, root_parent_world)?;
+    let tip_position = world_position(final_pose.tip);
+    let (_, nearest) =
+        nearest_polyline_point(&polyline, tip_position).unwrap_or((0.0, tip_position));
+    let error = (tip_position - nearest).length();
+    Some(IkSolution {
+        tip,
+        joints: joints.clone(),
+        rotations: joints
+            .iter()
+            .filter_map(|id| chain_locals.get(id).map(|local| (*id, local.rotation)))
+            .collect(),
+        tip_position,
+        target_position: nearest,
+        error: if error.is_finite() { error } else { f32::MAX },
+        iterations: SPLINE_PASSES,
+        converged: error.is_finite() && error <= chain.tolerance,
+        clamped: chain_length > curve_end + 1e-4,
+    })
 }
 
 /// Solve and apply every enabled chain in scene order. Solving before the
@@ -689,6 +979,23 @@ pub fn solve_ik_chains(
         };
         if !chain.enabled {
             continue;
+        }
+        // A usable Spline target drives the chain along its curve; a missing or
+        // non-spline node falls through to the point target below.
+        if let Some(spline) = chain.spline {
+            if let Some(spline_world) = worlds.get(&spline).copied() {
+                if let Some(solution) =
+                    solve_spline_chain(scene, tip, chain, locals, worlds, spline, spline_world)
+                {
+                    for (id, rotation) in &solution.rotations {
+                        if let Some(local) = locals.get_mut(id) {
+                            local.rotation = *rotation;
+                        }
+                    }
+                    solutions.push(solution);
+                    continue;
+                }
+            }
         }
         let Some(target_world) = worlds.get(&chain.target).copied() else {
             continue;
@@ -722,10 +1029,26 @@ fn baked_joint_ids(doc: &Document) -> BTreeSet<NodeId> {
         let Some(chain) = node.ik.as_ref() else {
             continue;
         };
-        if !chain.enabled || doc.scene.get(chain.target).is_none() {
+        if !chain.enabled {
+            continue;
+        }
+        let has_goal = doc.scene.get(chain.target).is_some()
+            || chain
+                .spline
+                .is_some_and(|spline| doc.scene.get(spline).is_some());
+        if !has_goal {
             continue;
         }
         joints.extend(ik_chain_joints(&doc.scene, tip, chain));
+    }
+    // A constraint tag drives its joint without any chain, so a bake that only
+    // walked chains would silently drop those poses.
+    for node in doc.scene.nodes.values() {
+        if matches!(node.kind, NodeKind::Joint { .. })
+            && node.tags.iter().any(|tag| tag.is_ik_constraint())
+        {
+            joints.insert(node.id);
+        }
     }
     joints
 }
@@ -756,7 +1079,12 @@ fn bake_ik_edits_for_times(
                 continue;
             };
             if node.local.rotation.is_finite() {
-                after.set_rotation_key(time, node.local.rotation, Interpolation::Smooth);
+                after.set_rotation_key(
+                    ChannelTarget::Object { id: *id },
+                    time,
+                    node.local.rotation,
+                    Interpolation::Smooth,
+                );
             }
         }
     }
@@ -816,7 +1144,7 @@ mod tests {
     use super::*;
     use crate::{GeometrySource, History, Node, NodeProps, SetNodePropsCmd, Skin};
     use glam::Vec3;
-    use lc_anim::AnimProperty;
+    use lc_anim::{AnimChannel, ChannelAddress};
 
     fn joint(doc: &mut Document, name: &str, parent: Option<NodeId>, translation: Vec3) -> NodeId {
         let id = doc.append_node(
@@ -1433,13 +1761,13 @@ mod tests {
         let (mut doc, _root, _middle, tip) = two_bone_setup("range-bake", Vec3::new(1.0, 1.2, 0.0));
         let target = doc.scene.get(tip).unwrap().ik.as_ref().unwrap().target;
         doc.scene.get_mut(target).unwrap().animation.set_key(
-            AnimProperty::TranslationX,
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
             0.0,
             1.0,
             Interpolation::Linear,
         );
         doc.scene.get_mut(target).unwrap().animation.set_key(
-            AnimProperty::TranslationX,
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
             1.0,
             0.5,
             Interpolation::Linear,
@@ -1483,5 +1811,648 @@ mod tests {
         );
         props.apply(&mut copy);
         assert_eq!(copy.ik, node.ik);
+    }
+
+    fn guide_spline(doc: &mut Document, points: &[Vec3]) -> NodeId {
+        let spline = lc_geom::Spline {
+            points: points
+                .iter()
+                .map(|point| lc_geom::SplinePoint::new(*point))
+                .collect(),
+            kind: lc_geom::SplineKind::Linear,
+            closed: false,
+            resolution: 4,
+        };
+        doc.append_node(NodeKind::Spline { spline }, "Guide", None)
+    }
+
+    fn spline_chain_setup(
+        goal: Vec3,
+        points: &[Vec3],
+    ) -> (Document, NodeId, NodeId, NodeId, NodeId) {
+        let mut doc = Document::empty();
+        let root = joint(&mut doc, "Hip", None, Vec3::ZERO);
+        let middle = joint(&mut doc, "Knee", Some(root), Vec3::X);
+        let tip = joint(&mut doc, "Ankle", Some(middle), Vec3::X);
+        let point_target = target(&mut doc, "Goal", goal);
+        let spline = guide_spline(&mut doc, points);
+        let mut chain = IkChain::new(point_target);
+        chain.spline = Some(spline);
+        doc.scene.get_mut(tip).unwrap().ik = Some(chain);
+        (doc, root, middle, tip, spline)
+    }
+
+    fn world_position_of(solved: &crate::EvaluatedScene, id: NodeId) -> Vec3 {
+        solved.node(id).unwrap().world.w_axis.truncate()
+    }
+
+    #[test]
+    fn spline_ik_follows_the_guide_curve_without_stretching() {
+        // A guide that rises at 45° for 1.41 m and then runs horizontally.
+        let (doc, root, middle, tip, _spline) = spline_chain_setup(
+            Vec3::new(2.0, 0.0, 0.0),
+            &[
+                Vec3::ZERO,
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(2.0, 1.0, 0.0),
+            ],
+        );
+        let solved = doc.evaluate(0.0);
+        let hip = world_position_of(&solved, root);
+        let knee = world_position_of(&solved, middle);
+        let ankle = world_position_of(&solved, tip);
+        // Rotating bones keeps their authored length exactly.
+        assert!(((knee - hip).length() - 1.0).abs() < 1e-3, "knee {knee}");
+        assert!(
+            ((ankle - knee).length() - 1.0).abs() < 1e-3,
+            "ankle {ankle}"
+        );
+        // The first bone follows the 45° opening segment of the guide.
+        let first = (knee - hip).normalize();
+        assert!(
+            first.dot(Vec3::new(1.0, 1.0, 0.0).normalize()) > 0.99,
+            "first bone {first} does not follow the guide's opening tangent"
+        );
+        // The chain climbs to the horizontal part instead of ignoring the curve.
+        assert!(
+            ankle.y > 0.9,
+            "the chain must follow the curve upward: {ankle}"
+        );
+        assert!(
+            ankle.x > 1.4,
+            "the chain must progress along the curve: {ankle}"
+        );
+    }
+
+    #[test]
+    fn spline_chain_reports_curve_error_and_short_curve_clamp() {
+        let (doc, root, middle, tip, spline) = spline_chain_setup(
+            Vec3::new(2.0, 0.0, 0.0),
+            &[
+                Vec3::ZERO,
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(2.0, 1.0, 0.0),
+            ],
+        );
+        let chain = doc.scene.get(tip).unwrap().ik.clone().unwrap();
+        let locals: BTreeMap<NodeId, Transform> = [root, middle, tip]
+            .iter()
+            .map(|id| (*id, doc.scene.get(*id).unwrap().transform))
+            .collect();
+        let solution = solve_spline_chain(
+            &doc.scene,
+            tip,
+            &chain,
+            &locals,
+            &BTreeMap::new(),
+            spline,
+            Mat4::IDENTITY,
+        )
+        .expect("a linear guide solves the chain");
+        assert!(
+            solution.error < 0.05,
+            "the tip must stay near the guide, error {}",
+            solution.error
+        );
+        assert!(!solution.clamped, "the guide is longer than the chain");
+        assert_eq!(solution.iterations, SPLINE_PASSES);
+        assert_eq!(solution.joints, vec![root, middle]);
+        assert!(solution.tip_position.is_finite());
+
+        // A guide shorter than the chain clamps instead of stretching.
+        let (short, _root, _middle, short_tip, short_spline) = spline_chain_setup(
+            Vec3::new(2.0, 0.0, 0.0),
+            &[Vec3::ZERO, Vec3::new(0.5, 0.0, 0.0)],
+        );
+        let short_chain = short.scene.get(short_tip).unwrap().ik.clone().unwrap();
+        let short_locals: BTreeMap<NodeId, Transform> = short
+            .scene
+            .nodes
+            .values()
+            .filter(|node| matches!(node.kind, NodeKind::Joint { .. }))
+            .map(|node| (node.id, node.transform))
+            .collect();
+        let solution = solve_spline_chain(
+            &short.scene,
+            short_tip,
+            &short_chain,
+            &short_locals,
+            &BTreeMap::new(),
+            short_spline,
+            Mat4::IDENTITY,
+        )
+        .expect("the short guide still produces a finite solve");
+        assert!(solution.clamped, "a short guide must report clamping");
+        assert!(solution.tip_position.is_finite());
+        for (_, rotation) in &solution.rotations {
+            assert!(rotation.is_finite(), "{rotation:?}");
+        }
+    }
+
+    #[test]
+    fn spline_ik_falls_back_to_the_point_target_for_a_non_spline_node() {
+        let (mut doc, _root, _middle, tip, _spline) = spline_chain_setup(
+            Vec3::new(1.5, 0.0, 0.5),
+            &[Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0)],
+        );
+        // A null object in the spline slot is not a curve, so the point target
+        // keeps driving the chain instead of freezing it.
+        let null = target(&mut doc, "Not A Curve", Vec3::new(0.0, 2.0, 0.0));
+        doc.scene.get_mut(tip).unwrap().ik.as_mut().unwrap().spline = Some(null);
+        let solved = doc.evaluate(0.0);
+        let ankle = world_position_of(&solved, tip);
+        let goal = Vec3::new(1.5, 0.0, 0.5);
+        assert!(
+            (ankle - goal).length() < 0.05,
+            "the point target must still drive the chain, got {ankle}"
+        );
+    }
+
+    #[test]
+    fn spline_solve_is_deterministic() {
+        let (doc, _root, _middle, tip, _spline) = spline_chain_setup(
+            Vec3::new(2.0, 0.0, 0.0),
+            &[
+                Vec3::ZERO,
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(2.0, 1.0, 0.0),
+            ],
+        );
+        let first = doc.evaluate(0.0);
+        let second = doc.evaluate(0.0);
+        assert_eq!(
+            first.node(tip).unwrap().local.rotation,
+            second.node(tip).unwrap().local.rotation
+        );
+        assert_eq!(
+            first.node(tip).unwrap().world,
+            second.node(tip).unwrap().world
+        );
+    }
+
+    #[test]
+    fn bake_includes_a_spline_chain_whose_point_target_is_gone() {
+        let (mut doc, root, middle, _tip, _spline) = spline_chain_setup(
+            Vec3::new(2.0, 0.0, 0.0),
+            &[
+                Vec3::ZERO,
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(2.0, 1.0, 0.0),
+            ],
+        );
+        // The guide drives the chain, so a stale point target must not stop a bake.
+        doc.scene.get_mut(_tip).unwrap().ik.as_mut().unwrap().target = 9_999;
+        let edits = bake_ik_edits(&doc, 0.0);
+        for id in [root, middle] {
+            let clip = edits
+                .iter()
+                .find(|(edited, _, _)| *edited == id)
+                .map(|(_, _, after)| after)
+                .unwrap_or_else(|| panic!("joint {id} was not baked"));
+            assert!(
+                clip.sample_rotation(0.0).is_some(),
+                "the baked joint {id} needs a rotation key"
+            );
+        }
+    }
+
+    #[test]
+    fn ik_chain_reads_legacy_json_without_a_spline_target() {
+        let chain: IkChain = serde_json::from_str(r#"{ "target": 7 }"#)
+            .expect("legacy chains without a spline field still load");
+        assert_eq!(chain.target, 7);
+        assert_eq!(chain.spline, None);
+
+        let mut chain = chain;
+        chain.spline = Some(3);
+        let json = serde_json::to_string(&chain).expect("chains serialize");
+        assert!(json.contains("\"spline\":3"), "{json}");
+        let round: IkChain = serde_json::from_str(&json).expect("chains round-trip");
+        assert_eq!(round.spline, Some(3));
+
+        chain.spline = None;
+        let json = serde_json::to_string(&chain).expect("chains serialize");
+        assert!(
+            !json.contains("spline"),
+            "an unset spline stays out of the file"
+        );
+    }
+
+    fn rotated_null(
+        doc: &mut Document,
+        name: &str,
+        translation: Vec3,
+        euler_degrees: Vec3,
+    ) -> NodeId {
+        let id = target(doc, name, translation);
+        doc.scene.get_mut(id).unwrap().transform.rotation =
+            Transform::from_euler_degrees(euler_degrees).rotation;
+        id
+    }
+
+    fn world_aim(solved: &crate::EvaluatedScene, id: NodeId) -> Vec3 {
+        solved
+            .node(id)
+            .unwrap()
+            .world
+            .transform_vector3(Vec3::X)
+            .normalize_or_zero()
+    }
+
+    #[test]
+    fn stiffness_lands_between_the_rest_pose_and_a_full_solve() {
+        let goal = Vec3::new(1.2, 0.8, 0.0);
+        let (mut doc, _root, middle, tip) = two_bone_setup("Soft", goal);
+        let pole = target(&mut doc, "Pole", Vec3::new(0.0, 0.0, 1.0));
+        doc.scene.get_mut(tip).unwrap().ik.as_mut().unwrap().pole = Some(pole);
+        // Zero stiffness is the rest pose; the default is a full solve.
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 0.0;
+        let rest = doc.evaluate(0.0);
+        let rest_tip = world_position_of(&rest, tip);
+        let rest_middle = world_position_of(&rest, middle);
+
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 1.0;
+        let full = doc.evaluate(0.0);
+        let full_tip = world_position_of(&full, tip);
+        let full_middle = world_position_of(&full, middle);
+
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 0.5;
+        let soft = doc.evaluate(0.0);
+        let soft_tip = world_position_of(&soft, tip);
+        let soft_middle = world_position_of(&soft, middle);
+
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 0.0;
+        let frozen_tip = world_position_of(&doc.evaluate(0.0), tip);
+
+        assert!(
+            (frozen_tip - rest_tip).length() < 1e-3,
+            "zero stiffness must keep the rest pose, got {frozen_tip}"
+        );
+        assert!(
+            (full_tip - goal).length() < 0.02,
+            "a full solve still reaches the goal, got {full_tip}"
+        );
+        let rest_residual = (rest_tip - goal).length();
+        let soft_residual = (soft_tip - goal).length();
+        let full_residual = (full_tip - goal).length();
+        assert!(
+            soft_residual < rest_residual - 0.02,
+            "half stiffness must correct: {soft_residual} vs rest {rest_residual}"
+        );
+        assert!(
+            soft_residual > full_residual + 0.01,
+            "half stiffness must trail the full solve: {soft_residual} vs {full_residual}"
+        );
+        // The pole still chooses the bend plane, just at a partial correction.
+        assert!((soft_middle - rest_middle).length() > 0.02, "{soft_middle}");
+        assert!((soft_middle - full_middle).length() > 0.02, "{soft_middle}");
+    }
+
+    #[test]
+    fn stiffness_softens_ccd_and_spline_chains() {
+        let mut doc = Document::empty();
+        let a = joint(&mut doc, "A", None, Vec3::ZERO);
+        let b = joint(&mut doc, "B", Some(a), Vec3::X);
+        let c = joint(&mut doc, "C", Some(b), Vec3::X);
+        let tip = joint(&mut doc, "Tip", Some(c), Vec3::X);
+        let goal_node = target(&mut doc, "Goal", Vec3::new(2.0, 1.2, 0.0));
+        let goal = Vec3::new(2.0, 1.2, 0.0);
+        let mut chain = IkChain::new(goal_node);
+        chain.chain_length = 3;
+        doc.scene.get_mut(tip).unwrap().ik = Some(chain);
+        // Zero stiffness is the rest pose; the default is a full solve.
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 0.0;
+        let rest_tip = world_position_of(&doc.evaluate(0.0), tip);
+        assert!(
+            (rest_tip - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-3,
+            "{rest_tip}"
+        );
+
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 1.0;
+        let full_tip = world_position_of(&doc.evaluate(0.0), tip);
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 0.4;
+        let soft_tip = world_position_of(&doc.evaluate(0.0), tip);
+        assert!(
+            (soft_tip - goal).length() > (full_tip - goal).length() + 0.02,
+            "a soft CCD solve must trail the full one: {soft_tip}"
+        );
+        assert!(
+            (soft_tip - goal).length() < (rest_tip - goal).length() - 0.02,
+            "a soft CCD solve must still correct: {soft_tip}"
+        );
+
+        let points = [
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+        ];
+        let (mut doc, _root, _middle, tip, _spline) = spline_chain_setup(Vec3::ZERO, &points);
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 0.0;
+        let rest_tip = world_position_of(&doc.evaluate(0.0), tip);
+        assert!(
+            (rest_tip - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-3,
+            "{rest_tip}"
+        );
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 1.0;
+        let full_tip = world_position_of(&doc.evaluate(0.0), tip);
+        doc.scene
+            .get_mut(tip)
+            .unwrap()
+            .ik
+            .as_mut()
+            .unwrap()
+            .stiffness = 0.5;
+        let soft_tip = world_position_of(&doc.evaluate(0.0), tip);
+        assert!(
+            (soft_tip - rest_tip).length() > 0.05,
+            "a soft spline solve must leave the rest pose: {soft_tip}"
+        );
+        assert!(
+            (soft_tip - full_tip).length() > 0.05,
+            "a soft spline solve must trail the guide: {soft_tip}"
+        );
+    }
+
+    #[test]
+    fn ik_point_constraint_pulls_the_owner_toward_its_target() {
+        let mut doc = Document::empty();
+        let owner = target(&mut doc, "Owner", Vec3::ZERO);
+        let goal = target(&mut doc, "Goal", Vec3::new(2.0, 0.0, 0.0));
+
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::IkPoint {
+            target: goal,
+            weight: 0.5,
+        }];
+        let half = world_position_of(&doc.evaluate(0.0), owner);
+        assert!(
+            (half - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-3,
+            "a half-weight point constraint lands halfway, got {half}"
+        );
+
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::IkPoint {
+            target: goal,
+            weight: 1.0,
+        }];
+        let full = world_position_of(&doc.evaluate(0.0), owner);
+        assert!((full - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-3, "{full}");
+
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::IkPoint {
+            target: goal,
+            weight: 0.0,
+        }];
+        let none = world_position_of(&doc.evaluate(0.0), owner);
+        assert!(
+            none.length() < 1e-3,
+            "weight zero leaves the pose alone: {none}"
+        );
+    }
+
+    #[test]
+    fn ik_angle_constraint_keeps_the_aim_inside_its_cone() {
+        let mut doc = Document::empty();
+        let owner = rotated_null(&mut doc, "Aim", Vec3::ZERO, Vec3::new(0.0, 90.0, 0.0));
+        let goal = target(&mut doc, "Goal", Vec3::new(2.0, 0.0, 0.0));
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::IkAngle {
+            target: goal,
+            max_degrees: 10.0,
+        }];
+        let aim = world_aim(&doc.evaluate(0.0), owner);
+        let angle = aim.angle_between(Vec3::X).to_degrees();
+        assert!(
+            (angle - 10.0).abs() < 0.2,
+            "the aim must stop on the 10° cone, got {angle}°"
+        );
+
+        // An aim already inside the cone keeps its pose.
+        let mut inside = Document::empty();
+        let owner = rotated_null(&mut inside, "Aim", Vec3::ZERO, Vec3::new(0.0, 5.0, 0.0));
+        let goal = target(&mut inside, "Goal", Vec3::new(2.0, 0.0, 0.0));
+        inside.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::IkAngle {
+            target: goal,
+            max_degrees: 10.0,
+        }];
+        let aim = world_aim(&inside.evaluate(0.0), owner);
+        assert!((aim.angle_between(Vec3::X).to_degrees() - 5.0).abs() < 0.2);
+
+        // A clamp tag later in the list still wins over the cone correction.
+        let mut clamped = Document::empty();
+        let owner = rotated_null(&mut clamped, "Aim", Vec3::ZERO, Vec3::new(0.0, 90.0, 0.0));
+        let goal = target(&mut clamped, "Goal", Vec3::new(2.0, 0.0, 0.0));
+        clamped.scene.get_mut(owner).unwrap().tags = vec![
+            crate::Tag::IkAngle {
+                target: goal,
+                max_degrees: 60.0,
+            },
+            crate::Tag::ClampRotation {
+                min: Vec3::splat(-10.0),
+                max: Vec3::splat(10.0),
+            },
+        ];
+        let solved = clamped.evaluate(0.0);
+        assert_rotation_within(
+            solved.node(owner).unwrap().local.rotation,
+            &all_limits(10.0),
+            "angle constraint",
+        );
+        // Euler clamping reconstructs from the clamped triple, which moves the
+        // aim away from what the 60° cone alone would have produced.
+        let angle = world_aim(&solved, owner)
+            .angle_between(Vec3::X)
+            .to_degrees();
+        assert!(
+            (angle - 60.0).abs() > 5.0,
+            "the clamp must override the cone result, got {angle}°"
+        );
+    }
+
+    #[test]
+    fn orient_and_parent_constraints_blend_by_weight() {
+        let mut doc = Document::empty();
+        let owner = target(&mut doc, "Owner", Vec3::ZERO);
+        let source = rotated_null(
+            &mut doc,
+            "Source",
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(0.0, 90.0, 0.0),
+        );
+        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+        let halfway = Vec3::new(diagonal, 0.0, -diagonal);
+
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::Orient {
+            target: source,
+            weight: 0.5,
+        }];
+        let solved = doc.evaluate(0.0);
+        assert!(
+            (world_aim(&solved, owner) - halfway).length() < 1e-2,
+            "a half orient lands 45° toward the source, got {:?}",
+            world_aim(&solved, owner)
+        );
+        assert!(
+            world_position_of(&solved, owner).length() < 1e-4,
+            "orient leaves the position alone"
+        );
+
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::Orient {
+            target: source,
+            weight: 1.0,
+        }];
+        let aim = world_aim(&doc.evaluate(0.0), owner);
+        assert!((aim - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-3, "{aim}");
+
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::Parent {
+            target: source,
+            weight: 0.5,
+        }];
+        let solved = doc.evaluate(0.0);
+        assert!(
+            (world_position_of(&solved, owner) - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-3,
+            "parent blends the position"
+        );
+        assert!((world_aim(&solved, owner) - halfway).length() < 1e-2);
+
+        doc.scene.get_mut(owner).unwrap().tags = vec![crate::Tag::Parent {
+            target: source,
+            weight: 1.0,
+        }];
+        let solved = doc.evaluate(0.0);
+        assert!((world_position_of(&solved, owner) - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-3);
+        assert!((world_aim(&solved, owner) - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-3);
+    }
+
+    #[test]
+    fn constraint_driven_joint_bakes_and_evaluates_deterministically() {
+        let mut doc = Document::empty();
+        let source = rotated_null(
+            &mut doc,
+            "Source",
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 45.0),
+        );
+        let driven = joint(&mut doc, "Driven", None, Vec3::ZERO);
+        doc.scene.get_mut(driven).unwrap().tags = vec![crate::Tag::Orient {
+            target: source,
+            weight: 1.0,
+        }];
+        let first = doc.evaluate(0.0);
+        let second = doc.evaluate(0.0);
+        assert_eq!(
+            first.node(driven).unwrap().world,
+            second.node(driven).unwrap().world
+        );
+
+        let expected = first.node(driven).unwrap().local.rotation;
+        let edits = bake_ik_edits(&doc, 0.0);
+        let (_, _, after) = edits
+            .iter()
+            .find(|(id, _, _)| *id == driven)
+            .unwrap_or_else(|| panic!("a constraint-only joint must bake, got {edits:?}"));
+        let baked = after
+            .sample_rotation(0.0)
+            .expect("the bake writes a rotation key");
+        assert!(
+            baked.dot(expected).abs() > 0.999,
+            "the bake must key the constrained pose, got {baked:?} want {expected:?}"
+        );
+    }
+
+    #[test]
+    fn constraint_tags_read_legacy_json_and_keep_defaults_out_of_the_file() {
+        let tag: crate::Tag = serde_json::from_str(r#"{ "type": "orient", "target": 3 }"#)
+            .expect("an orient tag without a weight loads");
+        assert!(
+            matches!(tag, crate::Tag::Orient { target: 3, weight } if (weight - 1.0).abs() < 1e-6),
+            "{tag:?}"
+        );
+        let tag: crate::Tag = serde_json::from_str(r#"{ "type": "ik_angle", "target": 2 }"#)
+            .expect("an angle tag without a cone loads");
+        assert!(
+            matches!(tag, crate::Tag::IkAngle { target: 2, max_degrees } if (max_degrees - 45.0).abs() < 1e-6),
+            "{tag:?}"
+        );
+        let tag: crate::Tag = serde_json::from_str(r#"{ "type": "parent", "target": 4 }"#)
+            .expect("a parent tag without a weight loads");
+        assert!(matches!(tag, crate::Tag::Parent { target: 4, .. }));
+        let tag: crate::Tag = serde_json::from_str(
+            r#"{ "type": "copy_location", "source": 5, "offset": [0, 0, 0] }"#,
+        )
+        .expect("legacy tags still load");
+        assert!(
+            matches!(tag, crate::Tag::CopyLocation { source: 5, weight, .. } if (weight - 1.0).abs() < 1e-6)
+        );
+
+        let json = serde_json::to_string(&crate::Tag::Orient {
+            target: 1,
+            weight: 0.5,
+        })
+        .expect("tags serialize");
+        assert!(json.contains("\"weight\":0.5"), "{json}");
+        let round: crate::Tag = serde_json::from_str(&json).expect("orient tags round-trip");
+        assert!(
+            matches!(round, crate::Tag::Orient { target: 1, weight } if (weight - 0.5).abs() < 1e-6)
+        );
+
+        let chain: IkChain = serde_json::from_str(r#"{ "target": 7 }"#)
+            .expect("legacy chains without stiffness still load");
+        assert!((chain.stiffness - 1.0).abs() < 1e-6);
+        let json = serde_json::to_string(&chain).expect("chains serialize");
+        assert!(
+            !json.contains("stiffness"),
+            "a full solve stays out: {json}"
+        );
     }
 }

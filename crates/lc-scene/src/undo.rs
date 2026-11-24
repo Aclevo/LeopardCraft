@@ -6,7 +6,7 @@
 
 use crate::{
     Document, DocumentSettings, Modifier, MorphSet, Node, NodeId, NodeKind, NodeProps, Skin,
-    Subtree,
+    Subtree, TakeState,
 };
 use lc_anim::AnimationClip;
 use lc_core::Transform;
@@ -500,12 +500,14 @@ impl Command for SetAnimationCmd {
         if let Some(n) = doc.scene.get_mut(self.id) {
             n.animation = self.after.clone();
         }
+        doc.store_active_clips();
     }
 
     fn undo(&mut self, doc: &mut Document) {
         if let Some(n) = doc.scene.get_mut(self.id) {
             n.animation = self.before.clone();
         }
+        doc.store_active_clips();
     }
 }
 
@@ -550,6 +552,7 @@ impl Command for SetTagAnimationCmd {
             node.tag_animations
                 .insert(self.tag as u32, self.after.clone());
         }
+        doc.store_active_clips();
     }
 
     fn undo(&mut self, doc: &mut Document) {
@@ -562,6 +565,7 @@ impl Command for SetTagAnimationCmd {
             node.tag_animations
                 .insert(self.tag as u32, self.before.clone());
         }
+        doc.store_active_clips();
     }
 }
 
@@ -584,6 +588,7 @@ impl Command for SetAnimationsCmd {
                 n.animation = after.clone();
             }
         }
+        doc.store_active_clips();
     }
 
     fn undo(&mut self, doc: &mut Document) {
@@ -592,6 +597,7 @@ impl Command for SetAnimationsCmd {
                 n.animation = before.clone();
             }
         }
+        doc.store_active_clips();
     }
 }
 
@@ -607,10 +613,12 @@ impl Command for SetMaterialCmd {
 
     fn apply(&mut self, doc: &mut Document) {
         doc.materials.insert(self.after.clone());
+        doc.store_active_clips();
     }
 
     fn undo(&mut self, doc: &mut Document) {
         doc.materials.insert(self.before.clone());
+        doc.store_active_clips();
     }
 }
 
@@ -699,6 +707,33 @@ impl Command for ReparentCmd {
 pub struct SetSettingsCmd {
     pub before: DocumentSettings,
     pub after: DocumentSettings,
+}
+
+/// One atomic take-management edit: create, activate, duplicate, delete,
+/// rename or fps. The state carries the take list, active index and the live
+/// clips so undo restores exactly what the editor showed before the action.
+pub struct SetTakesCmd {
+    pub label: String,
+    pub before: TakeState,
+    pub after: TakeState,
+}
+
+impl Command for SetTakesCmd {
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        doc.restore_take_state(&self.after);
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        doc.restore_take_state(&self.before);
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 impl Command for SetSettingsCmd {
@@ -845,7 +880,7 @@ mod tests {
     #[test]
     fn removing_a_tag_keeps_per_tag_clips_aligned_and_undoable() {
         use crate::Tag;
-        use lc_anim::{AnimProperty, Interpolation};
+        use lc_anim::{AnimChannel, ChannelAddress, Interpolation};
 
         let mut doc = demo();
         let id = doc.scene.find_by_name("Cube").unwrap();
@@ -865,7 +900,7 @@ mod tests {
             node.tag_animations.clear();
             let mut clip = AnimationClip::default();
             clip.set_key(
-                AnimProperty::CopyLocationWeight,
+                ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
                 0.0,
                 0.25,
                 Interpolation::Linear,

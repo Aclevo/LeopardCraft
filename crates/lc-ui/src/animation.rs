@@ -14,7 +14,12 @@ impl LeopardApp {
             };
             let before = node.animation.clone();
             let mut after = before.clone();
-            after.record_transform(&node.transform, time, Interpolation::Smooth);
+            after.record_transform(
+                ChannelTarget::Object { id: *id },
+                &node.transform,
+                time,
+                Interpolation::Smooth,
+            );
             if after != before {
                 edits.push((*id, before, after));
             }
@@ -176,14 +181,14 @@ impl LeopardApp {
             match channel.kind() {
                 ChannelKind::Quaternion => rows.push(CurveRow {
                     channel,
-                    property: None,
+                    address: None,
                     morph_target: None,
                 }),
                 _ => {
-                    for property in channel.scalar_properties() {
+                    for component in 0..channel.scalar_component_count() {
                         rows.push(CurveRow {
                             channel,
-                            property: Some(*property),
+                            address: self.channel_address_for(target, channel, component as u8),
                             morph_target: None,
                         });
                     }
@@ -196,7 +201,7 @@ impl LeopardApp {
                     for index in 0..node.morph.targets.len() {
                         rows.push(CurveRow {
                             channel: AnimChannel::MorphWeight,
-                            property: None,
+                            address: None,
                             morph_target: Some(index as u32),
                         });
                     }
@@ -206,13 +211,68 @@ impl LeopardApp {
         rows
     }
 
+    /// Registry rows after the F-curve list's key filter. `Selected` keeps only
+    /// rows that own a selected key on this target; `Transform` keeps Location,
+    /// Rotation and Scale.
+    pub(super) fn visible_curve_rows(&self, target: AnimTarget) -> Vec<CurveRow> {
+        let rows = self.curve_rows(target);
+        match self.curve_filter {
+            CurveFilter::All => rows,
+            CurveFilter::Transform => rows
+                .into_iter()
+                .filter(|row| AnimChannel::TRANSFORMS.contains(&row.channel))
+                .collect(),
+            CurveFilter::Selected => {
+                let Some(clip) = self.target_clip(target) else {
+                    return Vec::new();
+                };
+                let selected: Vec<CurveTrackId> = self
+                    .selected_keys
+                    .iter()
+                    .filter(|key| key.target == target && Self::curve_key_exists(&clip, key))
+                    .map(|key| key.track)
+                    .collect();
+                rows.into_iter()
+                    .filter(|row| selected.contains(&self.curve_row_track_for(target, *row)))
+                    .collect()
+            }
+        }
+    }
+
+    /// Switch the F-curve list filter. This is view state only; it never edits
+    /// keys, the document or history. Only tests need the setter because the UI
+    /// writes the field directly.
+    #[cfg(test)]
+    pub(super) fn set_curve_filter(&mut self, filter: CurveFilter) {
+        self.curve_filter = filter;
+    }
+
     pub(super) fn curve_row_track(row: CurveRow) -> CurveTrackId {
         if let Some(index) = row.morph_target {
             CurveTrackId::MorphWeight(index)
-        } else if let Some(property) = row.property {
-            CurveTrackId::Scalar(property)
+        } else if let Some(address) = row.address {
+            CurveTrackId::Scalar(address)
         } else {
             CurveTrackId::Rotation
+        }
+    }
+
+    /// Track identity for a row on `target`. A row is addressed to its target,
+    /// while older clips store owner-relative tracks, so resolve to whichever
+    /// address the clip actually holds before treating the row as keyed.
+    pub(super) fn curve_row_track_for(&self, target: AnimTarget, row: CurveRow) -> CurveTrackId {
+        let Some(address) = row.address else {
+            return Self::curve_row_track(row);
+        };
+        let Some(clip) = self.target_clip(target) else {
+            return CurveTrackId::Scalar(address);
+        };
+        if clip.track(address).is_some() {
+            return CurveTrackId::Scalar(address);
+        }
+        match ChannelAddress::owner(address.channel, address.component) {
+            Some(legacy) if clip.track(legacy).is_some() => CurveTrackId::Scalar(legacy),
+            _ => CurveTrackId::Scalar(address),
         }
     }
 
@@ -230,12 +290,122 @@ impl LeopardApp {
             };
             return format!("{name} Weight");
         }
-        match row.property {
-            Some(property) => {
-                AnimChannel::scalar_label(property).unwrap_or_else(|| property.label().to_string())
-            }
+        match row.address {
+            Some(address) => address.label(),
             None => row.channel.label().to_string(),
         }
+    }
+
+    /// Target identity a channel address records for an editor target.
+    pub(super) fn anim_target_channel_target(&self, target: AnimTarget) -> ChannelTarget {
+        match target {
+            AnimTarget::Object(id) => ChannelTarget::Object { id },
+            AnimTarget::Tag(node, index) => ChannelTarget::Tag {
+                node,
+                index: index as u32,
+            },
+            AnimTarget::Material(id) => ChannelTarget::Material { id },
+        }
+    }
+
+    /// Address one registry component for an editor target. `None` means the
+    /// registry does not declare that component.
+    pub(super) fn channel_address_for(
+        &self,
+        target: AnimTarget,
+        channel: AnimChannel,
+        component: u8,
+    ) -> Option<ChannelAddress> {
+        ChannelAddress::new(self.anim_target_channel_target(target), channel, component)
+    }
+
+    /// Address a pasted key should use: an existing owner-relative track for
+    /// the same channel wins, otherwise the key is addressed to the target.
+    pub(super) fn paste_address(
+        &self,
+        clip: &AnimationClip,
+        target: AnimTarget,
+        channel: AnimChannel,
+        component: u8,
+    ) -> Option<ChannelAddress> {
+        let explicit = self.channel_address_for(target, channel, component)?;
+        if clip.track(explicit).is_some() {
+            return Some(explicit);
+        }
+        if let Some(legacy) = ChannelAddress::owner(channel, component) {
+            if clip.track(legacy).is_some() {
+                return Some(legacy);
+            }
+        }
+        Some(explicit)
+    }
+
+    /// Whether a row already owns a track on its target.
+    pub(super) fn curve_row_has_keys(&self, target: AnimTarget, row: CurveRow) -> bool {
+        let Some(clip) = self.target_clip(target) else {
+            return false;
+        };
+        match self.curve_row_track_for(target, row) {
+            CurveTrackId::Scalar(address) => clip.track(address).is_some(),
+            CurveTrackId::Rotation => clip
+                .rotation
+                .as_ref()
+                .is_some_and(|track| !track.is_empty()),
+            CurveTrackId::MorphWeight(index) => clip.morph_weights.contains_key(&index),
+        }
+    }
+
+    /// Row list grouped by target. The current target shows every row the
+    /// filter allows; the primary object's other animatable tags and the
+    /// selected material appear as further groups with only their keyed rows,
+    /// so the browser groups channels by object, tag and material without
+    /// editing history.
+    pub(super) fn curve_groups(&self) -> Vec<CurveRowGroup> {
+        let current = self.current_anim_target();
+        let mut candidates = Vec::new();
+        if let Some(id) = self.selection.primary() {
+            if let Some(node) = self.doc.scene.get(id) {
+                candidates.push(AnimTarget::Object(id));
+                for (index, tag) in node.tags.iter().enumerate() {
+                    if Self::tag_animation_channel(tag).is_some() {
+                        candidates.push(AnimTarget::Tag(id, index));
+                    }
+                }
+            }
+        }
+        if let Some(id) = self.selected_material {
+            if self.doc.materials.get(id).is_some() {
+                candidates.push(AnimTarget::Material(id));
+            }
+        }
+        if let Some(target) = current {
+            if !candidates.contains(&target) {
+                candidates.insert(0, target);
+            }
+        }
+        let mut groups = Vec::new();
+        for target in candidates {
+            let is_current = current == Some(target);
+            let rows: Vec<CurveRow> = if is_current {
+                self.visible_curve_rows(target)
+            } else {
+                self.visible_curve_rows(target)
+                    .into_iter()
+                    .filter(|row| self.curve_row_has_keys(target, *row))
+                    .collect()
+            };
+            // An empty non-current group is hidden; the current group always
+            // appears so its empty-channel rows can be keyed.
+            if rows.is_empty() && !is_current {
+                continue;
+            }
+            groups.push(CurveRowGroup {
+                target,
+                label: self.target_label(target),
+                rows,
+            });
+        }
+        groups
     }
 
     /// Live values for a registry channel, in registry component order.
@@ -351,6 +521,7 @@ impl LeopardApp {
         let Some(mut after) = self.target_clip(target) else {
             return false;
         };
+        let channel_target = self.anim_target_channel_target(target);
         if channel.kind() == ChannelKind::Quaternion {
             let AnimTarget::Object(id) = target else {
                 return false;
@@ -358,12 +529,23 @@ impl LeopardApp {
             let Some(node) = self.doc.scene.get(id) else {
                 return false;
             };
-            after.set_rotation_key(time, node.transform.rotation, Interpolation::Smooth);
+            after.set_rotation_key(
+                channel_target,
+                time,
+                node.transform.rotation,
+                Interpolation::Smooth,
+            );
         } else {
             let Some(values) = self.channel_values(target, channel) else {
                 return false;
             };
-            if !after.record_channel(channel, &values, time, Interpolation::Smooth) {
+            if !after.record_channel(
+                channel_target,
+                channel,
+                &values,
+                time,
+                Interpolation::Smooth,
+            ) {
                 return false;
             }
         }
@@ -375,7 +557,7 @@ impl LeopardApp {
             target,
             CurveRow {
                 channel,
-                property: channel.scalar_properties().first().copied(),
+                address: ChannelAddress::new(channel_target, channel, 0),
                 morph_target: None,
             },
         ));
@@ -447,14 +629,14 @@ impl LeopardApp {
         true
     }
 
-    /// Index of the key at `time` on `property`, using the editor's key
+    /// Index of the key at `time` on `address`, using the editor's key
     /// tolerance so selection survives frame snapping.
     pub(super) fn curve_key_index(
         clip: &AnimationClip,
-        property: AnimProperty,
+        address: ChannelAddress,
         time: f32,
     ) -> Option<usize> {
-        let track = clip.track(property)?;
+        let track = clip.track(address)?;
         track
             .curve
             .keys
@@ -476,8 +658,8 @@ impl LeopardApp {
 
     /// Select the F-curve key at `time` on the primary object.
     #[cfg(test)]
-    pub(super) fn select_curve_key(&mut self, property: AnimProperty, time: f32) -> bool {
-        self.select_track_key(CurveTrackId::Scalar(property), time)
+    pub(super) fn select_curve_key(&mut self, address: ChannelAddress, time: f32) -> bool {
+        self.select_track_key(CurveTrackId::Scalar(address), time)
     }
 
     /// Select one quaternion rotation key on the primary object.
@@ -574,8 +756,8 @@ impl LeopardApp {
 
     pub(super) fn curve_key_exists(clip: &AnimationClip, key: &SelectedKey) -> bool {
         match key.track {
-            CurveTrackId::Scalar(property) => {
-                Self::curve_key_index(clip, property, key.time).is_some()
+            CurveTrackId::Scalar(address) => {
+                Self::curve_key_index(clip, address, key.time).is_some()
             }
             CurveTrackId::Rotation => clip.rotation_key_index(key.time).is_some(),
             CurveTrackId::MorphWeight(target) => {
@@ -643,8 +825,17 @@ impl LeopardApp {
         {
             return false;
         }
+        let visible: Vec<CurveTrackId> = self
+            .visible_curve_rows(target)
+            .into_iter()
+            .map(|row| self.curve_row_track_for(target, row))
+            .collect();
+        let visible_track = |track: CurveTrackId| visible.contains(&track);
         let mut hits = Vec::new();
         for track in &clip.tracks {
+            if !visible_track(CurveTrackId::Scalar(track.address)) {
+                continue;
+            }
             for key in &track.curve.keys {
                 if key.time >= time_min
                     && key.time <= time_max
@@ -653,28 +844,33 @@ impl LeopardApp {
                 {
                     hits.push(SelectedKey {
                         target,
-                        track: CurveTrackId::Scalar(track.property),
+                        track: CurveTrackId::Scalar(track.address),
                         time: key.time,
                     });
                 }
             }
         }
-        if let Some(track) = &clip.rotation {
-            for key in &track.keys {
-                if key.time >= time_min
-                    && key.time <= time_max
-                    && key.value.w >= value_min
-                    && key.value.w <= value_max
-                {
-                    hits.push(SelectedKey {
-                        target,
-                        track: CurveTrackId::Rotation,
-                        time: key.time,
-                    });
+        if visible_track(CurveTrackId::Rotation) {
+            if let Some(track) = &clip.rotation {
+                for key in &track.keys {
+                    if key.time >= time_min
+                        && key.time <= time_max
+                        && key.value.w >= value_min
+                        && key.value.w <= value_max
+                    {
+                        hits.push(SelectedKey {
+                            target,
+                            track: CurveTrackId::Rotation,
+                            time: key.time,
+                        });
+                    }
                 }
             }
         }
         for (target_index, curve) in &clip.morph_weights {
+            if !visible_track(CurveTrackId::MorphWeight(*target_index)) {
+                continue;
+            }
             for key in &curve.keys {
                 if key.time >= time_min
                     && key.time <= time_max
@@ -710,7 +906,7 @@ impl LeopardApp {
     pub(super) fn move_target_curve_key(
         &mut self,
         target: AnimTarget,
-        property: AnimProperty,
+        address: ChannelAddress,
         from: f32,
         to: f32,
     ) -> bool {
@@ -722,7 +918,7 @@ impl LeopardApp {
             return false;
         };
         let mut after = before.clone();
-        let Some(track) = after.track_mut(property) else {
+        let Some(track) = after.track_mut(address) else {
             return false;
         };
         let Some(index) = track
@@ -757,7 +953,7 @@ impl LeopardApp {
         }
         self.selected_keys = vec![SelectedKey {
             target,
-            track: CurveTrackId::Scalar(property),
+            track: CurveTrackId::Scalar(address),
             time: to,
         }];
         self.status = format!("Moved key to frame {}", (to * self.playback.fps).round());
@@ -769,13 +965,13 @@ impl LeopardApp {
     pub(super) fn delete_target_curve_key(
         &mut self,
         target: AnimTarget,
-        property: AnimProperty,
+        address: ChannelAddress,
         time: f32,
     ) -> bool {
         let Some(mut after) = self.target_clip(target) else {
             return false;
         };
-        let Some(track) = after.track_mut(property) else {
+        let Some(track) = after.track_mut(address) else {
             return false;
         };
         let Some(index) = track
@@ -801,14 +997,14 @@ impl LeopardApp {
     pub(super) fn set_target_curve_key_interpolation(
         &mut self,
         target: AnimTarget,
-        property: AnimProperty,
+        address: ChannelAddress,
         time: f32,
         interpolation: Interpolation,
     ) -> bool {
         let Some(mut after) = self.target_clip(target) else {
             return false;
         };
-        let Some(track) = after.track_mut(property) else {
+        let Some(track) = after.track_mut(address) else {
             return false;
         };
         let Some(index) = track
@@ -834,7 +1030,7 @@ impl LeopardApp {
         }
         self.selected_keys = vec![SelectedKey {
             target,
-            track: CurveTrackId::Scalar(property),
+            track: CurveTrackId::Scalar(address),
             time,
         }];
         self.status = format!("Set key interpolation to {}", interpolation.label());
@@ -854,7 +1050,7 @@ impl LeopardApp {
         let Some(mut after) = self.target_clip(target) else {
             return false;
         };
-        let track_id = Self::curve_row_track(row);
+        let track_id = self.curve_row_track_for(target, row);
         let selected_times: Vec<f32> = self
             .selected_curve_keys()
             .into_iter()
@@ -862,60 +1058,66 @@ impl LeopardApp {
             .map(|key| key.time)
             .collect();
         let mut changed = 0;
-        if let Some(property) = row.property {
-            if let Some(track) = after.track_mut(property) {
-                let times: Vec<f32> = track
-                    .curve
-                    .keys
-                    .iter()
-                    .filter(|key| {
-                        selected_times.is_empty()
-                            || selected_times
-                                .iter()
-                                .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
-                    })
-                    .map(|key| key.time)
-                    .collect();
-                for time in times {
-                    if track.curve.set_interpolation(time, interpolation) {
-                        changed += 1;
+        match track_id {
+            CurveTrackId::Scalar(address) => {
+                if let Some(track) = after.track_mut(address) {
+                    let times: Vec<f32> = track
+                        .curve
+                        .keys
+                        .iter()
+                        .filter(|key| {
+                            selected_times.is_empty()
+                                || selected_times
+                                    .iter()
+                                    .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                        })
+                        .map(|key| key.time)
+                        .collect();
+                    for time in times {
+                        if track.curve.set_interpolation(time, interpolation) {
+                            changed += 1;
+                        }
                     }
                 }
             }
-        } else if let Some(index) = row.morph_target {
-            if let Some(curve) = after.morph_weights.get_mut(&index) {
-                let times: Vec<f32> = curve
-                    .keys
-                    .iter()
-                    .filter(|key| {
-                        selected_times.is_empty()
-                            || selected_times
-                                .iter()
-                                .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
-                    })
-                    .map(|key| key.time)
-                    .collect();
-                for time in times {
-                    if curve.set_interpolation(time, interpolation) {
-                        changed += 1;
+            CurveTrackId::MorphWeight(index) => {
+                if let Some(curve) = after.morph_weights.get_mut(&index) {
+                    let times: Vec<f32> = curve
+                        .keys
+                        .iter()
+                        .filter(|key| {
+                            selected_times.is_empty()
+                                || selected_times
+                                    .iter()
+                                    .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                        })
+                        .map(|key| key.time)
+                        .collect();
+                    for time in times {
+                        if curve.set_interpolation(time, interpolation) {
+                            changed += 1;
+                        }
                     }
                 }
             }
-        } else if let Some(track) = after.rotation.as_mut() {
-            let times: Vec<f32> = track
-                .keys
-                .iter()
-                .filter(|key| {
-                    selected_times.is_empty()
-                        || selected_times
-                            .iter()
-                            .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
-                })
-                .map(|key| key.time)
-                .collect();
-            for time in times {
-                if track.set_interpolation(time, interpolation) {
-                    changed += 1;
+            CurveTrackId::Rotation => {
+                if let Some(track) = after.rotation.as_mut() {
+                    let times: Vec<f32> = track
+                        .keys
+                        .iter()
+                        .filter(|key| {
+                            selected_times.is_empty()
+                                || selected_times
+                                    .iter()
+                                    .any(|time| (key.time - time).abs() <= KEY_TIME_EPSILON)
+                        })
+                        .map(|key| key.time)
+                        .collect();
+                    for time in times {
+                        if track.set_interpolation(time, interpolation) {
+                            changed += 1;
+                        }
+                    }
                 }
             }
         }
@@ -1013,19 +1215,19 @@ impl LeopardApp {
             return false;
         };
         let mut after = before.clone();
-        let mut scalar_tracks: Vec<(AnimProperty, Vec<f32>)> = Vec::new();
+        let mut scalar_tracks: Vec<(ChannelAddress, Vec<f32>)> = Vec::new();
         let mut morph_tracks: Vec<(u32, Vec<f32>)> = Vec::new();
         let mut rotation_times = Vec::new();
         for key in &keys {
             match key.track {
-                CurveTrackId::Scalar(property) => {
+                CurveTrackId::Scalar(address) => {
                     if let Some((_, times)) = scalar_tracks
                         .iter_mut()
-                        .find(|(candidate, _)| *candidate == property)
+                        .find(|(candidate, _)| *candidate == address)
                     {
                         times.push(key.time);
                     } else {
-                        scalar_tracks.push((property, vec![key.time]));
+                        scalar_tracks.push((address, vec![key.time]));
                     }
                 }
                 CurveTrackId::Rotation => rotation_times.push(key.time),
@@ -1041,8 +1243,8 @@ impl LeopardApp {
                 }
             }
         }
-        for (property, times) in &scalar_tracks {
-            let Some(track) = after.track_mut(*property) else {
+        for (address, times) in &scalar_tracks {
+            let Some(track) = after.track_mut(*address) else {
                 return false;
             };
             if !track.curve.retime_selected_keys(pivot, factor, times) {
@@ -1176,7 +1378,7 @@ impl LeopardApp {
                 .map(|other| other.time)
                 .collect();
             let collides = match key.track {
-                CurveTrackId::Scalar(property) => after.track(property).is_some_and(|track| {
+                CurveTrackId::Scalar(address) => after.track(address).is_some_and(|track| {
                     track.curve.keys.iter().any(|candidate| {
                         (candidate.time - *new_time).abs() <= KEY_TIME_EPSILON
                             && !selected_times
@@ -1218,8 +1420,8 @@ impl LeopardApp {
         }
         for (key, new_time) in &moved {
             match key.track {
-                CurveTrackId::Scalar(property) => {
-                    let Some(track) = after.track_mut(property) else {
+                CurveTrackId::Scalar(address) => {
+                    let Some(track) = after.track_mut(address) else {
                         return false;
                     };
                     let Some(index) = track.curve.keys.iter().position(|candidate| {
@@ -1311,8 +1513,8 @@ impl LeopardApp {
             return false;
         };
         let changed = match track {
-            CurveTrackId::Scalar(property) => {
-                let Some(track) = after.track_mut(property) else {
+            CurveTrackId::Scalar(address) => {
+                let Some(track) = after.track_mut(address) else {
                     return false;
                 };
                 let Some(index) = track
@@ -1387,8 +1589,8 @@ impl LeopardApp {
         let count = keys.len();
         for key in &keys {
             match key.track {
-                CurveTrackId::Scalar(property) => {
-                    if let Some(track) = after.track_mut(property) {
+                CurveTrackId::Scalar(address) => {
+                    if let Some(track) = after.track_mut(address) {
                         track.curve.remove_nearest(key.time);
                     }
                 }
@@ -1445,8 +1647,8 @@ impl LeopardApp {
         let mut changed = 0;
         for key in &keys {
             match key.track {
-                CurveTrackId::Scalar(property) => {
-                    if let Some(track) = after.track_mut(property) {
+                CurveTrackId::Scalar(address) => {
+                    if let Some(track) = after.track_mut(address) {
                         if track.curve.set_interpolation(key.time, interpolation) {
                             changed += 1;
                         }
@@ -1503,8 +1705,8 @@ impl LeopardApp {
         let mut changed = 0;
         for key in &keys {
             match key.track {
-                CurveTrackId::Scalar(property) => {
-                    if let Some(track) = after.track_mut(property) {
+                CurveTrackId::Scalar(address) => {
+                    if let Some(track) = after.track_mut(address) {
                         if track
                             .curve
                             .set_tangent_type(key.time, tangent_type, incoming, outgoing)
@@ -1549,8 +1751,8 @@ impl LeopardApp {
         let mut common = None;
         for key in keys {
             let interpolation = match key.track {
-                CurveTrackId::Scalar(property) => {
-                    clip.track(property)?
+                CurveTrackId::Scalar(address) => {
+                    clip.track(address)?
                         .curve
                         .keys
                         .iter()
@@ -1591,9 +1793,9 @@ impl LeopardApp {
         let mut common = None;
         for key in keys {
             let (incoming, outgoing) = match key.track {
-                CurveTrackId::Scalar(property) => {
+                CurveTrackId::Scalar(address) => {
                     let key =
-                        clip.track(property)?.curve.keys.iter().find(|candidate| {
+                        clip.track(address)?.curve.keys.iter().find(|candidate| {
                             (candidate.time - key.time).abs() <= KEY_TIME_EPSILON
                         })?;
                     (key.tangent_in_type, key.tangent_out_type)
@@ -1646,8 +1848,8 @@ impl LeopardApp {
         let mut clipboard = Vec::with_capacity(keys.len());
         for key in &keys {
             match key.track {
-                CurveTrackId::Scalar(property) => {
-                    let Some(track) = clip.track(property) else {
+                CurveTrackId::Scalar(address) => {
+                    let Some(track) = clip.track(address) else {
                         continue;
                     };
                     let Some(value) =
@@ -1730,7 +1932,7 @@ impl LeopardApp {
         let mut pasted = Vec::new();
         for item in &self.curve_clipboard.keys {
             let channel = match item.track {
-                CurveTrackId::Scalar(property) => AnimChannel::from_scalar_property(property),
+                CurveTrackId::Scalar(address) => Some(address.channel),
                 CurveTrackId::Rotation => Some(AnimChannel::Rotation),
                 CurveTrackId::MorphWeight(_) => Some(AnimChannel::MorphWeight),
             };
@@ -1756,14 +1958,22 @@ impl LeopardApp {
                 continue;
             }
             match item.track {
-                CurveTrackId::Scalar(property) => {
+                CurveTrackId::Scalar(address) => {
                     let CurveKeyValue::Scalar(value) = item.value else {
                         continue;
                     };
-                    after.set_key(property, time, value, item.interpolation);
+                    // Re-address the key to the paste target so keys move
+                    // between objects, tags and materials, reusing an existing
+                    // owner-relative track instead of duplicating the channel.
+                    let Some(address) =
+                        self.paste_address(&after, target, address.channel, address.component)
+                    else {
+                        continue;
+                    };
+                    after.set_key(address, time, value, item.interpolation);
                     pasted.push(SelectedKey {
                         target,
-                        track: item.track,
+                        track: CurveTrackId::Scalar(address),
                         time,
                     });
                 }
@@ -1771,7 +1981,12 @@ impl LeopardApp {
                     let CurveKeyValue::Rotation(value) = item.value else {
                         continue;
                     };
-                    after.set_rotation_key(time, value, item.interpolation);
+                    after.set_rotation_key(
+                        self.anim_target_channel_target(target),
+                        time,
+                        value,
+                        item.interpolation,
+                    );
                     pasted.push(SelectedKey {
                         target,
                         track: item.track,
@@ -1806,32 +2021,32 @@ impl LeopardApp {
     }
 
     #[cfg(test)]
-    pub(super) fn move_curve_key(&mut self, property: AnimProperty, from: f32, to: f32) -> bool {
+    pub(super) fn move_curve_key(&mut self, address: ChannelAddress, from: f32, to: f32) -> bool {
         let Some(target) = self.current_anim_target() else {
             return false;
         };
-        self.move_target_curve_key(target, property, from, to)
+        self.move_target_curve_key(target, address, from, to)
     }
 
     #[cfg(test)]
-    pub(super) fn delete_curve_key(&mut self, property: AnimProperty, time: f32) -> bool {
+    pub(super) fn delete_curve_key(&mut self, address: ChannelAddress, time: f32) -> bool {
         let Some(target) = self.current_anim_target() else {
             return false;
         };
-        self.delete_target_curve_key(target, property, time)
+        self.delete_target_curve_key(target, address, time)
     }
 
     #[cfg(test)]
     pub(super) fn set_curve_key_interpolation(
         &mut self,
-        property: AnimProperty,
+        address: ChannelAddress,
         time: f32,
         interpolation: Interpolation,
     ) -> bool {
         let Some(target) = self.current_anim_target() else {
             return false;
         };
-        self.set_target_curve_key_interpolation(target, property, time, interpolation)
+        self.set_target_curve_key_interpolation(target, address, time, interpolation)
     }
 
     pub(super) fn key_transforms_ready(&self) -> bool {

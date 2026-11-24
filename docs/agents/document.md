@@ -12,8 +12,8 @@ command in the shared history; every `.lcscene` file keeps loading.
 
 ## Entry points
 
-- `crates/lc-scene/src/document.rs` — `Document`, settings, layers, save/open
-  entry points.
+- `crates/lc-scene/src/document.rs` — `Document`, settings, layers, animation
+  takes and save/open entry points.
 - `scene.rs` — `Scene`, `Node`, `NodeKind`, `NodeId`, tags, skins, morph sets.
 - `geometry.rs` — `Primitive`, `Modifier`, shape application.
 - `eval.rs` — authoritative `Document::evaluate` and `EvaluatedScene`.
@@ -41,7 +41,27 @@ command in the shared history; every `.lcscene` file keeps loading.
 - Units: metres; stored rotations are normalized quaternions; UI/API angles are
   degrees and math is radians.
 - `AnimChannel` is the only registry of animatable properties, their scope and
-  component count. Recording and the curve editor resolve channels through it.
+  component count. Keys are `ChannelAddress { target, channel, component }`
+  values validated by that registry; `target` is `Owner`, an object id, a tag
+  (node id + index) or a material id. Recording and the curve editor resolve
+  channels through the address. Legacy snake_case `property` tracks load into
+  owner addresses, and pre-address Euler rotation curves stay in
+  `AnimationClip::legacy_euler_rotation`, which is preserved and still sampled
+  in degrees.
+- Evaluation samples each clip once per frame: `AnimationClip::sample_channels`
+  fills a `ChannelSamples` buffer and consumers resolve components from it. Do
+  not re-query curves per component or per constraint pass.
+- `Document::takes` owns named animation takes and `active_take` selects one.
+  Each take stores node, per-tag and material clips; the live
+  `Node::animation`, `Node::tag_animations` and `Material::animation` fields
+  mirror the active take. Commit live edits with `store_active_clips` before
+  saving, signing, switching or changing takes. Files without a take list
+  migrate to one default take on load.
+- `Mesh::extra_uvs` is the additive multi-UV-set schema: additional coordinate
+  arrays parallel to `uvs`, serialized only when present and defaulting to one
+  UV0 set on old files. `repair_mesh` truncates or zero-pads a damaged set and
+  sanitizes non-finite coordinates; the mesh signature and validation include
+  every set. Material texture slots still sample UV0.
 - Writes go through the existing atomic save helpers and recovery paths. Never
   write over a user target directly.
 

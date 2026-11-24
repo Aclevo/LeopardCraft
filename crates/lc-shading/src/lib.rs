@@ -15,7 +15,7 @@ pub use graph::{
 pub use texture::{Texture2D, TextureCache};
 
 use glam::Vec2;
-use lc_anim::{AnimProperty, AnimationClip};
+use lc_anim::{AnimChannel, AnimationClip, ChannelTarget};
 use lc_core::StableHasher;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -103,10 +103,17 @@ impl Material {
     /// applies consistently in previews and offline renders.
     pub fn evaluate_at(&self, ctx: &ShadingContext, time: f32) -> Surface {
         let mut surface = self.graph.evaluate(ctx);
-        if let Some(value) = self.animation.sample(AnimProperty::MaterialRoughness, time) {
+        if self.animation.is_empty() {
+            return surface;
+        }
+        // One scratch buffer per call samples each material channel once, even
+        // though several surface fields are read from it.
+        let samples = self.animation.sample_channels(time);
+        let target = ChannelTarget::Material { id: self.id };
+        if let Some(value) = samples.scalar_for(target, AnimChannel::MaterialRoughness, 0) {
             surface.roughness = value.clamp(0.0, 1.0);
         }
-        if let Some(value) = self.animation.sample(AnimProperty::MaterialMetallic, time) {
+        if let Some(value) = samples.scalar_for(target, AnimChannel::MaterialMetallic, 0) {
             surface.metallic = value.clamp(0.0, 1.0);
         }
         surface
@@ -122,6 +129,7 @@ impl Material {
             tangent: glam::Vec3::X,
             view_dir: glam::Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures,
         };
         self.evaluate(&ctx)
@@ -137,6 +145,7 @@ impl Material {
             tangent: glam::Vec3::X,
             view_dir: glam::Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures,
         };
         self.evaluate(&ctx).roughness
@@ -150,6 +159,7 @@ impl Material {
             tangent: glam::Vec3::X,
             view_dir: glam::Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures,
         };
         self.evaluate(&ctx).metallic
@@ -165,6 +175,7 @@ impl Material {
             tangent: glam::Vec3::X,
             view_dir: glam::Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures,
         };
         self.graph.evaluate(&ctx).roughness
@@ -179,6 +190,7 @@ impl Material {
             tangent: glam::Vec3::X,
             view_dir: glam::Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures,
         };
         self.graph.evaluate(&ctx).metallic
@@ -391,18 +403,13 @@ mod tests {
     #[test]
     fn animated_material_scalars_apply_at_time() {
         let mut material = Material::pbr(7, "Animated", glam::Vec3::splat(0.5), 0.2, 0.1);
-        material.animation.set_key(
-            lc_anim::AnimProperty::MaterialRoughness,
-            0.0,
-            0.2,
-            lc_anim::Interpolation::Linear,
-        );
-        material.animation.set_key(
-            lc_anim::AnimProperty::MaterialRoughness,
-            1.0,
-            0.8,
-            lc_anim::Interpolation::Linear,
-        );
+        let roughness = lc_anim::ChannelAddress::owner(AnimChannel::MaterialRoughness, 0).unwrap();
+        material
+            .animation
+            .set_key(roughness, 0.0, 0.2, lc_anim::Interpolation::Linear);
+        material
+            .animation
+            .set_key(roughness, 1.0, 0.8, lc_anim::Interpolation::Linear);
         let cache = TextureCache::default();
         let ctx = ShadingContext::new(&cache);
         assert!((material.evaluate_at(&ctx, 0.5).roughness - 0.5).abs() < 1e-4);

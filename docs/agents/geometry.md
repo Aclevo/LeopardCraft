@@ -18,7 +18,9 @@ clock.
 - `ops.rs` — extrusion, inset, bevel, ring cut, weld, bridge, fill, split,
   shell, collapse, triangulate, flip, cover, disconnect, point slide, optimize,
   deformers.
-- `uv.rs` — projections, automatic unwrap, seam-aware charts, relaxation.
+- `uv.rs` — projections (UV0 and any set), automatic unwrap, seam-aware
+  charts, relaxation, chart transform/packing, UV slot operations and
+  distortion measurement.
 - `subdiv.rs` — Catmull-Clark, Stam-Loop and linear subdivision.
 - `csg.rs` — BSP booleans; `bvh.rs` — ray acceleration.
 - `primitives.rs`, `spline.rs` — parametric builders and curves.
@@ -31,6 +33,12 @@ clock.
   UV slots, creases, seams and pinned UVs unless the operation's contract says
   otherwise. Creases and seams are sorted canonical point pairs; normalize them
   after topology changes.
+- `Mesh::uvs` is UV0 and `Mesh::extra_uvs` holds additional sets as parallel
+  coordinate arrays over the same slot indices. Any operation that adds, removes
+  or rebuilds slots must keep every set the same length (weld/split remap them,
+  subdivision carries each set through the same UV0 rules, `sync_uv_sets`
+  repairs a damaged length). Pins and seams belong to the shared slot/point
+  topology, not to one set.
 - Keep every result finite. Degenerate topology and zero-length vectors return a
   sensible value or `None`, never NaN or a panic.
 - Determinism: iterate ordered containers or sort before hashing/rendering; use

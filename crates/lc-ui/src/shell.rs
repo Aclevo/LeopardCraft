@@ -967,6 +967,47 @@ impl LeopardApp {
                 {
                     self.perform_mesh_action(MeshAction::FillHole);
                 }
+                let fill_tool_label = if self.fill_hole_tool {
+                    "Fill Hole Tool ✓"
+                } else {
+                    "Fill Hole Tool"
+                };
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Fill Hole Tool",
+                    self.mesh_edit,
+                    fill_tool_label,
+                )
+                .clicked()
+                {
+                    self.fill_hole_tool = !self.fill_hole_tool;
+                    self.status = if self.fill_hole_tool {
+                        "Fill Hole tool: click a point on an open hole border".into()
+                    } else {
+                        "Fill Hole tool off".into()
+                    };
+                }
+                let scalpel_tool_label = if self.scalpel_tool {
+                    "Scalpel Tool ✓"
+                } else {
+                    "Scalpel Tool"
+                };
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Scalpel Tool",
+                    self.mesh_edit,
+                    scalpel_tool_label,
+                )
+                .clicked()
+                {
+                    self.scalpel_tool = !self.scalpel_tool;
+                    self.scalpel_start = None;
+                    self.status = if self.scalpel_tool {
+                        "Scalpel tool: click a point or edge to start a cut".into()
+                    } else {
+                        "Scalpel tool off".into()
+                    };
+                }
                 if recorded_button_enabled(ui, "Tools:Split", self.mesh_split_ready(), "Split")
                     .clicked()
                 {
@@ -986,6 +1027,31 @@ impl LeopardApp {
                 .clicked()
                 {
                     self.perform_mesh_action(MeshAction::Triangulate);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Scalpel",
+                    self.mesh_scalpel_ready(),
+                    "Scalpel",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Scalpel);
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:Subdivide",
+                    self.mesh_subdivide_ready(),
+                    "Subdivide",
+                )
+                .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Subdivide);
+                }
+                if recorded_button_enabled(ui, "Tools:Clone", self.mesh_clone_ready(), "Clone")
+                    .clicked()
+                {
+                    self.perform_mesh_action(MeshAction::Clone);
                 }
                 if recorded_button_enabled(
                     ui,
@@ -1087,6 +1153,84 @@ impl LeopardApp {
                     }
                 });
             });
+            recorded_submenu(ui, "Tools:UV Editing", "UV Editing", |ui| {
+                ui.set_min_width(210.0);
+                let ready = self.uv_edit_ready();
+                if recorded_button_enabled(ui, "Tools:UV Editing:Toggle Seam", ready, "Toggle Seam")
+                    .clicked()
+                {
+                    self.toggle_selected_uv_seam();
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:UV Editing:Select All Seams",
+                    ready,
+                    "Select All Seams",
+                )
+                .clicked()
+                {
+                    self.select_all_uv_seams();
+                }
+                if recorded_button_enabled(ui, "Tools:UV Editing:Seam Loop", ready, "Seam Loop")
+                    .clicked()
+                {
+                    self.select_uv_seam_loop();
+                }
+                if recorded_button_enabled(ui, "Tools:UV Editing:Clear Seams", ready, "Clear Seams")
+                    .clicked()
+                {
+                    self.clear_uv_seams();
+                }
+                ui.separator();
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:UV Editing:Select Island",
+                    ready,
+                    "Select Island",
+                )
+                .clicked()
+                {
+                    self.select_uv_island();
+                }
+                for (key, label, op) in [
+                    ("Weld UVs", "Weld UVs", UvSlotOp::Weld),
+                    ("Split UVs", "Split UVs", UvSlotOp::Split),
+                    ("Align U", "Align U", UvSlotOp::AlignU),
+                    ("Align V", "Align V", UvSlotOp::AlignV),
+                    ("Distribute U", "Distribute U", UvSlotOp::DistributeU),
+                    ("Distribute V", "Distribute V", UvSlotOp::DistributeV),
+                    ("Flip U", "Flip U", UvSlotOp::FlipU),
+                    ("Flip V", "Flip V", UvSlotOp::FlipV),
+                    ("Rotate 90", "Rotate 90°", UvSlotOp::Rotate90),
+                ] {
+                    if recorded_button_enabled(ui, &format!("Tools:UV Editing:{key}"), ready, label)
+                        .clicked()
+                    {
+                        self.run_uv_slot_op(op);
+                    }
+                }
+                ui.separator();
+                if recorded_button_enabled(ui, "Tools:UV Editing:Pack Charts", ready, "Pack Charts")
+                    .clicked()
+                {
+                    self.pack_selected_uv_charts();
+                }
+                if recorded_button_enabled(ui, "Tools:UV Editing:Add UV Set", ready, "Add UV Set")
+                    .clicked()
+                {
+                    self.add_uv_set();
+                }
+                if recorded_button_enabled(
+                    ui,
+                    "Tools:UV Editing:Remove UV Set",
+                    ready,
+                    "Remove UV Set",
+                )
+                .clicked()
+                {
+                    self.remove_uv_set();
+                }
+            });
             ui.menu_button("Render", |ui| {
                 ui.set_min_width(190.0);
                 if ui.button("Render Frame").clicked() {
@@ -1182,15 +1326,20 @@ impl LeopardApp {
                         }
                     });
                 });
-                ui.checkbox(&mut self.playback.looping, "Loop Playback");
+                let mut looping = self.playback.looping;
+                if ui.checkbox(&mut looping, "Loop Playback").changed() {
+                    self.set_playback_looping(looping);
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Frames/sec");
-                    ui.add(
-                        egui::DragValue::new(&mut self.playback.fps)
-                            .range(1.0..=240.0)
-                            .speed(0.2),
-                    );
+                    let mut fps = self.playback.fps;
+                    if ui
+                        .add(egui::DragValue::new(&mut fps).range(1.0..=240.0).speed(0.2))
+                        .changed()
+                    {
+                        self.set_playback_fps(fps);
+                    }
                 });
             });
             ui.menu_button("Window", |ui| {

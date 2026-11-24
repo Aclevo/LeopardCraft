@@ -17,12 +17,22 @@ impl LeopardApp {
         if !modifier_applies_to(node, modifier) {
             return false;
         }
-        if let Modifier::Boolean { operand, .. } = modifier {
-            return *operand != node.id
+        if let Modifier::Formula { x, y, z } = modifier {
+            return [x, y, z]
+                .iter()
+                .all(|expression| lc_geom::formula_expression_is_valid(expression));
+        }
+        let operand = match modifier {
+            Modifier::Boolean { operand, .. } => Some(*operand),
+            Modifier::Wrap { target, .. } => Some(*target),
+            _ => None,
+        };
+        if let Some(operand) = operand {
+            return operand != node.id
                 && self
                     .doc
                     .scene
-                    .get(*operand)
+                    .get(operand)
                     .map(|operand| operand.is_mesh())
                     .unwrap_or(false);
         }
@@ -320,6 +330,34 @@ impl LeopardApp {
         Some(self.weight_joint.unwrap_or(0).min(skin.joints.len() - 1))
     }
 
+    /// Make `joint` the active skinning joint when it belongs to the primary
+    /// mesh's bound skin. A joint that is not bound is refused without touching
+    /// the document, history or the current active joint, so viewport picking
+    /// cannot silently point the heat map and brush at the wrong bone.
+    pub(super) fn set_active_weight_joint_node(&mut self, joint: lc_scene::NodeId) -> bool {
+        let Some(id) = self.selection.primary() else {
+            self.status = "Select a skinned mesh before picking a joint".into();
+            return false;
+        };
+        let Some(skin) = self.doc.scene.get(id).and_then(|node| node.skin.as_ref()) else {
+            self.status = "The selected object has no bound skin".into();
+            return false;
+        };
+        let Some(index) = skin.joints.iter().position(|candidate| *candidate == joint) else {
+            self.status = "That joint is not bound to the selected mesh".into();
+            return false;
+        };
+        self.weight_joint = Some(index);
+        let name = self
+            .doc
+            .scene
+            .get(joint)
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| format!("Joint {joint}"));
+        self.status = format!("Active joint: {name}");
+        true
+    }
+
     pub(super) fn weight_paint_ready(&self) -> bool {
         let Some((id, mesh)) = self.selected_editable_mesh() else {
             return false;
@@ -475,6 +513,9 @@ impl LeopardApp {
             MorphAction::Capture => {
                 self.capture_morph_target();
             }
+            MorphAction::UpdateBase => {
+                self.update_morph_base();
+            }
             MorphAction::Restore => {
                 self.restore_morph_base();
             }
@@ -550,6 +591,60 @@ impl LeopardApp {
         self.history
             .execute(&mut self.doc, Box::new(SetMorphCmd { id, before, after }));
         self.status = format!("Captured morph target {name}");
+        true
+    }
+
+    /// Re-record the rest base from the live mesh while keeping every target's
+    /// absolute posed shape. Deltas are stored relative to the base, so each
+    /// target absorbs the difference between the old and new base. Cheetah3D
+    /// documents the Base/rest workflow but not how targets follow a re-recorded
+    /// base; preserving target poses is LeopardCraft's clean-room choice.
+    pub(super) fn update_morph_base(&mut self) -> bool {
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Morph targets need an editable mesh".into();
+            return false;
+        };
+        let Some(node) = self.doc.scene.get(id) else {
+            return false;
+        };
+        if !node.morph.has_base() {
+            self.status = "Record a morph base before updating it".into();
+            return false;
+        }
+        if node.morph.base.len() != mesh.positions.len() {
+            self.status = "The morph base does not match the current mesh topology".into();
+            return false;
+        }
+        if node
+            .morph
+            .targets
+            .iter()
+            .any(|target| target.deltas.len() != mesh.positions.len())
+        {
+            self.status = "A morph target does not match the current mesh topology".into();
+            return false;
+        }
+        if node.morph.base == mesh.positions {
+            self.status = "The morph base already matches the current mesh".into();
+            return false;
+        }
+        let before = node.morph.clone();
+        let old_base = before.base.clone();
+        let mut after = before.clone();
+        for target in &mut after.targets {
+            for (index, delta) in target.deltas.iter_mut().enumerate() {
+                *delta = old_base[index] + *delta - mesh.positions[index];
+            }
+        }
+        let rebased = after.targets.len();
+        after.base = mesh.positions.clone();
+        let vertices = mesh.positions.len();
+        self.history
+            .execute(&mut self.doc, Box::new(SetMorphCmd { id, before, after }));
+        self.status = format!(
+            "Updated morph base ({vertices} vertices, {rebased} target{} rebased)",
+            if rebased == 1 { "" } else { "s" }
+        );
         true
     }
 

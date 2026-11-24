@@ -12,16 +12,23 @@ impl LeopardApp {
     pub(super) fn open_file(&mut self, path: PathBuf) -> bool {
         reconcile_native_scene(&path);
         let opened = match lc_io::import_with_report(&path) {
-            Ok((doc, report)) => {
-                let name = path.display().to_string();
-                self.load_scene(doc, Some(path));
-                self.lifecycle.discard_recovery();
-                self.status = match report.summary() {
-                    Some(summary) => format!("Opened {name} — {summary}"),
-                    None => format!("Opened {name}"),
-                };
-                true
-            }
+            Ok((doc, report)) => match report.summary() {
+                Some(summary) => {
+                    self.pending_import = Some(PendingImport {
+                        path,
+                        doc,
+                        summary,
+                        replace_scene: true,
+                    });
+                    self.status =
+                        "Review the import report before the open scene is replaced".into();
+                    false
+                }
+                None => {
+                    self.finish_open(path, doc, None);
+                    true
+                }
+            },
             Err(e) => {
                 self.status = format!("Open failed: {e}");
                 false
@@ -36,26 +43,70 @@ impl LeopardApp {
         match lc_io::import_with_report(&path) {
             Ok((mut doc, report)) => {
                 doc.sanitize();
-                let before = self.doc.clone();
-                let after = doc;
-                self.history.execute(
-                    &mut self.doc,
-                    Box::new(lc_scene::ReplaceDocumentCmd {
-                        label: "Import".into(),
-                        before,
-                        after,
-                    }),
-                );
-                self.selection.set(self.doc.scene.roots.first().copied());
-                self.sync_playback_to_document();
-                self.status = match report.summary() {
-                    Some(summary) => format!("Imported {} — {summary}", path.display()),
-                    None => format!("Imported {}", path.display()),
-                };
+                if let Some(summary) = report.summary() {
+                    self.pending_import = Some(PendingImport {
+                        path,
+                        doc,
+                        summary,
+                        replace_scene: false,
+                    });
+                    self.status = "Review the import report before importing".into();
+                    return;
+                }
+                self.finish_import(path, doc, None);
             }
             Err(e) => self.status = format!("Import failed: {e}"),
         }
         self.drain_scene_warnings();
+    }
+
+    fn finish_open(&mut self, path: PathBuf, doc: Document, summary: Option<String>) {
+        let name = path.display().to_string();
+        self.load_scene(doc, Some(path));
+        self.lifecycle.discard_recovery();
+        self.status = match summary {
+            Some(summary) => format!("Opened {name} — {summary}"),
+            None => format!("Opened {name}"),
+        };
+    }
+
+    fn finish_import(&mut self, path: PathBuf, doc: Document, summary: Option<String>) {
+        let before = self.doc.clone();
+        let after = doc;
+        self.history.execute(
+            &mut self.doc,
+            Box::new(lc_scene::ReplaceDocumentCmd {
+                label: "Import".into(),
+                before,
+                after,
+            }),
+        );
+        self.selection.set(self.doc.scene.roots.first().copied());
+        self.sync_playback_to_document();
+        self.status = match summary {
+            Some(summary) => format!("Imported {} — {summary}", path.display()),
+            None => format!("Imported {}", path.display()),
+        };
+    }
+
+    /// Accept the staged import the report dialog is describing.
+    pub(super) fn apply_pending_import(&mut self) {
+        let Some(pending) = self.pending_import.take() else {
+            return;
+        };
+        if pending.replace_scene {
+            self.finish_open(pending.path, pending.doc, Some(pending.summary));
+        } else {
+            self.finish_import(pending.path, pending.doc, Some(pending.summary));
+        }
+        self.drain_scene_warnings();
+    }
+
+    /// Drop the staged import and leave the current scene exactly as it was.
+    pub(super) fn cancel_pending_import(&mut self) {
+        if self.pending_import.take().is_some() {
+            self.status = "Import cancelled; the scene was left unchanged".into();
+        }
     }
 
     pub(super) fn save_file(&mut self, path: PathBuf) -> Result<Option<PendingAction>, ()> {

@@ -14,7 +14,11 @@ protocol and a deterministic headless CLI. The MCP server owns its own
 ## Entry points
 
 - `crates/lc-mcp/src/server.rs` — JSON-RPC loop, handshake/discovery, protocol
-  errors, resources, stdio framing.
+  errors, resources and subscriptions, prompt dispatch, stdio framing.
+- `crates/lc-mcp/src/http.rs` — opt-in Streamable HTTP transport on a loopback
+  endpoint, with the Server-Sent Events stream for resource updates and the
+  `Mcp-Session-Id` session rules (400 without the header, 404 for an unknown or
+  terminated id, `DELETE /mcp` to end a session, oldest session evicted at 64).
 - `crates/lc-mcp/src/tools.rs` — tool schemas, argument parsing and undoable
   edits.
 - `app/src/main.rs` — CLI parsing and GUI/headless/MCP dispatch.
@@ -40,7 +44,8 @@ protocol and a deterministic headless CLI. The MCP server owns its own
 - Keep the launcher cwd-independent and Bash-only. It builds a missing or stale
   binary, honors `LEOPARDCRAFT_MCP_BIN`, and does not write into the repository.
 - The engine remains offline; no telemetry, network or wall-clock dependence in
-  tool behavior.
+  tool behavior. The Streamable HTTP transport is opt-in, binds loopback only,
+  tracks `Mcp-Session-Id` sessions, and is never required by the stdio path.
 
 ## Interfaces and boundaries
 
@@ -76,9 +81,12 @@ same change. The integrator runs the full gate afterwards.
 ## TODO mapping
 
 Own `TODO.md` section 7 (MCP automation) and the MCP/CLI limitations in
-`README.md`. Attaching to a live editor, authoring modifiers/material graphs via
-tools, and HTTP transport remain separate tasks; coordinate contract needs with
-the owning lane before starting.
+`README.md`. Attaching to a live editor remains open, but its contract is
+decided and recorded in `TODO.md` §7: a loopback HTTP/JSON endpoint with a
+per-session token published in a `0600` registry, an Origin allow-list, one
+request at a time on the editor's UI thread, and attach augmenting rather than
+replacing the editor's document. Coordinate contract needs with the owning lane
+before starting.
 
 ## Handoff
 

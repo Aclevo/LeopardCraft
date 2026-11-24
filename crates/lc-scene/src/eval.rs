@@ -9,7 +9,7 @@ use crate::{
     RenderSettings, Tag,
 };
 use glam::{Mat4, Quat, Vec3};
-use lc_anim::{skin_positions_indexed, AnimProperty};
+use lc_anim::{skin_positions_indexed, AnimChannel, ChannelSamples, ChannelTarget};
 use lc_core::{look_at_quat, Aabb, StableHasher, Transform};
 use lc_geom::{Mesh, Spline};
 use lc_shading::MaterialId;
@@ -164,11 +164,43 @@ pub(crate) fn normalized_clamp_bounds(min: Vec3, max: Vec3) -> (Vec3, Vec3) {
     (low, high)
 }
 
+/// Unit direction that stays finite for very large components, unlike a bare
+/// `normalize` on hand-edited data.
+fn unit_axis(v: Vec3) -> Option<Vec3> {
+    if !v.is_finite() {
+        return None;
+    }
+    let scale = v.abs().max_element();
+    if scale <= 1e-6 {
+        return None;
+    }
+    Some((v / scale).normalize())
+}
+
 impl Document {
     pub fn evaluate(&self, time: f32) -> EvaluatedScene {
         let time = if time.is_finite() { time.max(0.0) } else { 0.0 };
         let order = self.scene.depth_first();
         let mut locals: BTreeMap<NodeId, Transform> = BTreeMap::new();
+
+        // 0. Sample every animated channel once per frame into a scratch buffer.
+        // The constraint passes and the geometry stage then read these values
+        // instead of re-querying curves component by component.
+        let mut node_samples: BTreeMap<NodeId, ChannelSamples> = BTreeMap::new();
+        let mut tag_samples: BTreeMap<(NodeId, u32), ChannelSamples> = BTreeMap::new();
+        for id in &order {
+            let Some(node) = self.scene.get(*id) else {
+                continue;
+            };
+            if !node.animation.is_empty() {
+                node_samples.insert(*id, node.animation.sample_channels(time));
+            }
+            for (index, _) in node.tags.iter().enumerate() {
+                if let Some(clip) = node.tag_animations.get(&(index as u32)) {
+                    tag_samples.insert((*id, index as u32), clip.sample_channels(time));
+                }
+            }
+        }
 
         // 1. Animated local transforms, with authored joint limits applied to
         // both direct animation and the rest pose before any solver runs.
@@ -176,7 +208,12 @@ impl Document {
             let Some(node) = self.scene.get(*id) else {
                 continue;
             };
-            let mut local = node.animation.apply_transform(node.transform, time);
+            let mut local = match node_samples.get(id) {
+                Some(samples) => {
+                    samples.apply_transform(node.transform, ChannelTarget::Object { id: *id })
+                }
+                None => node.transform,
+            };
             let _ = crate::ik::clamp_joint_local(&self.scene, *id, &mut local);
             locals.insert(*id, local);
         }
@@ -199,6 +236,10 @@ impl Document {
         // rebuilds every world matrix from the updated local rotations, so the
         // geometry and skinning stages see the solved pose.
         let _ = crate::ik::solve_ik_chains(&self.scene, &mut locals, &worlds);
+        // Blending constraints measure their weight against the pose the solver
+        // produced, so the second ordering pass reproduces the first result
+        // instead of compounding a partial weight toward the target.
+        let solver_pose = locals.clone();
         for _pass in 0..2 {
             for id in &order {
                 let Some(node) = self.scene.get(*id) else {
@@ -209,6 +250,7 @@ impl Document {
                     .and_then(|p| worlds.get(&p).copied())
                     .unwrap_or(Mat4::IDENTITY);
                 let mut local = locals.get(id).copied().unwrap_or(node.transform);
+                let base_local = solver_pose.get(id).copied().unwrap_or(node.transform);
                 for (tag_index, tag) in node.tags.iter().enumerate() {
                     match tag {
                         Tag::LookAt { target, up } => {
@@ -240,19 +282,101 @@ impl Document {
                                     source_world.transform_point3(Vec3::ZERO) + *offset;
                                 let local_target =
                                     parent_world.inverse().transform_point3(target_world);
-                                let weight = node
-                                    .tag_animations
-                                    .get(&(tag_index as u32))
-                                    .and_then(|clip| {
-                                        clip.sample(AnimProperty::CopyLocationWeight, time)
+                                let weight = tag_samples
+                                    .get(&(*id, tag_index as u32))
+                                    .and_then(|samples| {
+                                        samples.scalar_for(
+                                            ChannelTarget::Tag {
+                                                node: *id,
+                                                index: tag_index as u32,
+                                            },
+                                            AnimChannel::CopyLocationWeight,
+                                            0,
+                                        )
                                     })
                                     .or_else(|| {
-                                        node.animation
-                                            .sample(AnimProperty::CopyLocationWeight, time)
+                                        node_samples.get(id).and_then(|samples| {
+                                            samples.scalar_for(
+                                                ChannelTarget::Object { id: *id },
+                                                AnimChannel::CopyLocationWeight,
+                                                0,
+                                            )
+                                        })
                                     })
                                     .unwrap_or(*weight);
                                 local.translation =
                                     local.translation.lerp(local_target, weight.clamp(0.0, 1.0));
+                            }
+                        }
+                        Tag::IkPoint { target, weight } => {
+                            if let Some(target_world) = worlds.get(target) {
+                                let weight = weight.clamp(0.0, 1.0);
+                                let current =
+                                    (parent_world * base_local.matrix()).w_axis.truncate();
+                                let desired = current.lerp(target_world.w_axis.truncate(), weight);
+                                let local_target = parent_world.inverse().transform_point3(desired);
+                                if local_target.is_finite() {
+                                    local.translation = local_target;
+                                }
+                            }
+                        }
+                        Tag::IkAngle {
+                            target,
+                            max_degrees,
+                        } => {
+                            if let Some(target_world) = worlds.get(target) {
+                                let owner_world = parent_world * base_local.matrix();
+                                let position = owner_world.w_axis.truncate();
+                                let to_target = target_world.w_axis.truncate() - position;
+                                let aim = world_rotation(owner_world) * Vec3::X;
+                                let (Some(aim), Some(to_target)) =
+                                    (unit_axis(aim), unit_axis(to_target))
+                                else {
+                                    continue;
+                                };
+                                let limit = max_degrees.clamp(0.0, 180.0).to_radians();
+                                let angle = aim.angle_between(to_target);
+                                if angle.is_finite() && angle > limit + 1e-6 {
+                                    // Rotate the aim back toward the target by the
+                                    // excess, about the axis the aim has to travel.
+                                    let excess = angle - limit;
+                                    if let Some(axis) = unit_axis(aim.cross(to_target)) {
+                                        let correction = Quat::from_axis_angle(axis, excess);
+                                        let desired = correction * world_rotation(owner_world);
+                                        let parent_rot = world_rotation(parent_world);
+                                        local.rotation =
+                                            (parent_rot.inverse() * desired).normalize();
+                                    }
+                                }
+                            }
+                        }
+                        Tag::Orient { target, weight } => {
+                            if let Some(target_world) = worlds.get(target) {
+                                let owner_world = parent_world * base_local.matrix();
+                                let weight = weight.clamp(0.0, 1.0);
+                                let desired = world_rotation(owner_world)
+                                    .slerp(world_rotation(*target_world), weight);
+                                let parent_rot = world_rotation(parent_world);
+                                local.rotation = (parent_rot.inverse() * desired).normalize();
+                            }
+                        }
+                        Tag::Parent { target, weight } => {
+                            if let Some(target_world) = worlds.get(target) {
+                                let weight = weight.clamp(0.0, 1.0);
+                                let owner_world = parent_world * base_local.matrix();
+                                let current_position = owner_world.w_axis.truncate();
+                                let desired_position =
+                                    current_position.lerp(target_world.w_axis.truncate(), weight);
+                                let local_position =
+                                    parent_world.inverse().transform_point3(desired_position);
+                                if local_position.is_finite() {
+                                    local.translation = local_position;
+                                }
+                                let desired_rotation = world_rotation(owner_world)
+                                    .slerp(world_rotation(*target_world), weight);
+                                let parent_rot = world_rotation(parent_world);
+                                local.rotation =
+                                    (parent_rot.inverse() * desired_rotation).normalize();
                             }
                         }
                         _ => {}
@@ -347,9 +471,15 @@ impl Document {
                 },
                 NodeKind::Camera { camera } => {
                     let mut cam = camera.clone();
-                    cam.fov_y_deg = node
-                        .animation
-                        .sample(AnimProperty::Fov, time)
+                    cam.fov_y_deg = node_samples
+                        .get(id)
+                        .and_then(|samples| {
+                            samples.scalar_for(
+                                ChannelTarget::Object { id: *id },
+                                AnimChannel::Fov,
+                                0,
+                            )
+                        })
                         .unwrap_or(cam.fov_y_deg)
                         .clamp(1.0, 179.0);
                     let evaluated = EvaluatedCamera {
@@ -367,23 +497,22 @@ impl Document {
                 }
                 NodeKind::Light { light } => {
                     let mut l = light.clone();
-                    l.intensity = node
-                        .animation
-                        .sample(AnimProperty::LightIntensity, time)
-                        .unwrap_or(l.intensity)
-                        .max(0.0);
-                    l.color = Vec3::new(
-                        node.animation
-                            .sample(AnimProperty::LightColorR, time)
-                            .unwrap_or(l.color.x),
-                        node.animation
-                            .sample(AnimProperty::LightColorG, time)
-                            .unwrap_or(l.color.y),
-                        node.animation
-                            .sample(AnimProperty::LightColorB, time)
-                            .unwrap_or(l.color.z),
-                    )
-                    .max(Vec3::ZERO);
+                    let target = ChannelTarget::Object { id: *id };
+                    if let Some(samples) = node_samples.get(id) {
+                        l.intensity = samples
+                            .scalar_for(target, AnimChannel::LightIntensity, 0)
+                            .unwrap_or(l.intensity)
+                            .max(0.0);
+                        let mut color = l.color;
+                        for (axis, component) in [0u8, 1, 2].into_iter().enumerate() {
+                            if let Some(value) =
+                                samples.scalar_for(target, AnimChannel::LightColor, component)
+                            {
+                                color[axis] = value;
+                            }
+                        }
+                        l.color = color.max(Vec3::ZERO);
+                    }
                     if visible && self.settings.layer_visible(node.layer) {
                         lights.push(EvaluatedLight {
                             node: *id,
@@ -509,23 +638,27 @@ impl Document {
                 };
                 &repaired
             };
-            let operand_mesh = if let Modifier::Boolean { operand, .. } = modifier {
-                if *operand != id {
+            // Boolean and Wrap take a second mesh; it is evaluated and moved into
+            // the target's local space so both modifiers can treat it as a plain
+            // mesh input. A modifier that names itself has no operand.
+            let operand_id = match modifier {
+                Modifier::Boolean { operand, .. } => Some(*operand),
+                Modifier::Wrap { target, .. } => Some(*target),
+                _ => None,
+            };
+            let operand_mesh = operand_id
+                .filter(|operand| *operand != id)
+                .and_then(|operand| {
                     let other =
-                        self.evaluate_geometry_recursive(*operand, time, worlds, cache, visiting);
+                        self.evaluate_geometry_recursive(operand, time, worlds, cache, visiting);
                     other.mesh.map(|mut m| {
                         let target_world = worlds.get(&id).copied().unwrap_or(Mat4::IDENTITY);
-                        let source_world = worlds.get(operand).copied().unwrap_or(Mat4::IDENTITY);
+                        let source_world = worlds.get(&operand).copied().unwrap_or(Mat4::IDENTITY);
                         let relative = target_world.inverse() * source_world;
                         m.transform(relative);
                         m
                     })
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+                });
             let input = ModifierInput {
                 mesh: mesh.as_ref(),
                 spline: spline.as_ref(),
@@ -614,6 +747,69 @@ mod tests {
     use lc_anim::{AnimationClip, Interpolation};
 
     #[test]
+    fn wrap_modifier_uses_its_target_and_ignores_a_self_target() {
+        let mut doc = Document::empty();
+        let source = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::from_primitive(Primitive::Box {
+                    width: 4.0,
+                    height: 0.6,
+                    depth: 0.6,
+                }),
+            },
+            "Wrap Source",
+            None,
+        );
+        let target = doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::from_primitive(Primitive::Box {
+                    width: 1.0,
+                    height: 1.0,
+                    depth: 1.0,
+                }),
+            },
+            "Wrap Target",
+            None,
+        );
+        doc.scene.get_mut(target).unwrap().transform.translation = Vec3::new(3.0, 0.0, 0.0);
+        let rest = match &doc.scene.get(source).unwrap().kind {
+            NodeKind::Mesh { geometry } => geometry.build(),
+            _ => unreachable!("the wrap source is a mesh"),
+        };
+        doc.scene
+            .get_mut(source)
+            .unwrap()
+            .modifiers
+            .push(Modifier::Wrap {
+                target,
+                angle_deg: 120.0,
+                axis: 0,
+            });
+        let wrapped = doc.evaluate(0.0);
+        let mesh = wrapped.node(source).unwrap().mesh().unwrap();
+        assert!(mesh.validate().is_ok());
+        assert!(mesh.positions.iter().all(|point| point.is_finite()));
+        assert!(mesh
+            .positions
+            .iter()
+            .zip(&rest.positions)
+            .any(|(wrapped, rest)| (*wrapped - *rest).length() > 1e-3));
+
+        // A Wrap that names its own object has no operand, so it leaves the mesh
+        // alone instead of recursing into its own evaluation.
+        doc.scene.get_mut(source).unwrap().modifiers = vec![Modifier::Wrap {
+            target: source,
+            angle_deg: 120.0,
+            axis: 0,
+        }];
+        let self_target = doc.evaluate(0.0);
+        assert_eq!(
+            self_target.node(source).unwrap().mesh().unwrap().positions,
+            rest.positions
+        );
+    }
+
+    #[test]
     fn demo_evaluates_to_renderable_scene() {
         let doc = Document::demo();
         let scene = doc.evaluate(0.0);
@@ -682,18 +878,12 @@ mod tests {
                 weight: 0.0,
             });
             node.animation = AnimationClip::default();
-            node.animation.set_key(
-                AnimProperty::CopyLocationWeight,
-                0.0,
-                0.0,
-                Interpolation::Linear,
-            );
-            node.animation.set_key(
-                AnimProperty::CopyLocationWeight,
-                1.0,
-                1.0,
-                Interpolation::Linear,
-            );
+            let weight_address =
+                lc_anim::ChannelAddress::owner(AnimChannel::CopyLocationWeight, 0).unwrap();
+            node.animation
+                .set_key(weight_address, 0.0, 0.0, Interpolation::Linear);
+            node.animation
+                .set_key(weight_address, 1.0, 1.0, Interpolation::Linear);
         }
         let scene0 = doc.evaluate(0.0);
         let scene1 = doc.evaluate(1.0);
@@ -1122,7 +1312,7 @@ mod tests {
         doc.scene.get_mut(mesh_id).unwrap().skin = Some(skin);
         doc.scene.get_mut(joint).unwrap().transform.translation.y = 2.0;
         doc.scene.get_mut(joint).unwrap().animation.set_key(
-            AnimProperty::TranslationY,
+            lc_anim::ChannelAddress::owner(AnimChannel::Translation, 1).unwrap(),
             0.0,
             2.0,
             Interpolation::Linear,

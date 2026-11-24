@@ -14,8 +14,8 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use glam::{Mat4, Quat, Vec2 as V2, Vec3};
 use lc_anim::{
-    AnimChannel, AnimProperty, AnimationClip, ChannelAppliesTo, ChannelKind, Interpolation,
-    Playback, TangentType,
+    AnimChannel, AnimationClip, ChannelAddress, ChannelAppliesTo, ChannelKind, ChannelTarget,
+    Interpolation, Playback, TangentType,
 };
 use lc_core::{look_at_quat, ray_triangle, Pcg32, Transform};
 use lc_geom::Mesh;
@@ -26,7 +26,7 @@ use lc_scene::{
     Node, NodeId, NodeKind, NodeProps, Primitive, ProjectionMode, ProximityWeightOptions,
     RenameNodeCmd, ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetAnimationsCmd,
     SetMaterialCmd, SetMorphCmd, SetNodePropsCmd, SetNodesPropsCmd, SetShapeCmd, SetShapesCmd,
-    SetTagAnimationCmd, SetTransformsCmd, Shape, Skin, Tag,
+    SetTagAnimationCmd, SetTakesCmd, SetTransformsCmd, Shape, Skin, Tag,
 };
 use lc_shading::{Material, MaterialId, ShaderNodeKind, ShaderValue, TextureCache};
 use serde::{Deserialize, Serialize};
@@ -204,9 +204,22 @@ pub enum InspectorTab {
 pub enum BrowserTab {
     #[default]
     Objects,
+    Morphs,
     Takes,
     Layers,
     Console,
+}
+
+/// One row in the scene-wide Morphs browser tab. The target index points into
+/// its owner's `MorphSet`, so the tab never copies morph state.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct MorphBrowserRow {
+    pub(super) object: NodeId,
+    pub(super) object_name: String,
+    pub(super) target: usize,
+    pub(super) target_name: String,
+    pub(super) weight: f32,
+    pub(super) active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,12 +343,16 @@ enum MeshAction {
     PointSlide,
     Bridge,
     ToggleCrease,
+    SetCreaseWeight,
+    Subdivide,
+    Clone,
     ToggleSeam,
     TogglePinnedUv,
     FillHole,
     Split,
     Shell,
     Triangulate,
+    Scalpel,
     FlipNormal,
     Disconnect,
     Cover,
@@ -347,6 +364,7 @@ enum MeshAction {
 pub(super) enum MorphAction {
     RecordBase,
     Capture,
+    UpdateBase,
     Restore,
     Remove(usize),
 }
@@ -375,6 +393,8 @@ impl Default for OrbitCamera {
 const WORKSPACE_STORAGE_KEY: &str = "leopardcraft.workspace.v1";
 /// Recovery snapshots are written at most this often while the scene is dirty.
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Upper bound for the playback range, matching the timeline's frame fields.
+const MAX_PLAYBACK_FRAME: f32 = 100_000.0;
 
 /// Layout and view choices that should return when the editor is reopened.
 /// Scene contents themselves remain in the user's `.lcscene` file.
@@ -506,6 +526,16 @@ struct FileDialog {
     path: String,
 }
 
+/// A glTF import that produced a skipped-data report. The parsed document is
+/// held until the user confirms, so the live scene is untouched while the
+/// report is on screen.
+pub(super) struct PendingImport {
+    path: PathBuf,
+    doc: Document,
+    summary: String,
+    replace_scene: bool,
+}
+
 struct RenderResult {
     width: u32,
     height: u32,
@@ -599,7 +629,7 @@ const KEY_TIME_EPSILON: f32 = 1e-3;
 /// Which kind of channel track a curve key belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CurveTrackId {
-    Scalar(AnimProperty),
+    Scalar(ChannelAddress),
     Rotation,
     MorphWeight(u32),
 }
@@ -617,8 +647,38 @@ pub(super) enum AnimTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CurveRow {
     pub(super) channel: AnimChannel,
-    pub(super) property: Option<AnimProperty>,
+    pub(super) address: Option<ChannelAddress>,
     pub(super) morph_target: Option<u32>,
+}
+
+/// One target's channels in the grouped F-curve row list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CurveRowGroup {
+    pub(super) target: AnimTarget,
+    pub(super) label: String,
+    pub(super) rows: Vec<CurveRow>,
+}
+
+/// Which registry rows and curves the F-curve list shows. `Selected` keeps
+/// only channels that own a selected key; `Transform` keeps Location, Rotation
+/// and Scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CurveFilter {
+    All,
+    Selected,
+    Transform,
+}
+
+impl CurveFilter {
+    pub(super) const ALL: [Self; 3] = [Self::All, Self::Selected, Self::Transform];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::All => "All channels",
+            Self::Selected => "Selected keys",
+            Self::Transform => "Transforms only",
+        }
+    }
 }
 
 /// A single F-curve key identified by its target, track and time.
@@ -711,6 +771,58 @@ pub(super) struct CurveClipboard {
     keys: Vec<CurveClipboardKey>,
 }
 
+/// UV view state: multi-point selection, the active UV set, chart tool values
+/// and the checker/distortion overlays. None of this is document state or an
+/// undo entry; only the UV edits themselves go through the history.
+#[derive(Clone, Debug)]
+pub(super) struct UvEditorState {
+    pub selection: BTreeSet<u32>,
+    pub set: usize,
+    pub checker: bool,
+    pub distortion: bool,
+    pub pack_padding: f32,
+    pub pack_rotate: bool,
+    pub pack_align: lc_geom::UvPackAlign,
+    pub chart_move: V2,
+    pub chart_rotate: f32,
+    pub chart_scale: f32,
+    pub numeric: V2,
+}
+
+impl Default for UvEditorState {
+    fn default() -> Self {
+        Self {
+            selection: BTreeSet::new(),
+            set: 0,
+            checker: true,
+            distortion: false,
+            pack_padding: 0.01,
+            pack_rotate: false,
+            pack_align: lc_geom::UvPackAlign::BottomLeft,
+            chart_move: V2::ZERO,
+            chart_rotate: 0.0,
+            chart_scale: 1.0,
+            numeric: V2::ZERO,
+        }
+    }
+}
+
+/// UV edits that work on the active set's slots. Weld and Split change the
+/// shared slot topology, so they affect every set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UvSlotOp {
+    Weld,
+    Split,
+    AlignU,
+    AlignV,
+    DistributeU,
+    DistributeV,
+    FlipU,
+    FlipV,
+    Rotate90,
+    Numeric,
+}
+
 pub struct LeopardApp {
     doc: Document,
     history: History,
@@ -726,18 +838,26 @@ pub struct LeopardApp {
     selected_material: Option<MaterialId>,
     selected_shader_node: Option<u32>,
     selected_uv: Option<usize>,
+    uv_editor: UvEditorState,
     /// Explicit F-curve target. `None` follows the primary object.
     anim_target: Option<AnimTarget>,
     /// Selected F-curve keys, on whichever target owns them.
     selected_keys: Vec<SelectedKey>,
     /// Shared numeric factor used by selected-key and whole-take retiming.
     retime_factor: f32,
+    /// Text buffers for the document Takes tab. They are committed by an
+    /// explicit button so each rename/fps edit is exactly one undo step.
+    take_name_buffer: String,
+    take_fps_buffer: f32,
+    take_editor_index: Option<usize>,
     curve_key_drag: Option<CurveKeyDrag>,
     curve_tangent_drag: Option<CurveTangentDrag>,
     curve_box_select: Option<CurveBoxSelect>,
     curve_clipboard: CurveClipboard,
     /// Registry row selected in the F-curve list, for keying.
     selected_curve_channel: Option<(AnimTarget, CurveRow)>,
+    /// View filter for the F-curve row list, drawn curves and key picking.
+    curve_filter: CurveFilter,
     /// A native clipboard paste was handled and its V-key release still needs
     /// to be swallowed so the same chord is not pasted twice.
     native_paste_pending: bool,
@@ -751,6 +871,7 @@ pub struct LeopardApp {
     viewport: ViewportRenderer,
     texture_cache: TextureCache,
     dialog: Option<FileDialog>,
+    pending_import: Option<PendingImport>,
     lifecycle: DocumentLifecycle,
     allow_close: bool,
     status: String,
@@ -774,6 +895,19 @@ pub struct LeopardApp {
     box_select: Option<BoxSelect>,
     mesh_edit: bool,
     mesh_select_mode: MeshSelectMode,
+    triangulate_mode: lc_geom::TriangulateMode,
+    mesh_crease_weight: f32,
+    mesh_clone: lc_geom::CloneOptions,
+    /// Click a point on an open border to fill that hole, like the manual's
+    /// Fill Hole tool. The selection-driven command remains available too.
+    fill_hole_tool: bool,
+    /// Click a point or edge to cut, like the manual's Scalpel tool: the second
+    /// click splits the polygon holding both picks, and that cut's end point
+    /// becomes the next start until ESC resets it.
+    scalpel_tool: bool,
+    scalpel_start: Option<lc_geom::ScalpelPick>,
+    mesh_subdivide_levels: u32,
+    mesh_subdivide_scheme: lc_geom::SubdivisionKind,
     mesh_selected: Vec<u32>,
     /// Component selection for every mesh taking part in a multi-mesh edit.
     /// `mesh_selected` remains the primary mesh's selection for the viewport
@@ -814,6 +948,12 @@ pub struct LeopardApp {
     /// Visible, renderable and locked flags reflected by each browser row.
     #[cfg(test)]
     object_row_flags: Vec<(NodeId, bool, bool, bool)>,
+    /// Target-row rectangles from the last Morphs browser frame.
+    #[cfg(test)]
+    morph_row_rects: Vec<(NodeId, usize, Rect)>,
+    /// Take-row rectangles from the last Takes browser frame.
+    #[cfg(test)]
+    take_row_rects: Vec<(usize, Rect)>,
 }
 
 impl LeopardApp {
@@ -840,14 +980,22 @@ impl LeopardApp {
             selected_material: Some(0),
             selected_shader_node: None,
             selected_uv: None,
+            uv_editor: UvEditorState::default(),
             anim_target: None,
             selected_keys: Vec::new(),
             retime_factor: 1.0,
+            take_name_buffer: doc
+                .active_take()
+                .map(|t| t.name.clone())
+                .unwrap_or_default(),
+            take_fps_buffer: doc.active_take_fps(),
+            take_editor_index: Some(doc.active_take),
             curve_key_drag: None,
             curve_tangent_drag: None,
             curve_box_select: None,
             curve_clipboard: CurveClipboard::default(),
             selected_curve_channel: None,
+            curve_filter: CurveFilter::All,
             native_paste_pending: false,
             doc,
             history: History::new(200),
@@ -868,6 +1016,7 @@ impl LeopardApp {
             viewport: ViewportRenderer::new(cc.wgpu_render_state.clone()),
             texture_cache: TextureCache::default(),
             dialog: None,
+            pending_import: None,
             lifecycle,
             allow_close: false,
             status: "Ready — demo studio loaded".into(),
@@ -891,6 +1040,14 @@ impl LeopardApp {
             box_select: None,
             mesh_edit: false,
             mesh_select_mode: MeshSelectMode::Polygons,
+            triangulate_mode: lc_geom::TriangulateMode::default(),
+            mesh_crease_weight: 1.0,
+            mesh_clone: lc_geom::CloneOptions::default(),
+            fill_hole_tool: false,
+            scalpel_tool: false,
+            scalpel_start: None,
+            mesh_subdivide_levels: 1,
+            mesh_subdivide_scheme: lc_geom::SubdivisionKind::default(),
             mesh_selected: Vec::new(),
             mesh_components: BTreeMap::new(),
             mesh_transform: MeshTransformMode::Move,
@@ -924,6 +1081,10 @@ impl LeopardApp {
             object_row_icons: Vec::new(),
             #[cfg(test)]
             object_row_flags: Vec::new(),
+            #[cfg(test)]
+            morph_row_rects: Vec::new(),
+            #[cfg(test)]
+            take_row_rects: Vec::new(),
         };
         if let Some(storage) = cc.storage {
             if let Some(state) = eframe::get_value::<WorkspaceState>(storage, WORKSPACE_STORAGE_KEY)
@@ -1028,10 +1189,193 @@ impl LeopardApp {
     /// Adopt the loaded document's frame range. Documents store frames and
     /// fps; the playback clock runs in seconds, so both bounds are divided.
     fn sync_playback_to_document(&mut self) {
-        self.playback.fps = self.doc.settings.fps.max(1.0);
+        self.playback.fps = self.doc.active_take_fps();
         self.playback.start = self.doc.settings.frame_start / self.playback.fps;
         self.playback.end = self.doc.settings.frame_end / self.playback.fps;
         self.playback.time = self.playback.start;
+        self.normalize_playback();
+    }
+
+    fn sync_take_editor(&mut self) {
+        let index = self.doc.active_take;
+        self.take_name_buffer = self
+            .doc
+            .active_take()
+            .map(|take| take.name.clone())
+            .unwrap_or_default();
+        self.take_fps_buffer = self.doc.active_take_fps();
+        self.take_editor_index = Some(index);
+    }
+
+    /// Drop key selections whose clips were replaced by a take operation.
+    fn clear_take_dependent_edits(&mut self) {
+        self.selected_keys.clear();
+        self.curve_key_drag = None;
+        self.curve_tangent_drag = None;
+        self.curve_box_select = None;
+    }
+
+    fn run_take_edit(&mut self, label: &str, edit: impl FnOnce(&mut Document) -> bool) -> bool {
+        let before = self.doc.take_state();
+        if !edit(&mut self.doc) {
+            self.sync_take_editor();
+            return false;
+        }
+        let after = self.doc.take_state();
+        self.history.execute(
+            &mut self.doc,
+            Box::new(SetTakesCmd {
+                label: label.into(),
+                before,
+                after,
+            }),
+        );
+        self.sync_playback_to_document();
+        self.sync_take_editor();
+        self.clear_take_dependent_edits();
+        self.invalidate_pending();
+        true
+    }
+
+    pub(super) fn create_take(&mut self) -> bool {
+        if !self.run_take_edit("New Take", |doc| {
+            doc.create_take("Take");
+            true
+        }) {
+            return false;
+        }
+        self.status = format!("Created {}", self.take_name_buffer);
+        true
+    }
+
+    pub(super) fn duplicate_take(&mut self) -> bool {
+        if !self.run_take_edit("Duplicate Take", |doc| {
+            doc.duplicate_active_take();
+            true
+        }) {
+            return false;
+        }
+        self.status = format!("Duplicated take as {}", self.take_name_buffer);
+        true
+    }
+
+    pub(super) fn delete_active_take(&mut self) -> bool {
+        let index = self.doc.active_take;
+        if !self.run_take_edit("Delete Take", |doc| doc.delete_take(index)) {
+            return false;
+        }
+        self.status = format!("Deleted take; active is {}", self.take_name_buffer);
+        true
+    }
+
+    pub(super) fn activate_take(&mut self, index: usize) -> bool {
+        if !self.run_take_edit("Activate Take", |doc| doc.activate_take(index)) {
+            return false;
+        }
+        self.status = format!("Activated {}", self.take_name_buffer);
+        true
+    }
+
+    pub(super) fn rename_active_take(&mut self, name: String) -> bool {
+        let index = self.doc.active_take;
+        if !self.run_take_edit("Rename Take", |doc| doc.rename_take(index, &name)) {
+            self.status = "Take names must be unique and non-empty".into();
+            return false;
+        }
+        self.status = format!("Renamed take to {}", self.take_name_buffer);
+        true
+    }
+
+    pub(super) fn set_active_take_fps(&mut self, fps: f32) -> bool {
+        let index = self.doc.active_take;
+        if !self.run_take_edit("Take FPS", |doc| doc.set_take_fps(index, fps)) {
+            self.status = if fps.is_finite() {
+                "Take fps is unchanged".into()
+            } else {
+                "Take fps must be a finite number".into()
+            };
+            return false;
+        }
+        self.status = format!("Take fps set to {}", self.playback.fps);
+        true
+    }
+
+    /// Keep playback bounds finite, ordered and inside the timeline's frame
+    /// limit. Playback is view state, so this never touches the document or
+    /// history.
+    fn normalize_playback(&mut self) {
+        let fps = if self.playback.fps.is_finite() {
+            self.playback.fps.clamp(1.0, 240.0)
+        } else {
+            24.0
+        };
+        self.playback.fps = fps;
+        let max = MAX_PLAYBACK_FRAME / fps;
+        if !self.playback.start.is_finite() {
+            self.playback.start = 0.0;
+        }
+        if !self.playback.end.is_finite() {
+            self.playback.end = self.playback.start;
+        }
+        self.playback.start = self.playback.start.clamp(0.0, max);
+        self.playback.end = self.playback.end.clamp(self.playback.start, max);
+        if !self.playback.time.is_finite() {
+            self.playback.time = self.playback.start;
+        }
+        self.playback.time = self
+            .playback
+            .time
+            .clamp(self.playback.start, self.playback.end);
+    }
+
+    pub(super) fn set_playback_start(&mut self, start: f32) -> bool {
+        if !start.is_finite() {
+            return false;
+        }
+        self.normalize_playback();
+        let start = start.clamp(0.0, self.playback.end);
+        if (start - self.playback.start).abs() <= 1e-6 {
+            return false;
+        }
+        self.playback.start = start;
+        self.playback.time = self.playback.time.clamp(start, self.playback.end);
+        true
+    }
+
+    pub(super) fn set_playback_end(&mut self, end: f32) -> bool {
+        if !end.is_finite() {
+            return false;
+        }
+        self.normalize_playback();
+        let max = MAX_PLAYBACK_FRAME / self.playback.fps;
+        let end = end.clamp(self.playback.start, max);
+        if (end - self.playback.end).abs() <= 1e-6 {
+            return false;
+        }
+        self.playback.end = end;
+        self.playback.time = self.playback.time.clamp(self.playback.start, end);
+        true
+    }
+
+    pub(super) fn set_playback_looping(&mut self, looping: bool) -> bool {
+        if self.playback.looping == looping {
+            return false;
+        }
+        self.playback.looping = looping;
+        true
+    }
+
+    pub(super) fn set_playback_fps(&mut self, fps: f32) -> bool {
+        if !fps.is_finite() {
+            return false;
+        }
+        let fps = fps.clamp(1.0, 240.0);
+        if (fps - self.playback.fps).abs() <= 1e-6 {
+            return false;
+        }
+        self.playback.fps = fps;
+        self.normalize_playback();
+        true
     }
 
     pub fn load_scene(&mut self, doc: Document, path: Option<PathBuf>) {
@@ -1040,6 +1384,7 @@ impl LeopardApp {
         }
         self.doc = doc;
         self.sync_playback_to_document();
+        self.sync_take_editor();
         let initial = self.doc.scene.find_by_name("Cube").or_else(|| {
             self.doc.scene.depth_first().into_iter().find(|id| {
                 self.doc
@@ -1121,6 +1466,11 @@ impl LeopardApp {
 
     fn undo(&mut self) {
         if let Some(label) = self.history.undo(&mut self.doc) {
+            let take_changed = self
+                .history
+                .redo_top()
+                .and_then(|command| command.as_any())
+                .is_some_and(|state| state.downcast_ref::<SetTakesCmd>().is_some());
             let restored = self
                 .history
                 .redo_top()
@@ -1130,6 +1480,11 @@ impl LeopardApp {
             if let Some((target, selection)) = restored {
                 self.restore_paste_state(target, selection);
             }
+            if take_changed {
+                self.sync_playback_to_document();
+                self.sync_take_editor();
+                self.clear_take_dependent_edits();
+            }
             self.status = format!("Undo: {label}");
             self.selection.retain_existing(&self.doc.scene);
             self.invalidate_pending();
@@ -1138,6 +1493,11 @@ impl LeopardApp {
 
     fn redo(&mut self) {
         if let Some(label) = self.history.redo(&mut self.doc) {
+            let take_changed = self
+                .history
+                .undo_top()
+                .and_then(|command| command.as_any())
+                .is_some_and(|state| state.downcast_ref::<SetTakesCmd>().is_some());
             let restored = self
                 .history
                 .undo_top()
@@ -1146,6 +1506,11 @@ impl LeopardApp {
                 .map(|paste| (paste.target, paste.after_selection.clone()));
             if let Some((target, selection)) = restored {
                 self.restore_paste_state(target, selection);
+            }
+            if take_changed {
+                self.sync_playback_to_document();
+                self.sync_take_editor();
+                self.clear_take_dependent_edits();
             }
             self.status = format!("Redo: {label}");
             self.selection.retain_existing(&self.doc.scene);
@@ -1186,6 +1551,10 @@ impl LeopardApp {
         self.pending_shape = None;
         self.pending_material = None;
         self.gizmo_drag = None;
+        // A pending Scalpel cut names points of the current topology, so undo,
+        // redo and a replaced document must drop it rather than leave a start
+        // the mesh no longer has.
+        self.scalpel_start = None;
     }
 
     fn commit_pending(&mut self) {
@@ -1270,6 +1639,7 @@ impl eframe::App for LeopardApp {
         self.shell(root);
 
         self.show_file_dialog(&ctx);
+        self.show_import_report_dialog(&ctx);
         self.show_recovery_dialog(&ctx);
         self.show_guard_dialog(&ctx);
         self.show_about(&ctx);
@@ -1568,6 +1938,146 @@ fn selected_valid_points(mesh: &Mesh, selected: &[u32]) -> Vec<u32> {
     unique.sort_unstable();
     unique.dedup();
     unique
+}
+
+/// Resolve the component selection into one Scalpel cut: two edges or two
+/// points that share a polygon, with edge picks cutting at their midpoints.
+/// Mesh Editing's predicate and handler both use this so enablement and the
+/// action cannot disagree.
+fn scalpel_cut(
+    mesh: &Mesh,
+    mode: MeshSelectMode,
+    selected: &[u32],
+) -> Result<(u32, lc_geom::ScalpelPick, lc_geom::ScalpelPick), String> {
+    let on_face = |face: &lc_geom::Polygon, a: u32, b: u32| {
+        let count = face.corners.len();
+        (0..count).any(|index| {
+            let start = face.corners[index].point;
+            let end = face.corners[(index + 1) % count].point;
+            (start == a && end == b) || (start == b && end == a)
+        })
+    };
+    match mode {
+        MeshSelectMode::Edges => {
+            let edges = mesh.edges();
+            let mut picks: Vec<(u32, u32)> = Vec::new();
+            for index in selected {
+                let Some(edge) = edges.get(*index as usize) else {
+                    return Err("select two edges of one polygon".into());
+                };
+                if edge.a == edge.b {
+                    return Err("an edge needs two different points".into());
+                }
+                picks.push((edge.a.min(edge.b), edge.a.max(edge.b)));
+            }
+            picks.sort_unstable();
+            picks.dedup();
+            if picks.len() != 2 {
+                return Err("select exactly two edges of the same polygon".into());
+            }
+            let face = (0..mesh.polygons.len())
+                .find(|face| {
+                    on_face(&mesh.polygons[*face], picks[0].0, picks[0].1)
+                        && on_face(&mesh.polygons[*face], picks[1].0, picks[1].1)
+                })
+                .ok_or_else(|| "the two edges must belong to the same polygon".to_string())?;
+            Ok((
+                face as u32,
+                lc_geom::ScalpelPick::Edge {
+                    a: picks[0].0,
+                    b: picks[0].1,
+                    t: 0.5,
+                },
+                lc_geom::ScalpelPick::Edge {
+                    a: picks[1].0,
+                    b: picks[1].1,
+                    t: 0.5,
+                },
+            ))
+        }
+        MeshSelectMode::Points => {
+            let points = selected_valid_points(mesh, selected);
+            if points.len() != 2 {
+                return Err("select exactly two points of the same polygon".into());
+            }
+            let face = (0..mesh.polygons.len())
+                .find(|face| {
+                    let poly = &mesh.polygons[*face];
+                    points
+                        .iter()
+                        .all(|point| poly.corners.iter().any(|corner| corner.point == *point))
+                })
+                .ok_or_else(|| "the two points must belong to the same polygon".to_string())?;
+            Ok((
+                face as u32,
+                lc_geom::ScalpelPick::Point(points[0]),
+                lc_geom::ScalpelPick::Point(points[1]),
+            ))
+        }
+        _ => Err("Scalpel works in point or edge mode".into()),
+    }
+}
+
+/// Parameter along the segment `a -> b` of the point closest to `ray`, clamped
+/// to the segment. `None` when the ray is parallel to the edge.
+fn closest_segment_parameter(ray: &lc_core::Ray, a: Vec3, b: Vec3) -> Option<f32> {
+    let direction = ray.dir.normalize_or_zero();
+    if direction.length_squared() <= 1e-12 {
+        return None;
+    }
+    let segment = b - a;
+    let offset = a - ray.origin;
+    let denominator = segment.length_squared() - segment.dot(direction).powi(2);
+    if denominator.abs() <= 1e-8 || segment.length_squared() <= 1e-12 {
+        return None;
+    }
+    let t = (segment.dot(direction) * direction.dot(offset) - segment.dot(offset)) / denominator;
+    Some(t.clamp(0.0, 1.0))
+}
+
+/// Whether a Scalpel pick lands on one polygon's corner ring.
+fn scalpel_pick_on_face(mesh: &Mesh, face: usize, pick: lc_geom::ScalpelPick) -> bool {
+    let Some(poly) = mesh.polygons.get(face) else {
+        return false;
+    };
+    match pick {
+        lc_geom::ScalpelPick::Point(point) => {
+            poly.corners.iter().any(|corner| corner.point == point)
+        }
+        lc_geom::ScalpelPick::Edge { a, b, .. } => {
+            let count = poly.corners.len();
+            (0..count).any(|index| {
+                let start = poly.corners[index].point;
+                let end = poly.corners[(index + 1) % count].point;
+                (start == a && end == b) || (start == b && end == a)
+            })
+        }
+    }
+}
+
+fn scalpel_pick_on_any_face(mesh: &Mesh, pick: lc_geom::ScalpelPick) -> bool {
+    (0..mesh.polygons.len()).any(|face| scalpel_pick_on_face(mesh, face, pick))
+}
+
+/// The polygon a chained Scalpel cut splits: the polygon under the pointer when
+/// it holds both picks, otherwise the first polygon that does. Two points that
+/// share an edge belong to both faces, so the pointer decides the intended one.
+fn scalpel_chain_face(
+    mesh: &Mesh,
+    under_pointer: Option<u32>,
+    start: lc_geom::ScalpelPick,
+    end: lc_geom::ScalpelPick,
+) -> Option<u32> {
+    let holds = |face: usize| {
+        scalpel_pick_on_face(mesh, face, start) && scalpel_pick_on_face(mesh, face, end)
+    };
+    under_pointer
+        .filter(|face| holds(*face as usize))
+        .or_else(|| {
+            (0..mesh.polygons.len())
+                .find(|face| holds(*face))
+                .map(|face| face as u32)
+        })
 }
 
 fn selected_valid_polygons(mesh: &Mesh, selected: &[u32]) -> Vec<u32> {

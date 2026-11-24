@@ -949,6 +949,42 @@ impl LeopardApp {
                                         }
                                     });
                             });
+                            let spline_name = chain
+                                .spline
+                                .and_then(|spline| {
+                                    node_list
+                                        .iter()
+                                        .find(|(nid, _)| *nid == spline)
+                                        .map(|(_, name)| name.as_str())
+                                })
+                                .unwrap_or("None");
+                            ui.horizontal(|ui| {
+                                ui.label("Spline");
+                                egui::ComboBox::from_id_salt("ik_spline")
+                                    .selected_text(spline_name)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut chain.spline, None, "None");
+                                        for (nid, name) in &node_list {
+                                            if *nid != chain.target {
+                                                ui.selectable_value(
+                                                    &mut chain.spline,
+                                                    Some(*nid),
+                                                    name,
+                                                );
+                                            }
+                                        }
+                                    });
+                            });
+                            if chain.spline.is_some() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "The chain follows this Spline object's curve instead of \
+                                         the point target; bones keep their length.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
                             ui.add(
                                 egui::DragValue::new(&mut chain.chain_length)
                                     .speed(0.1)
@@ -971,6 +1007,20 @@ impl LeopardApp {
                                 egui::Slider::new(&mut chain.damping, 0.05..=1.0)
                                     .text("Damping"),
                             );
+                            ui.add(
+                                egui::Slider::new(&mut chain.stiffness, 0.0..=1.0)
+                                    .text("Stiffness"),
+                            );
+                            if chain.stiffness < 0.999 {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Below 1 the chain keeps part of its rest pose: 0.5 lands \
+                                         halfway between the rest pose and a full solve.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
                             let movable = lc_scene::ik_chain_joints(&self.doc.scene, id, chain);
                             ui.label(
                                 egui::RichText::new(format!(
@@ -1147,6 +1197,18 @@ impl LeopardApp {
                                 if ui
                                     .add_enabled(
                                         editable_mesh.is_some() && base_matches && mesh_changed,
+                                        egui::Button::new("Update Base"),
+                                    )
+                                    .on_hover_text(
+                                        "Re-record the rest shape and keep each target's posed vertices",
+                                    )
+                                    .clicked()
+                                {
+                                    morph_action = Some(MorphAction::UpdateBase);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        editable_mesh.is_some() && base_matches && mesh_changed,
                                         egui::Button::new("Restore Base"),
                                     )
                                     .on_hover_text("Return the editable mesh to the recorded base")
@@ -1202,7 +1264,7 @@ impl LeopardApp {
                 }
 
                 theme::section(ui, "modifiers", "Modifier Stack", |ui| {
-                    let boolean_candidates: Vec<(NodeId, String)> = node_list
+                    let operand_candidates: Vec<(NodeId, String)> = node_list
                         .iter()
                         .filter(|(nid, _)| {
                             *nid != id
@@ -1235,20 +1297,28 @@ impl LeopardApp {
                                             }
                                         });
                                 }
-                                Modifier::Bend { angle_deg } => {
+                                Modifier::Bend { angle_deg, cage } => {
                                     ui.add(egui::DragValue::new(angle_deg).speed(1.0).suffix("°"));
+                                    modifier_cage_controls(ui, i, cage);
                                 }
-                                Modifier::Taper { amount, .. } => {
+                                Modifier::Taper { amount, cage, .. } => {
                                     ui.add(egui::DragValue::new(amount).speed(0.01));
+                                    modifier_cage_controls(ui, i, cage);
                                 }
-                                Modifier::Twist { angle_deg, axis } => {
+                                Modifier::Twist {
+                                    angle_deg,
+                                    axis,
+                                    cage,
+                                } => {
                                     ui.add(egui::DragValue::new(angle_deg).speed(1.0).suffix("°"));
                                     modifier_axis_combo(ui, ("twist_axis", i), axis);
+                                    modifier_cage_controls(ui, i, cage);
                                 }
                                 Modifier::Shear {
                                     distance,
                                     direction_deg,
                                     axis,
+                                    cage,
                                 } => {
                                     ui.add(egui::DragValue::new(distance).speed(0.01));
                                     ui.add(
@@ -1257,21 +1327,116 @@ impl LeopardApp {
                                             .suffix("°"),
                                     );
                                     modifier_axis_combo(ui, ("shear_axis", i), axis);
+                                    modifier_cage_controls(ui, i, cage);
                                 }
                                 Modifier::Bulge {
                                     strength,
                                     x_axis,
                                     z_axis,
+                                    cage,
                                 } => {
                                     ui.add(egui::DragValue::new(strength).speed(0.01));
                                     ui.checkbox(x_axis, "X");
                                     ui.checkbox(z_axis, "Z");
+                                    modifier_cage_controls(ui, i, cage);
                                 }
-                                Modifier::Spherify { radius, strength } => {
+                                Modifier::Spherify {
+                                    radius,
+                                    strength,
+                                    cage,
+                                } => {
                                     ui.add(egui::DragValue::new(radius).speed(0.01));
                                     ui.add(
                                         egui::DragValue::new(strength).range(0.0..=1.0).speed(0.01),
                                     );
+                                    modifier_cage_controls(ui, i, cage);
+                                }
+                                Modifier::Displacement {
+                                    amplitude,
+                                    frequency,
+                                    ..
+                                } => {
+                                    ui.add(egui::DragValue::new(amplitude).speed(0.005));
+                                    ui.label("Freq");
+                                    ui.add(
+                                        egui::DragValue::new(frequency)
+                                            .range(0.0..=64.0)
+                                            .speed(0.05),
+                                    );
+                                }
+                                Modifier::Formula { x, y, z } => {
+                                    ui.vertical(|ui| {
+                                        for (label, expression) in [("X", x), ("Y", y), ("Z", z)]
+                                        {
+                                            ui.horizontal(|ui| {
+                                                ui.label(label);
+                                                ui.add(
+                                                    egui::TextEdit::singleline(expression)
+                                                        .desired_width(140.0),
+                                                );
+                                            });
+                                        }
+                                    });
+                                }
+                                Modifier::Magnet {
+                                    strength,
+                                    radius,
+                                    cage,
+                                } => {
+                                    ui.add(
+                                        egui::DragValue::new(strength)
+                                            .range(-1.0..=1.0)
+                                            .speed(0.01),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(radius)
+                                            .range(0.0..=64.0)
+                                            .speed(0.01),
+                                    );
+                                    modifier_cage_controls(ui, i, cage);
+                                }
+                                Modifier::LaplacianSmooth {
+                                    iterations,
+                                    strength,
+                                    preserve_boundary,
+                                } => {
+                                    ui.add(egui::DragValue::new(iterations).range(1..=64));
+                                    ui.add(
+                                        egui::DragValue::new(strength)
+                                            .range(0.0..=1.0)
+                                            .speed(0.01),
+                                    );
+                                    ui.checkbox(preserve_boundary, "Keep border");
+                                }
+                                Modifier::PolygonReduction { ratio } => {
+                                    ui.add(
+                                        egui::DragValue::new(ratio)
+                                            .range(0.05..=1.0)
+                                            .speed(0.01),
+                                    );
+                                }
+                                Modifier::Wrap {
+                                    target,
+                                    angle_deg,
+                                    axis,
+                                } => {
+                                    egui::ComboBox::from_id_salt(("wrap_target", i))
+                                        .selected_text(
+                                            operand_candidates
+                                                .iter()
+                                                .find(|(nid, _)| nid == target)
+                                                .map(|(_, name)| name.clone())
+                                                .unwrap_or_else(|| "Target".into()),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (target_id, name) in &operand_candidates {
+                                                ui.selectable_value(target, *target_id, name);
+                                            }
+                                        });
+                                    ui.add(
+                                        egui::DragValue::new(angle_deg).speed(1.0).suffix("°"),
+                                    );
+                                    modifier_axis_combo(ui, ("wrap_axis", i), axis);
                                 }
                                 Modifier::Array { count, .. } => {
                                     ui.add(egui::DragValue::new(count).range(1..=256));
@@ -1286,14 +1451,14 @@ impl LeopardApp {
                                 Modifier::Boolean { operand, operation } => {
                                     egui::ComboBox::from_id_salt(("bool_operand", i))
                                         .selected_text(
-                                            boolean_candidates
+                                            operand_candidates
                                                 .iter()
                                                 .find(|(nid, _)| nid == operand)
                                                 .map(|(_, name)| name.clone())
                                                 .unwrap_or_else(|| "Operand".into()),
                                         )
                                         .show_ui(ui, |ui| {
-                                            for (operand_id, name) in &boolean_candidates {
+                                            for (operand_id, name) in &operand_candidates {
                                                 ui.selectable_value(operand, *operand_id, name);
                                             }
                                         });
@@ -1326,7 +1491,7 @@ impl LeopardApp {
                     ui.menu_button("Add Modifier", |ui| {
                         for modifier in Modifier::defaults() {
                             let label = modifier.label();
-                            if modifier_is_boolean(&modifier) {
+                            if modifier_needs_operand(&modifier) {
                                 continue;
                             }
                             let ready = self.modifier_ready(&modifier);
@@ -1335,7 +1500,7 @@ impl LeopardApp {
                             }
                         }
                     });
-                    let boolean_menu_ready = boolean_candidates.iter().any(|(operand, _)| {
+                    let boolean_menu_ready = operand_candidates.iter().any(|(operand, _)| {
                         self.modifier_ready(&Modifier::Boolean {
                             operand: *operand,
                             operation: lc_scene::CsgOperation::Subtract,
@@ -1343,7 +1508,7 @@ impl LeopardApp {
                     });
                     if boolean_menu_ready {
                         ui.menu_button("Add Boolean", |ui| {
-                            for (operand_id, name) in &boolean_candidates {
+                            for (operand_id, name) in &operand_candidates {
                                 for operation in [
                                     lc_scene::CsgOperation::Subtract,
                                     lc_scene::CsgOperation::Union,
@@ -1371,6 +1536,30 @@ impl LeopardApp {
                             }
                         });
                     }
+                    if operand_candidates.iter().any(|(target, _)| {
+                        self.modifier_ready(&Modifier::Wrap {
+                            target: *target,
+                            angle_deg: 45.0,
+                            axis: 1,
+                        })
+                    }) {
+                        ui.menu_button("Add Wrap", |ui| {
+                            for (target, name) in &operand_candidates {
+                                let modifier = Modifier::Wrap {
+                                    target: *target,
+                                    angle_deg: 45.0,
+                                    axis: 1,
+                                };
+                                let ready = self.modifier_ready(&modifier);
+                                if ui
+                                    .add_enabled(ready, egui::Button::new(format!("Wrap {name}")))
+                                    .clicked()
+                                {
+                                    add_modifier = Some(modifier);
+                                }
+                            }
+                        });
+                    }
                     if let Some(modifier) = add_modifier {
                         self.add_modifier_to_primary(modifier);
                     }
@@ -1378,7 +1567,7 @@ impl LeopardApp {
 
                 theme::section(ui, "tags", "Tags", |ui| {
                     let mut remove = None;
-                    for (i, tag) in node.tags.iter().enumerate() {
+                    for (i, tag) in node.tags.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(tag.label());
                             if theme::close_icon(ui, 16.0)
@@ -1388,6 +1577,62 @@ impl LeopardApp {
                                 remove = Some(i);
                             }
                         });
+                        match tag {
+                            Tag::IkPoint { target, weight } => {
+                                Self::tag_target_row(ui, i, target, &node_list);
+                                ui.add(egui::Slider::new(weight, 0.0..=1.0).text("Weight"));
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Pulls the origin toward the target. On a joint this \
+                                         translates the joint itself, not the bones around it.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            Tag::IkAngle { target, max_degrees } => {
+                                Self::tag_target_row(ui, i, target, &node_list);
+                                ui.add(
+                                    egui::DragValue::new(max_degrees)
+                                        .speed(0.5)
+                                        .range(0.0..=180.0)
+                                        .prefix("Cone "),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Keeps the object's local +X axis within this angle of \
+                                         the direction to the target; it only pulls, never pushes.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            Tag::Orient { target, weight } => {
+                                Self::tag_target_row(ui, i, target, &node_list);
+                                ui.add(egui::Slider::new(weight, 0.0..=1.0).text("Weight"));
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Blends the object's world rotation toward the target's \
+                                         rotation, leaving its position alone.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            Tag::Parent { target, weight } => {
+                                Self::tag_target_row(ui, i, target, &node_list);
+                                ui.add(egui::Slider::new(weight, 0.0..=1.0).text("Weight"));
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Follows the target's position and rotation like a \
+                                         constrained child.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                     if let Some(i) = remove {
                         node.remove_tag(i);
@@ -1420,6 +1665,30 @@ impl LeopardApp {
                             node.tags.push(Tag::CopyLocation {
                                 source: target,
                                 offset: Vec3::ZERO,
+                                weight: 1.0,
+                            });
+                        }
+                        if ui.button("IK Point").clicked() {
+                            node.tags.push(Tag::IkPoint {
+                                target,
+                                weight: 1.0,
+                            });
+                        }
+                        if ui.button("IK Angle").clicked() {
+                            node.tags.push(Tag::IkAngle {
+                                target,
+                                max_degrees: 45.0,
+                            });
+                        }
+                        if ui.button("Orient").clicked() {
+                            node.tags.push(Tag::Orient {
+                                target,
+                                weight: 1.0,
+                            });
+                        }
+                        if ui.button("Parent").clicked() {
+                            node.tags.push(Tag::Parent {
+                                target,
                                 weight: 1.0,
                             });
                         }
@@ -1492,6 +1761,31 @@ impl LeopardApp {
 }
 
 impl LeopardApp {
+    /// Target picker under an IK constraint tag. The combo id is salted by the
+    /// tag index because several tags on one node may point at other targets.
+    fn tag_target_row(
+        ui: &mut egui::Ui,
+        index: usize,
+        target: &mut NodeId,
+        node_list: &[(NodeId, String)],
+    ) {
+        let current = node_list
+            .iter()
+            .find(|(id, _)| *id == *target)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("Missing");
+        ui.horizontal(|ui| {
+            ui.label("Target");
+            egui::ComboBox::from_id_salt(("tag_target", index))
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (id, name) in node_list {
+                        ui.selectable_value(target, *id, name);
+                    }
+                });
+        });
+    }
+
     pub(super) fn ui_mesh_edit(&mut self, ui: &mut egui::Ui) {
         let mesh = self.selected_editable_mesh().map(|(_, mesh)| mesh);
         let mut action = None;
@@ -1668,6 +1962,64 @@ impl LeopardApp {
             if triangulate.clicked() {
                 action = Some(MeshAction::Triangulate);
             }
+            let scalpel_ready = self.mesh_scalpel_ready();
+            let scalpel = ui.add_enabled(scalpel_ready, egui::Button::new("Scalpel"));
+            record_menu_item_state("panel:Scalpel", &scalpel, scalpel_ready);
+            if scalpel.clicked() {
+                action = Some(MeshAction::Scalpel);
+            }
+            let scalpel_tool = ui.add_enabled(
+                self.mesh_edit,
+                egui::Checkbox::new(&mut self.scalpel_tool, "Click tool"),
+            );
+            record_menu_item_state("panel:Scalpel Tool", &scalpel_tool, self.mesh_edit);
+            if scalpel_tool.changed() {
+                self.scalpel_start = None;
+                self.status = if self.scalpel_tool {
+                    "Scalpel tool: click a point or edge to start a cut".into()
+                } else {
+                    "Scalpel tool off".into()
+                };
+            }
+            egui::ComboBox::from_id_salt("triangulate_mode")
+                .selected_text(self.triangulate_mode.label())
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        lc_geom::TriangulateMode::ShortestDiagonal,
+                        lc_geom::TriangulateMode::QuadPair,
+                    ] {
+                        ui.selectable_value(&mut self.triangulate_mode, mode, mode.label());
+                    }
+                });
+            let subdivide_ready = self.mesh_subdivide_ready();
+            let subdivide = ui.add_enabled(subdivide_ready, egui::Button::new("Subdivide"));
+            record_menu_item_state("panel:Subdivide", &subdivide, subdivide_ready);
+            if subdivide.clicked() {
+                action = Some(MeshAction::Subdivide);
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.mesh_subdivide_levels)
+                    .speed(1.0)
+                    .range(1..=6)
+                    .prefix("Levels "),
+            );
+            egui::ComboBox::from_id_salt("subdivide_scheme")
+                .selected_text(self.mesh_subdivide_scheme.label())
+                .width(125.0)
+                .show_ui(ui, |ui| {
+                    for scheme in [
+                        lc_geom::SubdivisionKind::CatmullClark,
+                        lc_geom::SubdivisionKind::StamLoop,
+                        lc_geom::SubdivisionKind::Linear,
+                    ] {
+                        ui.selectable_value(
+                            &mut self.mesh_subdivide_scheme,
+                            scheme,
+                            scheme.label(),
+                        );
+                    }
+                });
             let flip_ready = self.mesh_flip_normal_ready();
             let flip = ui.add_enabled(flip_ready, egui::Button::new("Flip Normal"));
             record_menu_item_state("panel:Flip Normal", &flip, flip_ready);
@@ -1770,6 +2122,18 @@ impl LeopardApp {
             if fill.clicked() {
                 action = Some(MeshAction::FillHole);
             }
+            let tool = ui.add_enabled(
+                self.mesh_edit,
+                egui::Checkbox::new(&mut self.fill_hole_tool, "Click tool"),
+            );
+            record_menu_item_state("panel:Fill Hole Tool", &tool, self.mesh_edit);
+            if tool.changed() {
+                self.status = if self.fill_hole_tool {
+                    "Fill Hole tool: click a point on an open hole border".into()
+                } else {
+                    "Fill Hole tool off".into()
+                };
+            }
             let holes = self.selected_hole_count();
             ui.label(
                 egui::RichText::new(format!(
@@ -1833,6 +2197,75 @@ impl LeopardApp {
                 .weak(),
             );
         });
+        ui.collapsing("Clone", |ui| {
+            let clone_ready = self.mesh_clone_ready();
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_clone.copies)
+                        .speed(1.0)
+                        .range(0..=256)
+                        .prefix("Copies "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_clone.holes)
+                        .speed(0.01)
+                        .range(0.0..=1.0)
+                        .prefix("Holes "),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Direction");
+                for (axis, label) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.add(
+                        egui::DragValue::new(&mut self.mesh_clone.direction[axis])
+                            .speed(0.01)
+                            .prefix(*label),
+                    );
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_clone.scale)
+                        .speed(0.01)
+                        .prefix("Scale "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_clone.rotation_deg)
+                        .speed(1.0)
+                        .suffix("°")
+                        .prefix("Rotation "),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_clone.position_variation)
+                        .speed(0.005)
+                        .prefix("Pos var "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_clone.scale_variation)
+                        .speed(0.01)
+                        .prefix("Scale var "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_clone.rotation_variation_deg)
+                        .speed(1.0)
+                        .suffix("°")
+                        .prefix("Rot var "),
+                );
+            });
+            ui.checkbox(&mut self.mesh_clone.keep_ratio, "Keep ratio");
+            let apply = ui.add_enabled(clone_ready, egui::Button::new("Clone"));
+            record_menu_item_state("panel:Clone", &apply, clone_ready);
+            if apply.clicked() {
+                action = Some(MeshAction::Clone);
+            }
+            ui.label(
+                egui::RichText::new("An empty selection clones every point or polygon")
+                    .small()
+                    .weak(),
+            );
+        });
         if self.mesh_select_mode == MeshSelectMode::Edges {
             ui.horizontal_wrapped(|ui| {
                 let edge_ready = self.mesh_topology_ready(MeshSelectMode::Edges, 1);
@@ -1866,6 +2299,17 @@ impl LeopardApp {
                     .small()
                     .weak(),
                 );
+                ui.add(
+                    egui::DragValue::new(&mut self.mesh_crease_weight)
+                        .speed(0.01)
+                        .range(0.0..=1.0)
+                        .prefix("Weight "),
+                );
+                let set_weight = ui.add_enabled(edge_ready, egui::Button::new("Set Crease Weight"));
+                record_menu_item_state("panel:Set Crease Weight", &set_weight, edge_ready);
+                if set_weight.clicked() {
+                    action = Some(MeshAction::SetCreaseWeight);
+                }
                 let seam = ui.add_enabled(edge_ready, egui::Button::new("Toggle Seam"));
                 record_menu_item_state("panel:Toggle Seam", &seam, edge_ready);
                 if seam.clicked() {
@@ -1950,7 +2394,8 @@ fn node_icon(kind: &NodeKind) -> Icon {
         NodeKind::Camera { .. } => Icon::Camera,
         NodeKind::Light { light } => match light.kind {
             LightKind::Directional => Icon::DirectionalLight,
-            LightKind::Point { .. } | LightKind::Spot { .. } => Icon::PointLight,
+            LightKind::Point { .. } => Icon::PointLight,
+            LightKind::Spot { .. } => Icon::SpotLight,
             LightKind::Area { .. } => Icon::AreaLight,
         },
         NodeKind::Joint { .. } => Icon::Joint,
@@ -2055,6 +2500,7 @@ impl LeopardApp {
             &mut self.browser_tab,
             &[
                 ("Objects", BrowserTab::Objects),
+                ("Morphs", BrowserTab::Morphs),
                 ("Takes", BrowserTab::Takes),
                 ("Layers", BrowserTab::Layers),
                 ("Console", BrowserTab::Console),
@@ -2065,6 +2511,7 @@ impl LeopardApp {
         ui.add_space(2.0);
         match self.browser_tab {
             BrowserTab::Objects => self.ui_objects(ui),
+            BrowserTab::Morphs => self.ui_morphs(ui),
             BrowserTab::Takes => self.ui_takes(ui),
             BrowserTab::Layers => self.ui_layers(ui),
             BrowserTab::Console => self.ui_console(ui),
@@ -2102,7 +2549,7 @@ impl LeopardApp {
                     depth: chain.len() + 1,
                     has_children: false,
                     name: modifier.label().to_string(),
-                    icon: if modifier_is_boolean(modifier) {
+                    icon: if modifier_needs_operand(modifier) {
                         Icon::Nodes
                     } else {
                         Icon::Subdivide
@@ -2111,6 +2558,29 @@ impl LeopardApp {
                     renderable: node.renderable,
                     locked: node.locked,
                     is_modifier: true,
+                });
+            }
+        }
+        rows
+    }
+
+    pub(super) fn morph_browser_rows(&self) -> Vec<MorphBrowserRow> {
+        let mut rows = Vec::new();
+        for id in self.doc.scene.depth_first() {
+            let Some(node) = self.doc.scene.get(id) else {
+                continue;
+            };
+            if !node.is_mesh() {
+                continue;
+            }
+            for (target, morph) in node.morph.targets.iter().enumerate() {
+                rows.push(MorphBrowserRow {
+                    object: id,
+                    object_name: node.name.clone(),
+                    target,
+                    target_name: morph.name.clone(),
+                    weight: morph.weight,
+                    active: morph.weight > 0.0,
                 });
             }
         }
@@ -2535,6 +3005,114 @@ impl LeopardApp {
         }
     }
 
+    fn ui_morphs(&mut self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        self.morph_row_rects.clear();
+        let rows = self.morph_browser_rows();
+        if rows.is_empty() {
+            theme::empty(
+                ui,
+                "No morph targets yet\nRecord a base and capture poses in Properties",
+            );
+            return;
+        }
+        let mut select = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut last_object = None;
+                for row in &rows {
+                    if last_object != Some(row.object) {
+                        last_object = Some(row.object);
+                        let (rect, response) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width().max(40.0), 18.0),
+                            Sense::click(),
+                        );
+                        ui.painter_at(rect).text(
+                            Pos2::new(rect.left() + 4.0, rect.bottom() - 2.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            &row.object_name,
+                            egui::FontId::proportional(10.0),
+                            theme::TEXT_WEAK,
+                        );
+                        if response.clicked() {
+                            select = Some((row.object, row.object_name.clone()));
+                        }
+                    }
+                    let (rect, response) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width().max(40.0), 24.0),
+                        Sense::click(),
+                    );
+                    #[cfg(test)]
+                    self.morph_row_rects.push((row.object, row.target, rect));
+                    let selected = self.selection.contains(row.object);
+                    let painter = ui.painter_at(rect);
+                    if selected {
+                        painter.rect_filled(rect, 0.0, theme::SELECTION);
+                    } else if response.hovered() {
+                        painter.rect_filled(rect, 0.0, Color32::from_rgb(246, 247, 249));
+                    }
+                    let text_color = if selected {
+                        Color32::WHITE
+                    } else {
+                        theme::TEXT
+                    };
+                    let weight_color = if selected {
+                        Color32::from_rgb(220, 232, 250)
+                    } else {
+                        theme::TEXT_WEAK
+                    };
+                    let weight = if row.weight.is_finite() {
+                        row.weight.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    painter.circle_filled(
+                        Pos2::new(rect.left() + 8.0, rect.center().y),
+                        3.0,
+                        if row.active {
+                            Color32::from_rgb(104, 163, 84)
+                        } else {
+                            Color32::from_rgb(178, 178, 178)
+                        },
+                    );
+                    painter.text(
+                        Pos2::new(rect.left() + 17.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &row.target_name,
+                        egui::FontId::proportional(10.5),
+                        text_color,
+                    );
+                    painter.text(
+                        Pos2::new(rect.right() - 4.0, rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("{weight:.2} · {}", if row.active { "On" } else { "Off" }),
+                        egui::FontId::proportional(9.5),
+                        weight_color,
+                    );
+                    if response.clicked() {
+                        select = Some((row.object, row.object_name.clone()));
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "A target is On when its weight is above zero. Edit weights in Properties.",
+                    )
+                    .size(9.5)
+                    .color(theme::TEXT_WEAK),
+                );
+            });
+        if let Some((id, name)) = select {
+            self.selection.select_one(id);
+            self.inspector_tab = InspectorTab::Object;
+            self.mesh_edit = false;
+            self.weight_paint = false;
+            self.sync_selection_material();
+            self.status = format!("Selected {name}");
+        }
+    }
+
     fn ui_layers(&mut self, ui: &mut egui::Ui) {
         let before = self.doc.settings.clone();
         let mut changed = false;
@@ -2586,98 +3164,56 @@ impl LeopardApp {
     }
 
     fn ui_takes(&mut self, ui: &mut egui::Ui) {
-        let takes: Vec<(NodeId, String, usize, f32, f32)> = self
-            .doc
-            .scene
-            .depth_first()
-            .into_iter()
-            .filter_map(|id| {
-                let node = self.doc.scene.get(id)?;
-                if !node.has_animation() {
-                    return None;
-                }
-                let keys: usize = node
-                    .animation
-                    .tracks
-                    .iter()
-                    .map(|track| track.curve.keys.len())
-                    .sum::<usize>()
-                    + node
-                        .animation
-                        .rotation
-                        .as_ref()
-                        .map_or(0, |track| track.keys.len())
-                    + node
-                        .animation
-                        .morph_weights
-                        .values()
-                        .map(|curve| curve.keys.len())
-                        .sum::<usize>();
-                let times = node.animation.key_times();
-                Some((
-                    id,
-                    node.name.clone(),
-                    keys,
-                    times.first().copied().unwrap_or(0.0) * self.playback.fps,
-                    times.last().copied().unwrap_or(0.0) * self.playback.fps,
-                ))
-            })
-            .collect();
-        if takes.is_empty() {
-            theme::empty(
-                ui,
-                "No animated objects yet\nKey transforms to create a take",
-            );
-            return;
+        if self.take_editor_index != Some(self.doc.active_take) {
+            self.sync_take_editor();
         }
-        let selected_take = self.selection.primary().and_then(|selected_id| {
-            takes
-                .iter()
-                .find(|(id, _, _, _, _)| *id == selected_id)
-                .map(|(id, name, _, _, _)| (*id, name.clone()))
+        #[cfg(test)]
+        self.take_row_rects.clear();
+        let mut rename = None;
+        let mut apply_fps = None;
+
+        ui.horizontal(|ui| {
+            if ui
+                .button("New")
+                .on_hover_text("Create an empty take and activate it")
+                .clicked()
+            {
+                self.create_take();
+            }
+            if ui
+                .button("Duplicate")
+                .on_hover_text("Copy the active take and all of its clips")
+                .clicked()
+            {
+                self.duplicate_take();
+            }
+            if ui
+                .button("Delete")
+                .on_hover_text("Delete the active take; another take becomes active")
+                .clicked()
+            {
+                self.delete_active_take();
+            }
         });
-        if let Some((take_id, take_name)) = selected_take {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Retime take ×")
-                        .size(9.5)
-                        .color(theme::TEXT_WEAK),
-                );
-                let mut factor = self.retime_factor;
-                ui.add(
-                    egui::DragValue::new(&mut factor)
-                        .speed(0.01)
-                        .range(0.01..=100.0)
-                        .max_decimals(3),
-                );
-                let ready = (factor - 1.0).abs() > 1e-6;
-                if ui
-                    .add_enabled(
-                        ready,
-                        egui::Button::new(egui::RichText::new("Retime Take").size(9.0)),
-                    )
-                    .on_hover_text(format!(
-                        "Scale every key in {take_name} around 0 seconds; fractional times are preserved"
-                    ))
-                    .clicked()
-                {
-                    self.retime_factor = factor;
-                    self.retime_animation_take(take_id, factor);
-                } else {
-                    self.retime_factor = factor;
-                }
-            });
-            ui.label(
-                egui::RichText::new("Pivot: 0s. Collisions reject the whole edit.")
-                    .size(9.0)
-                    .color(theme::TEXT_WEAK),
-            );
-        }
+        ui.add_space(4.0);
+        theme::rule(ui);
+        ui.add_space(2.0);
+
+        let active = self.doc.active_take;
+        let rows: Vec<(usize, String, f32)> = self
+            .doc
+            .takes
+            .iter()
+            .enumerate()
+            .map(|(index, take)| (index, take.name.clone(), take.fps))
+            .collect();
+        let mut activate = None;
         egui::ScrollArea::vertical()
+            .max_height(180.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (id, name, keys, first, last) in &takes {
-                    let selected = self.selection.contains(*id);
+                for (index, name, fps) in rows {
+                    let selected = index == active;
                     let (rect, response) = ui
                         .allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
                     let painter = ui.painter_at(rect);
@@ -2694,14 +3230,17 @@ impl LeopardApp {
                     painter.text(
                         rect.left_top() + Vec2::new(6.0, 3.0),
                         egui::Align2::LEFT_TOP,
-                        name,
+                        &name,
                         egui::FontId::proportional(11.0),
                         color,
                     );
                     painter.text(
                         rect.left_bottom() + Vec2::new(6.0, -3.0),
                         egui::Align2::LEFT_BOTTOM,
-                        format!("{keys} keys · frames {first:.0}–{last:.0}"),
+                        format!(
+                            "{fps:.0} fps · {}",
+                            if selected { "active" } else { "stored" }
+                        ),
                         egui::FontId::proportional(9.5),
                         if selected {
                             Color32::from_rgb(220, 232, 250)
@@ -2709,21 +3248,107 @@ impl LeopardApp {
                             theme::TEXT_WEAK
                         },
                     );
-                    if response.clicked() {
-                        self.selection.select_one(*id);
-                        self.inspector_tab = InspectorTab::Object;
-                        self.mesh_edit = false;
-                        self.sync_selection_material();
-                        self.status = format!("Selected {name}");
+                    #[cfg(test)]
+                    self.take_row_rects.push((index, rect));
+                    if response.clicked() && !selected {
+                        activate = Some(index);
                     }
                 }
-                ui.add_space(4.0);
+            });
+        if let Some(index) = activate {
+            self.activate_take(index);
+        }
+
+        ui.add_space(6.0);
+        theme::rule(ui);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Name")
+                    .size(9.5)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.take_name_buffer)
+                    .desired_width(108.0)
+                    .font(egui::FontId::proportional(10.0)),
+            );
+            if ui
+                .add_enabled(
+                    !self.take_name_buffer.trim().is_empty(),
+                    egui::Button::new(egui::RichText::new("Rename").size(9.0)),
+                )
+                .clicked()
+            {
+                rename = Some(self.take_name_buffer.clone());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Take FPS")
+                    .size(9.5)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.take_fps_buffer)
+                    .speed(0.1)
+                    .range(1.0..=240.0)
+                    .max_decimals(2),
+            );
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Apply FPS").size(9.0),
+                ))
+                .on_hover_text("Retimes the playback range from this take's fps")
+                .clicked()
+            {
+                apply_fps = Some(self.take_fps_buffer);
+            }
+        });
+        if let Some(id) = self.selection.primary().filter(|id| {
+            self.doc
+                .scene
+                .get(*id)
+                .is_some_and(|n| !n.animation.is_empty())
+        }) {
+            ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Takes are stored per object in this build.")
+                    egui::RichText::new("Retime selected")
                         .size(9.5)
                         .color(theme::TEXT_WEAK),
                 );
+                ui.add(
+                    egui::DragValue::new(&mut self.retime_factor)
+                        .speed(0.01)
+                        .range(0.01..=100.0)
+                        .max_decimals(3),
+                );
+                if ui
+                    .add_enabled(
+                        (self.retime_factor - 1.0).abs() > 1e-6,
+                        egui::Button::new(egui::RichText::new("Retime").size(9.0)),
+                    )
+                    .clicked()
+                {
+                    let factor = self.retime_factor;
+                    self.retime_animation_take(id, factor);
+                }
             });
+        }
+        ui.label(
+            egui::RichText::new(
+                "Each take stores its own fps; switching restores its clips and retimes playback.",
+            )
+            .size(9.0)
+            .color(theme::TEXT_WEAK),
+        );
+
+        if let Some(name) = rename {
+            self.rename_active_take(name);
+        }
+        if let Some(fps) = apply_fps {
+            self.set_active_take_fps(fps);
+        }
     }
 
     fn ui_console(&mut self, ui: &mut egui::Ui) {
@@ -2755,6 +3380,36 @@ impl LeopardApp {
     }
 }
 
+/// Shared Cheetah3D deformer Type/Cage controls. `index` scopes the combo id to
+/// this stack row so several deformers can be open at once.
+fn modifier_cage_controls(ui: &mut egui::Ui, index: usize, cage: &mut lc_scene::DeformCage) {
+    ui.horizontal(|ui| {
+        ui.label("Type");
+        egui::ComboBox::from_id_salt(("deform_limit", index))
+            .selected_text(cage.limit.label())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for limit in [
+                    lc_scene::DeformLimit::Constrained,
+                    lc_scene::DeformLimit::Unconstrained,
+                    lc_scene::DeformLimit::Cage,
+                ] {
+                    ui.selectable_value(&mut cage.limit, limit, limit.label());
+                }
+            });
+    });
+    if cage.limit != lc_scene::DeformLimit::Unconstrained {
+        ui.horizontal(|ui| {
+            ui.label("Cage");
+            ui.add(
+                egui::DragValue::new(&mut cage.extent)
+                    .range(0.05..=4.0)
+                    .speed(0.01),
+            );
+        });
+    }
+}
+
 fn modifier_axis_combo(
     ui: &mut egui::Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
@@ -2770,8 +3425,10 @@ fn modifier_axis_combo(
         });
 }
 
-fn modifier_is_boolean(modifier: &Modifier) -> bool {
-    matches!(modifier, Modifier::Boolean { .. })
+/// Modifiers that need a second object chosen from the scene, so the generic
+/// Add Modifier menu skips them in favour of their own picker.
+fn modifier_needs_operand(modifier: &Modifier) -> bool {
+    matches!(modifier, Modifier::Boolean { .. } | Modifier::Wrap { .. })
 }
 
 fn object_matches_filter(name: &str, filter: &str) -> bool {
@@ -2909,14 +3566,14 @@ mod node_icon_tests {
             })),
             Icon::AreaLight
         );
-        // Spot lights share the point-light glyph; the inspector names the kind.
         assert_eq!(
             node_icon(&light(LightKind::Spot {
                 radius: 1.0,
                 inner_deg: 15.0,
                 outer_deg: 30.0,
             })),
-            Icon::PointLight
+            Icon::SpotLight
         );
+        assert_ne!(Icon::SpotLight, Icon::PointLight);
     }
 }

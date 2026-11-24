@@ -278,6 +278,45 @@ impl LeopardApp {
             })
     }
 
+    /// Scalpel cuts one polygon between two picks: two edges or two points that
+    /// share a polygon. It only enables when that cut would really split the
+    /// mesh, so the button never reports a no-op.
+    pub(super) fn mesh_scalpel_ready(&self) -> bool {
+        if !self.mesh_component_selection_ready() {
+            return false;
+        }
+        let mode = self.mesh_select_mode;
+        if !matches!(mode, MeshSelectMode::Points | MeshSelectMode::Edges) {
+            return false;
+        }
+        self.selection.ids().iter().all(|id| {
+            self.editable_mesh(*id)
+                .map(|mesh| {
+                    scalpel_cut(mesh, mode, self.mesh_components_for(*id))
+                        .and_then(|(face, from, to)| lc_geom::scalpel_face(mesh, face, from, to))
+                        .is_ok()
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Clone works in point and polygon mode; an empty selection means every
+    /// point or polygon, as the manual documents.
+    pub(super) fn mesh_clone_ready(&self) -> bool {
+        self.mesh_edit
+            && self.selected_meshes_editable()
+            && matches!(
+                self.mesh_select_mode,
+                MeshSelectMode::Points | MeshSelectMode::Polygons
+            )
+    }
+
+    /// Partial subdivision needs polygon mode and at least one usable selected
+    /// polygon; it shares Split's selection predicate.
+    pub(super) fn mesh_subdivide_ready(&self) -> bool {
+        self.mesh_split_ready()
+    }
+
     /// Triangulate needs polygon mode and at least one selected polygon that
     /// actually has more than three corners, so it never reports a no-op.
     pub(super) fn mesh_triangulate_ready(&self) -> bool {
@@ -404,12 +443,61 @@ impl LeopardApp {
     /// one UV point to pick and drag.
     pub(super) fn uv_point_edit_ready(&self) -> bool {
         self.selected_editable_mesh()
-            .map(|(_, mesh)| !mesh.uvs.is_empty())
+            .map(|(_, mesh)| mesh.uv_set_count() > 0)
             .unwrap_or(false)
     }
 
+    /// Menu/toolbar predicate for the UV authoring commands.
+    pub(super) fn uv_edit_ready(&self) -> bool {
+        self.uv_point_edit_ready()
+    }
+
+    /// The active UV set, clamped to the mesh's current set count.
+    pub(super) fn uv_active_set(&self, mesh: &Mesh) -> usize {
+        self.uv_editor
+            .set
+            .min(mesh.uv_set_count().saturating_sub(1))
+    }
+
+    /// Selected UV slots, including the last-clicked primary point.
+    pub(super) fn uv_selected_slots(&self) -> Vec<u32> {
+        let mut slots: Vec<u32> = self.uv_editor.selection.iter().copied().collect();
+        if let Some(index) = self.selected_uv {
+            let index = index as u32;
+            if !slots.contains(&index) {
+                slots.push(index);
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    pub(super) fn selected_uv_slots_for(&self, mesh: &Mesh) -> Vec<u32> {
+        let set = self.uv_active_set(mesh);
+        let Some(values) = mesh.uv_set(set) else {
+            return Vec::new();
+        };
+        let mut slots = self.uv_selected_slots();
+        slots.retain(|slot| (*slot as usize) < values.len());
+        slots
+    }
+
+    /// Drop stale selection and clamp the active set after a slot edit.
+    pub(super) fn prune_uv_selection(&mut self, mesh: &Mesh) {
+        let len = mesh.uvs.len() as u32;
+        self.uv_editor.selection.retain(|slot| *slot < len);
+        if self.selected_uv.is_some_and(|index| index as u32 >= len) {
+            self.selected_uv = None;
+        }
+        let sets = mesh.uv_set_count();
+        if self.uv_editor.set >= sets {
+            self.uv_editor.set = sets.saturating_sub(1);
+        }
+    }
+
     pub(super) fn set_uv_point(&mut self, id: NodeId, index: usize, uv: V2) -> bool {
-        let Some((primary, _)) = self.selected_editable_mesh() else {
+        let Some((primary, mesh)) = self.selected_editable_mesh() else {
             self.status = "UV editing requires an editable mesh".into();
             return false;
         };
@@ -417,6 +505,7 @@ impl LeopardApp {
             self.status = "Select the editable mesh that owns the UV point".into();
             return false;
         }
+        let set = self.uv_active_set(&mesh);
         let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
             return false;
         };
@@ -429,52 +518,105 @@ impl LeopardApp {
         let GeometrySource::Editable { mesh, .. } = geometry else {
             return false;
         };
-        let Some(point) = mesh.uvs.get_mut(index) else {
+        let Some(point) = mesh
+            .uv_set_mut(set)
+            .and_then(|values| values.get_mut(index))
+            .map(|value| *value)
+        else {
             self.status = "That UV point no longer exists".into();
             return false;
         };
-        if *point != uv {
-            *point = uv;
+        if point != uv {
+            mesh.set_uv_value(set, index as u32, uv);
             if self.pending_shape.is_none() {
                 self.pending_shape = Some((id, before));
             }
         }
+        self.uv_editor.selection.insert(index as u32);
         self.selected_uv = Some(index);
         true
     }
 
-    /// The pin command edits the UV point selected in the UV view, on the
-    /// primary editable mesh.
-    pub(super) fn uv_pin_ready(&self) -> bool {
-        self.selected_editable_mesh()
-            .zip(self.selected_uv)
-            .is_some_and(|((_, mesh), index)| index < mesh.uvs.len())
+    /// Move every selected UV point by one drag delta in the active set.
+    pub(super) fn nudge_selected_uv(&mut self, delta: V2) -> bool {
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            return false;
+        };
+        let set = self.uv_active_set(&mesh);
+        let slots = self.selected_uv_slots_for(&mesh);
+        let mut moved = false;
+        for slot in slots {
+            let Some(current) = mesh.uv_value(set, slot) else {
+                continue;
+            };
+            if self.set_uv_point(id, slot as usize, current + delta) {
+                moved = true;
+            }
+        }
+        moved
     }
 
-    pub(super) fn toggle_selected_uv_pin(&mut self) {
-        if !self.uv_pin_ready() {
-            self.status = if self.selected_editable_mesh().is_some() {
-                "Select a UV point in the UV view first".into()
-            } else {
-                "Pin UVs on an editable mesh with a UV set".into()
-            };
+    /// The pin command covers every selected UV point on the primary mesh.
+    pub(super) fn uv_pin_ready(&self) -> bool {
+        self.selected_editable_mesh()
+            .is_some_and(|(_, mesh)| !self.selected_uv_slots_for(&mesh).is_empty())
+    }
+
+    pub(super) fn toggle_selected_uv_pins(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Pin UVs on an editable mesh with a UV set".into();
+            return;
+        };
+        let slots = self.selected_uv_slots_for(&mesh);
+        if slots.is_empty() {
+            self.status = "Select one or more UV points in the UV view first".into();
             return;
         }
-        let (Some((id, mesh)), Some(index)) = (self.selected_editable_mesh(), self.selected_uv)
-        else {
-            return;
+        let pin = !slots.iter().all(|slot| mesh.is_uv_pinned(*slot));
+        let count = slots.len();
+        let message = if pin {
+            format!("Pinned {count} UV point(s)")
+        } else {
+            format!("Unpinned {count} UV point(s)")
+        };
+        self.commit_uv_edit(message, |mesh| {
+            for slot in &slots {
+                mesh.set_uv_pinned(*slot, pin);
+            }
+            Some(String::new())
+        });
+    }
+
+    /// Apply one document mutation to the primary mesh's UVs as one undo step.
+    /// The closure returns a status message, or `None` for a refused edit.
+    pub(super) fn commit_uv_edit(
+        &mut self,
+        message: String,
+        edit: impl FnOnce(&mut Mesh) -> Option<String>,
+    ) -> bool {
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            self.status = "UV editing requires an editable mesh".into();
+            return false;
         };
         let Some(before) = self.doc.scene.get(id).map(Shape::of) else {
-            return;
+            return false;
         };
-        let mut updated = mesh;
-        let pinned = updated.toggle_uv_pinned(index as u32);
+        let mut updated = mesh.clone();
+        let Some(edited) = edit(&mut updated) else {
+            self.status = "UVs unchanged".into();
+            return false;
+        };
+        let status = if edited.is_empty() { message } else { edited };
+        if updated == mesh {
+            self.status = status;
+            return false;
+        }
         let NodeKind::Mesh { geometry } = &before.kind else {
-            return;
+            return false;
         };
         let mut after = before.clone();
         after.kind = NodeKind::Mesh {
-            geometry: geometry.with_mesh(updated),
+            geometry: geometry.with_mesh(updated.clone()),
         };
         self.history.execute(
             &mut self.doc,
@@ -482,11 +624,345 @@ impl LeopardApp {
                 edits: vec![(id, before, after)],
             }),
         );
-        self.status = if pinned {
-            format!("Pinned UV point {index}")
-        } else {
-            format!("Unpinned UV point {index}")
+        self.prune_uv_selection(&updated);
+        self.status = status;
+        true
+    }
+
+    /// Toggle seams on the mesh edges between adjacent selected UV points.
+    pub(super) fn toggle_selected_uv_seam(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "UV seams need an editable mesh".into();
+            return;
         };
+        let slots: HashSet<u32> = self.selected_uv_slots_for(&mesh).into_iter().collect();
+        if slots.len() < 2 {
+            self.status = "Select two adjacent UV points across a mesh edge first".into();
+            return;
+        }
+        let mut edges = Vec::new();
+        for poly in &mesh.polygons {
+            let n = poly.corners.len();
+            for i in 0..n {
+                let a = poly.corners[i];
+                let b = poly.corners[(i + 1) % n];
+                if slots.contains(&a.uv) && slots.contains(&b.uv) {
+                    edges.push(if a.point < b.point {
+                        [a.point, b.point]
+                    } else {
+                        [b.point, a.point]
+                    });
+                }
+            }
+        }
+        edges.sort_unstable();
+        edges.dedup();
+        if edges.is_empty() {
+            self.status = "Selected UV points are not adjacent on a mesh edge".into();
+            return;
+        }
+        let count = edges.len();
+        self.commit_uv_edit(format!("Toggled {count} UV seam edge(s)"), |mesh| {
+            for [a, b] in &edges {
+                mesh.toggle_seam(*a, *b);
+            }
+            Some(String::new())
+        });
+    }
+
+    pub(super) fn select_all_uv_seams(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "UV seams need an editable mesh".into();
+            return;
+        };
+        if mesh.seams.is_empty() {
+            self.status = "The mesh has no UV seams".into();
+            return;
+        }
+        let points: HashSet<u32> = mesh.seams.iter().flatten().copied().collect();
+        let mut slots = Vec::new();
+        for poly in &mesh.polygons {
+            for corner in &poly.corners {
+                if points.contains(&corner.point) {
+                    slots.push(corner.uv);
+                }
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        let count = slots.len();
+        self.uv_editor.selection = slots.into_iter().collect();
+        self.selected_uv = self.uv_editor.selection.iter().next().map(|s| *s as usize);
+        self.status = format!("Selected {count} UV points on seams");
+    }
+
+    pub(super) fn clear_uv_seams(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "UV seams need an editable mesh".into();
+            return;
+        };
+        if mesh.seams.is_empty() {
+            self.status = "The mesh has no UV seams".into();
+            return;
+        }
+        self.commit_uv_edit("Cleared UV seams".into(), |mesh| {
+            mesh.seams.clear();
+            Some(String::new())
+        });
+    }
+
+    /// Select every UV point on the seam loop connected to the selection. With
+    /// no seam selected, this selects every seam point.
+    pub(super) fn select_uv_seam_loop(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "UV seams need an editable mesh".into();
+            return;
+        };
+        if mesh.seams.is_empty() {
+            self.status = "The mesh has no UV seams".into();
+            return;
+        }
+        let mut graph: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for [a, b] in &mesh.seams {
+            graph.entry(*a).or_default().push(*b);
+            graph.entry(*b).or_default().push(*a);
+        }
+        let slots = self.selected_uv_slots_for(&mesh);
+        let mut selected_points = HashSet::new();
+        for poly in &mesh.polygons {
+            for corner in &poly.corners {
+                if slots.contains(&corner.uv) {
+                    selected_points.insert(corner.point);
+                }
+            }
+        }
+        let seeds: Vec<u32> = graph
+            .keys()
+            .copied()
+            .filter(|point| selected_points.is_empty() || selected_points.contains(point))
+            .collect();
+        let mut loop_points = HashSet::new();
+        let mut queue: Vec<u32> = seeds;
+        while let Some(point) = queue.pop() {
+            if !loop_points.insert(point) {
+                continue;
+            }
+            if let Some(neighbours) = graph.get(&point) {
+                queue.extend(neighbours.iter().copied());
+            }
+        }
+        if loop_points.is_empty() {
+            self.status = "Select a UV point on a seam first".into();
+            return;
+        }
+        let mut loop_slots = Vec::new();
+        for poly in &mesh.polygons {
+            for corner in &poly.corners {
+                if loop_points.contains(&corner.point) {
+                    loop_slots.push(corner.uv);
+                }
+            }
+        }
+        loop_slots.sort_unstable();
+        loop_slots.dedup();
+        let count = loop_slots.len();
+        self.uv_editor.selection = loop_slots.into_iter().collect();
+        self.selected_uv = self.uv_editor.selection.iter().next().map(|s| *s as usize);
+        self.status = format!("Selected seam loop with {count} UV points");
+    }
+
+    pub(super) fn select_uv_island(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Select an editable mesh with a UV set".into();
+            return;
+        };
+        let slots = self.selected_uv_slots_for(&mesh);
+        if slots.is_empty() {
+            self.status = "Select a UV point before selecting its island".into();
+            return;
+        }
+        let island = lc_geom::uv_island_slots(&mesh, &slots);
+        let count = island.len();
+        self.uv_editor.selection = island.into_iter().collect();
+        self.selected_uv = self.uv_editor.selection.iter().next().map(|s| *s as usize);
+        self.status = format!("Selected {count} UV points in the island");
+    }
+
+    pub(super) fn select_all_uv_points(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Select an editable mesh with a UV set".into();
+            return;
+        };
+        let set = self.uv_active_set(&mesh);
+        let count = mesh.uv_set(set).map(|values| values.len()).unwrap_or(0);
+        self.uv_editor.selection = (0..count as u32).collect();
+        self.selected_uv = (0..count).next();
+        self.status = format!("Selected {count} UV points");
+    }
+
+    pub(super) fn clear_uv_selection(&mut self) {
+        self.uv_editor.selection.clear();
+        self.selected_uv = None;
+        self.status = "Cleared UV selection".into();
+    }
+
+    /// Charts touched by the current UV selection, with the active set.
+    fn selected_uv_charts(&self) -> Option<(usize, Vec<usize>, usize)> {
+        let (_, mesh) = self.selected_editable_mesh()?;
+        let set = self.uv_active_set(&mesh);
+        let slots = self.selected_uv_slots_for(&mesh);
+        let charts = lc_geom::charts_for_uv_slots(&mesh, &slots);
+        Some((set, charts, mesh.uv_set_count()))
+    }
+
+    pub(super) fn transform_selected_uv_charts(&mut self) {
+        let Some((set, charts, _)) = self.selected_uv_charts() else {
+            self.status = "Select a UV point or island first".into();
+            return;
+        };
+        if charts.is_empty() {
+            self.status = "Select a UV point or island first".into();
+            return;
+        }
+        let move_by = self.uv_editor.chart_move;
+        let rotate = self.uv_editor.chart_rotate;
+        let scale = self.uv_editor.chart_scale;
+        if move_by == V2::ZERO && rotate == 0.0 && (scale - 1.0).abs() < 1e-6 {
+            self.status = "Enter a chart move, rotation or scale first".into();
+            return;
+        }
+        let count = charts.len();
+        self.commit_uv_edit(format!("Transformed {count} UV chart(s)"), |mesh| {
+            lc_geom::transform_uv_charts(mesh, set, &charts, move_by, rotate, scale);
+            Some(String::new())
+        });
+    }
+
+    /// Pack the charts touched by the selection, or every chart when nothing
+    /// is selected. Pinned charts stay at their authored coordinates.
+    pub(super) fn pack_selected_uv_charts(&mut self) {
+        let Some((set, charts, _)) = self.selected_uv_charts() else {
+            self.status = "Select an editable mesh with a UV set".into();
+            return;
+        };
+        let options = lc_geom::UvPackOptions {
+            padding: self.uv_editor.pack_padding,
+            rotate: self.uv_editor.pack_rotate,
+            align: self.uv_editor.pack_align,
+        };
+        self.commit_uv_edit("Packed UV charts".into(), |mesh| {
+            let report = lc_geom::pack_uv_charts(mesh, set, &charts, options);
+            if report.packed == 0 {
+                return None;
+            }
+            Some(if report.skipped_pinned > 0 {
+                format!(
+                    "Packed {} UV chart(s); {} pinned chart(s) left in place",
+                    report.packed, report.skipped_pinned
+                )
+            } else {
+                format!("Packed {} UV chart(s)", report.packed)
+            })
+        });
+    }
+
+    /// Run a slot-level UV operation on the active set. Weld/Split change the
+    /// shared slot topology and therefore every set.
+    pub(super) fn run_uv_slot_op(&mut self, op: UvSlotOp) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Select an editable mesh with a UV set".into();
+            return;
+        };
+        let set = self.uv_active_set(&mesh);
+        let slots = self.selected_uv_slots_for(&mesh);
+        if slots.is_empty() {
+            self.status = "Select one or more UV points first".into();
+            return;
+        }
+        if slots.len() < 2
+            && !matches!(op, UvSlotOp::Numeric | UvSlotOp::Split | UvSlotOp::Rotate90)
+        {
+            self.status = "That UV operation needs at least two selected points".into();
+            return;
+        }
+        let numeric = self.uv_editor.numeric;
+        self.commit_uv_edit("Updated UVs".into(), |mesh| match op {
+            UvSlotOp::Weld => {
+                let removed = lc_geom::weld_uv_slots(mesh, &slots);
+                (removed > 0).then(|| format!("Welded UV points; {removed} slot(s) removed"))
+            }
+            UvSlotOp::Split => {
+                let created = lc_geom::split_uv_slots(mesh, &slots);
+                (created > 0).then(|| format!("Split UV points into {created} new slot(s)"))
+            }
+            UvSlotOp::AlignU => lc_geom::align_uv_slots(mesh, set, &slots, lc_geom::UvAxis::U)
+                .then(|| "Aligned UVs on U".into()),
+            UvSlotOp::AlignV => lc_geom::align_uv_slots(mesh, set, &slots, lc_geom::UvAxis::V)
+                .then(|| "Aligned UVs on V".into()),
+            UvSlotOp::DistributeU => {
+                lc_geom::distribute_uv_slots(mesh, set, &slots, lc_geom::UvAxis::U)
+                    .then(|| "Distributed UVs on U".into())
+            }
+            UvSlotOp::DistributeV => {
+                lc_geom::distribute_uv_slots(mesh, set, &slots, lc_geom::UvAxis::V)
+                    .then(|| "Distributed UVs on V".into())
+            }
+            UvSlotOp::FlipU => lc_geom::flip_uv_slots(mesh, set, &slots, lc_geom::UvAxis::U)
+                .then(|| "Flipped UVs on U".into()),
+            UvSlotOp::FlipV => lc_geom::flip_uv_slots(mesh, set, &slots, lc_geom::UvAxis::V)
+                .then(|| "Flipped UVs on V".into()),
+            UvSlotOp::Rotate90 => {
+                lc_geom::rotate_uv_slots(mesh, set, &slots, 1).then(|| "Rotated UVs 90°".into())
+            }
+            UvSlotOp::Numeric => {
+                let mut changed = false;
+                for slot in &slots {
+                    changed |= mesh.set_uv_value(set, *slot, numeric);
+                }
+                changed.then(|| {
+                    format!(
+                        "Set {} UV point(s) to {:.4}, {:.4}",
+                        slots.len(),
+                        numeric.x,
+                        numeric.y
+                    )
+                })
+            }
+        });
+    }
+
+    pub(super) fn add_uv_set(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Select an editable mesh with a UV set".into();
+            return;
+        };
+        if mesh.uvs.is_empty() {
+            self.status = "Apply a projection before adding a UV set".into();
+            return;
+        }
+        let next = mesh.uv_set_count();
+        if self.commit_uv_edit("Added a UV set".into(), |mesh| {
+            mesh.add_uv_set()
+                .map(|index| format!("Added UV set {index}"))
+        }) {
+            self.uv_editor.set = next;
+            self.status = format!("Added UV set {next}");
+        }
+    }
+
+    pub(super) fn remove_uv_set(&mut self) {
+        let Some((_, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Select an editable mesh with a UV set".into();
+            return;
+        };
+        let set = self.uv_active_set(&mesh);
+        if set == 0 {
+            self.status = "UV0 cannot be removed".into();
+            return;
+        }
+        self.commit_uv_edit(format!("Removed UV set {set}"), |mesh| {
+            mesh.remove_uv_set(set).then_some(String::new())
+        });
     }
 
     pub(super) fn selected_editable_mesh(&self) -> Option<(NodeId, Mesh)> {
@@ -604,6 +1080,24 @@ impl LeopardApp {
             };
             return;
         }
+        let uv0_only = matches!(op, UvOp::Unwrap | UvOp::Relax | UvOp::Normalize);
+        if uv0_only {
+            for id in self.selection.ids() {
+                let Some(NodeKind::Mesh { geometry }) = self.doc.scene.get(*id).map(|n| &n.kind)
+                else {
+                    continue;
+                };
+                let GeometrySource::Editable { mesh, .. } = geometry else {
+                    continue;
+                };
+                if self.uv_active_set(mesh) != 0 {
+                    self.status =
+                        "Unwrap, Relax and Normalize author UV0; switch the set to UV0 first"
+                            .into();
+                    return;
+                }
+            }
+        }
         let mut edits = Vec::new();
         for id in self.selection.ids() {
             let Some(node) = self.doc.scene.get(*id) else {
@@ -617,11 +1111,14 @@ impl LeopardApp {
                 continue;
             };
             let mut mesh = mesh.clone();
+            let set = self.uv_active_set(&mesh);
             match op {
-                UvOp::Planar => lc_geom::planar_projection(&mut mesh, 1, 1.0),
-                UvOp::Box => lc_geom::box_projection(&mut mesh, 1.0),
-                UvOp::Cylindrical => lc_geom::cylindrical_projection(&mut mesh, 1.0, 1.0),
-                UvOp::Spherical => lc_geom::spherical_projection(&mut mesh, 1.0),
+                UvOp::Planar => lc_geom::planar_projection_in_set(&mut mesh, set, 1, 1.0),
+                UvOp::Box => lc_geom::box_projection_in_set(&mut mesh, set, 1.0),
+                UvOp::Cylindrical => {
+                    lc_geom::cylindrical_projection_in_set(&mut mesh, set, 1.0, 1.0)
+                }
+                UvOp::Spherical => lc_geom::spherical_projection_in_set(&mut mesh, set, 1.0),
                 UvOp::Unwrap => lc_geom::automatic_unwrap(&mut mesh, 45.0, 0.01),
                 UvOp::Relax => lc_geom::relax_uvs(&mut mesh, 8, 0.5, true),
                 UvOp::Normalize => lc_geom::normalize_uvs(&mut mesh),
@@ -978,6 +1475,76 @@ impl LeopardApp {
                     },
                 );
             }
+            MeshAction::SetCreaseWeight => {
+                if !self.require_mesh_selection(MeshSelectMode::Edges, 1, "set crease weights") {
+                    return;
+                }
+                let weight = self.mesh_crease_weight;
+                self.apply_mesh_operation_selection(
+                    "Set edge crease weights",
+                    false,
+                    move |_, mesh, selected| {
+                        let edges = mesh.edges();
+                        let mut updated = mesh.clone();
+                        for &index in selected {
+                            if let Some(edge) = edges.get(index as usize) {
+                                updated.set_crease_weight(edge.a, edge.b, weight);
+                            }
+                        }
+                        Ok(updated)
+                    },
+                );
+            }
+            MeshAction::Subdivide => {
+                if !self.mesh_subdivide_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if self.mesh_select_mode != MeshSelectMode::Polygons {
+                        "Subdivide is only available in polygon mode".into()
+                    } else {
+                        "Select at least one polygon to subdivide".into()
+                    };
+                    return;
+                }
+                let levels = self.mesh_subdivide_levels.clamp(1, 6);
+                let scheme = self.mesh_subdivide_scheme;
+                self.apply_mesh_operation(
+                    "Subdivided selected polygons",
+                    move |_, mesh, components| {
+                        let faces = selected_valid_polygons(mesh, components);
+                        if faces.is_empty() {
+                            return Err("select at least one polygon to subdivide".into());
+                        }
+                        let faces = faces.iter().map(|face| *face as usize).collect::<Vec<_>>();
+                        Ok(lc_geom::subdivide_faces(mesh, &faces, levels, scheme))
+                    },
+                );
+            }
+            MeshAction::Clone => {
+                if !self.mesh_clone_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else {
+                        "Clone is only available in point or polygon mode".into()
+                    };
+                    return;
+                }
+                let options = self.mesh_clone;
+                let mode = self.mesh_select_mode;
+                self.apply_mesh_operation_selection(
+                    "Cloned selection",
+                    false,
+                    move |_, mesh, selected| match mode {
+                        MeshSelectMode::Points => {
+                            Ok(lc_geom::clone_points(mesh, selected, &options))
+                        }
+                        MeshSelectMode::Polygons => {
+                            Ok(lc_geom::clone_faces(mesh, selected, &options))
+                        }
+                        MeshSelectMode::Edges => Err("clone needs point or polygon mode".into()),
+                    },
+                );
+            }
             MeshAction::ToggleSeam => {
                 if !self.require_mesh_selection(MeshSelectMode::Edges, 1, "toggle UV seams") {
                     return;
@@ -1009,7 +1576,8 @@ impl LeopardApp {
                     };
                     return;
                 }
-                self.apply_mesh_operation("Triangulated polygons", |_, mesh, components| {
+                let mode = self.triangulate_mode;
+                self.apply_mesh_operation("Triangulated polygons", move |_, mesh, components| {
                     let faces = selected_valid_polygons(mesh, components);
                     if faces.is_empty() {
                         return Err(
@@ -1017,7 +1585,27 @@ impl LeopardApp {
                                 .into(),
                         );
                     }
-                    Ok(lc_geom::triangulate_faces(mesh, &faces))
+                    Ok(lc_geom::triangulate_faces_with(mesh, &faces, mode))
+                });
+            }
+            MeshAction::Scalpel => {
+                if !self.mesh_scalpel_ready() {
+                    self.status = if !self.mesh_component_selection_ready() {
+                        "Enter component mode with editable meshes first".into()
+                    } else if !matches!(
+                        self.mesh_select_mode,
+                        MeshSelectMode::Points | MeshSelectMode::Edges
+                    ) {
+                        "Scalpel works in point or edge mode".into()
+                    } else {
+                        "Select two edges or two points of one polygon to cut".into()
+                    };
+                    return;
+                }
+                let mode = self.mesh_select_mode;
+                self.apply_mesh_operation("Cut polygon", move |_, mesh, components| {
+                    let (face, from, to) = scalpel_cut(mesh, mode, components)?;
+                    lc_geom::scalpel_face(mesh, face, from, to)
                 });
             }
             MeshAction::FlipNormal => {
@@ -1171,7 +1759,7 @@ impl LeopardApp {
                     })
                     .unwrap_or_default();
             }
-            MeshAction::TogglePinnedUv => self.toggle_selected_uv_pin(),
+            MeshAction::TogglePinnedUv => self.toggle_selected_uv_pins(),
             MeshAction::AssignMaterial => self.assign_material_to_selected_faces(),
         }
     }
@@ -1553,6 +2141,294 @@ impl LeopardApp {
         } else {
             format!("Assigned material {material_id} on {count} objects")
         };
+    }
+
+    /// Nearest point that lies on an open boundary, used by the click-driven
+    /// Fill Hole tool. Picking ignores the current component mode because the
+    /// manual's tool is available in all three modes.
+    pub(super) fn pick_boundary_point(
+        &self,
+        mesh: &Mesh,
+        world: Mat4,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+        pointer: Pos2,
+    ) -> Option<u32> {
+        let boundary: HashSet<u32> = mesh.boundary_loops().into_iter().flatten().collect();
+        let mut best: Option<(f32, u32)> = None;
+        for (i, p) in mesh.positions.iter().enumerate() {
+            if !boundary.contains(&(i as u32)) {
+                continue;
+            }
+            let Some(screen) = self.project(world.transform_point3(*p), rect, pixel_w, pixel_h)
+            else {
+                continue;
+            };
+            let distance = (screen - pointer).length();
+            if distance < 10.0 && best.map(|(d, _)| distance < d).unwrap_or(true) {
+                best = Some((distance, i as u32));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// Fill the hole whose border contains `point`, without changing the
+    /// component selection first. The result is one undo step and the stale
+    /// component selection is cleared, matching the selection-driven command.
+    pub(super) fn fill_hole_at(&mut self, point: u32) {
+        if !self.mesh_edit {
+            self.status = "Enter component mode first".into();
+            return;
+        }
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Select an editable mesh first".into();
+            return;
+        };
+        let holes = lc_geom::open_holes(&mesh, &[point]);
+        if holes.is_empty() {
+            self.status = "Click a point on an open hole border".into();
+            return;
+        }
+        let updated = match lc_geom::fill_holes(&mesh, &holes) {
+            Ok(updated) if updated == mesh => {
+                self.status = "Filled hole: no change".into();
+                return;
+            }
+            Ok(updated) => updated,
+            Err(error) => {
+                self.status = format!("Filled hole failed: {error}");
+                return;
+            }
+        };
+        if let Err(errors) = updated.validate() {
+            self.status = format!("Mesh edit rejected: {}", errors.join("; "));
+            return;
+        }
+        let Some(node) = self.doc.scene.get(id) else {
+            return;
+        };
+        let before = Shape::of(node);
+        let mut after = before.clone();
+        after.kind = match after.kind {
+            NodeKind::Mesh { geometry } => NodeKind::Mesh {
+                geometry: geometry.with_mesh(updated),
+            },
+            other => other,
+        };
+        self.history.execute(
+            &mut self.doc,
+            Box::new(SetShapesCmd {
+                edits: vec![(id, before, after)],
+            }),
+        );
+        self.clear_mesh_component_selection();
+        self.status = "Filled hole".into();
+    }
+
+    /// The pick ray in the mesh's local space, shared by the Scalpel's edge
+    /// parameter and face hit tests.
+    fn pointer_ray(
+        &self,
+        world: Mat4,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+        pointer: Pos2,
+    ) -> lc_core::Ray {
+        let pixel = glam::Vec2::new(
+            (pointer.x - rect.min.x) / rect.width().max(1.0) * pixel_w as f32,
+            (pointer.y - rect.min.y) / rect.height().max(1.0) * pixel_h as f32,
+        );
+        let mut rng = Pcg32::new(1);
+        let ray = lc_render::RenderCamera::new(self.orbit.world(), self.orbit.camera()).ray(
+            pixel,
+            glam::Vec2::new(pixel_w as f32, pixel_h as f32),
+            &mut rng,
+        );
+        let inv = world.inverse();
+        lc_core::Ray::new(
+            inv.transform_point3(ray.origin),
+            inv.transform_vector3(ray.dir),
+        )
+    }
+
+    /// Pick the Scalpel's cut end under the pointer: the nearest point within
+    /// the point tolerance, otherwise the nearest edge segment and the point on
+    /// it closest to the pick ray. Points win, so a click on a corner is a point
+    /// pick.
+    pub(super) fn pick_scalpel_pick(
+        &self,
+        mesh: &Mesh,
+        world: Mat4,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+        pointer: Pos2,
+    ) -> Option<lc_geom::ScalpelPick> {
+        let mut best_point: Option<(f32, u32)> = None;
+        for (i, p) in mesh.positions.iter().enumerate() {
+            let Some(screen) = self.project(world.transform_point3(*p), rect, pixel_w, pixel_h)
+            else {
+                continue;
+            };
+            let distance = (screen - pointer).length();
+            if distance < 10.0 && best_point.map(|(d, _)| distance < d).unwrap_or(true) {
+                best_point = Some((distance, i as u32));
+            }
+        }
+        if let Some((_, point)) = best_point {
+            return Some(lc_geom::ScalpelPick::Point(point));
+        }
+        let ray = self.pointer_ray(world, rect, pixel_w, pixel_h, pointer);
+        let mut best_edge: Option<(f32, u32, u32, f32)> = None;
+        for edge in mesh.edges() {
+            if edge.a == edge.b {
+                continue;
+            }
+            let (Some(from), Some(to), Some(start), Some(end)) = (
+                mesh.positions.get(edge.a as usize),
+                mesh.positions.get(edge.b as usize),
+                mesh.positions
+                    .get(edge.a as usize)
+                    .and_then(|p| self.project(world.transform_point3(*p), rect, pixel_w, pixel_h)),
+                mesh.positions
+                    .get(edge.b as usize)
+                    .and_then(|p| self.project(world.transform_point3(*p), rect, pixel_w, pixel_h)),
+            ) else {
+                continue;
+            };
+            let segment = end - start;
+            let length_sq = segment.length_sq();
+            if length_sq <= 1e-6 {
+                continue;
+            }
+            let screen_t = ((pointer - start).dot(segment) / length_sq).clamp(0.0, 1.0);
+            let distance = (start + segment * screen_t - pointer).length();
+            if distance < 8.0 && best_edge.map(|(d, ..)| distance < d).unwrap_or(true) {
+                // The picked position is the point on the 3D edge nearest the
+                // pick ray, so clicking a projected midpoint inserts the true
+                // midpoint instead of a screen-space approximation.
+                let t = closest_segment_parameter(&ray, *from, *to).unwrap_or(screen_t);
+                best_edge = Some((distance, edge.a, edge.b, t));
+            }
+        }
+        best_edge.map(|(_, a, b, t)| lc_geom::ScalpelPick::Edge { a, b, t })
+    }
+
+    /// The polygon under the pointer, used to choose which face a chained
+    /// Scalpel cut splits when the two picks alone belong to more than one.
+    pub(super) fn pick_mesh_face(
+        &self,
+        mesh: &Mesh,
+        world: Mat4,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+        pointer: Pos2,
+    ) -> Option<u32> {
+        let local = self.pointer_ray(world, rect, pixel_w, pixel_h, pointer);
+        let mut best: Option<(f32, u32)> = None;
+        for (face, poly) in mesh.polygons.iter().enumerate() {
+            for tri in mesh.polygon_triangles(face) {
+                let points = [tri[0], tri[1], tri[2]].map(|corner| poly.corners[corner].point);
+                let (Some(a), Some(b), Some(c)) = (
+                    mesh.positions.get(points[0] as usize),
+                    mesh.positions.get(points[1] as usize),
+                    mesh.positions.get(points[2] as usize),
+                ) else {
+                    continue;
+                };
+                if let Some((t, _, _)) = ray_triangle(&local, *a, *b, *c) {
+                    if t > 1e-5 && best.map(|(nearest, _)| t < nearest).unwrap_or(true) {
+                        best = Some((t, face as u32));
+                    }
+                }
+            }
+        }
+        best.map(|(_, face)| face)
+    }
+
+    /// Apply one Scalpel click: the first pick starts a cut, the second splits
+    /// the polygon that holds both picks, and the cut's end point becomes the
+    /// next start until ESC (source 43). Each completed cut is one undo step.
+    pub(super) fn scalpel_click_at(
+        &mut self,
+        pick: lc_geom::ScalpelPick,
+        under_pointer: Option<u32>,
+    ) {
+        if !self.mesh_edit {
+            self.status = "Enter component mode first".into();
+            return;
+        }
+        let Some((id, mesh)) = self.selected_editable_mesh() else {
+            self.status = "Select an editable mesh first".into();
+            return;
+        };
+        if !scalpel_pick_on_any_face(&mesh, pick) {
+            self.status = "Click a point or edge of a polygon".into();
+            return;
+        }
+        // Another edit can replace the mesh without going through undo, so drop
+        // a start the current mesh no longer has and let this click begin a new
+        // cut instead of refusing every click against the stale start.
+        let stale = self
+            .scalpel_start
+            .is_some_and(|start| !scalpel_pick_on_any_face(&mesh, start));
+        if stale {
+            self.scalpel_start = None;
+        }
+        let Some(start) = self.scalpel_start else {
+            self.scalpel_start = Some(pick);
+            self.status = if stale {
+                "Scalpel: the previous start no longer exists; this click starts a new cut".into()
+            } else {
+                "Scalpel start set: click a second point or edge of the same polygon".into()
+            };
+            return;
+        };
+        let Some(face) = scalpel_chain_face(&mesh, under_pointer, start, pick) else {
+            self.status =
+                "Scalpel: the second pick must be on the polygon that holds the cut start".into();
+            return;
+        };
+        let (updated, _, end) = match lc_geom::scalpel_face_ends(&mesh, face, start, pick) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status = format!("Scalpel failed: {error}");
+                return;
+            }
+        };
+        if let Err(errors) = updated.validate() {
+            self.status = format!("Mesh edit rejected: {}", errors.join("; "));
+            return;
+        }
+        let Some(node) = self.doc.scene.get(id) else {
+            return;
+        };
+        let before = Shape::of(node);
+        let mut after = before.clone();
+        after.kind = match after.kind {
+            NodeKind::Mesh { geometry } => NodeKind::Mesh {
+                geometry: geometry.with_mesh(updated),
+            },
+            other => other,
+        };
+        self.history.execute(
+            &mut self.doc,
+            Box::new(SetShapesCmd {
+                edits: vec![(id, before, after)],
+            }),
+        );
+        self.clear_mesh_component_selection();
+        self.scalpel_start = Some(lc_geom::ScalpelPick::Point(end));
+        self.status = "Cut polygon: the end point is the next start (Esc resets)".into();
+    }
+
+    /// ESC resets the chained cut without leaving the tool.
+    pub(super) fn scalpel_cancel(&mut self) {
+        self.scalpel_start = None;
+        self.status = "Scalpel reset: click a point or edge to start a cut".into();
     }
 
     pub(super) fn pick_mesh_component(

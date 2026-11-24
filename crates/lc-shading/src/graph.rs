@@ -229,6 +229,11 @@ pub enum ShaderNodeKind {
     },
     Texture {
         path: String,
+        /// Which UV set the image is sampled with. 0 is UV0; higher values use
+        /// the hit's additional sets, falling back to UV0 when the mesh has no
+        /// such set. Old files default to UV0.
+        #[serde(default)]
+        uv_set: u32,
     },
 }
 
@@ -337,6 +342,10 @@ pub struct ShaderGraph {
 #[derive(Clone, Copy, Debug)]
 pub struct ShadingContext<'a> {
     pub uv: Vec2,
+    /// Additional UV sets at the shaded point, starting at UV1. Empty when the
+    /// hit carries no extra sets, in which case every texture falls back to
+    /// `uv`.
+    pub extra_uvs: &'a [Vec2],
     pub position: Vec3,
     pub normal: Vec3,
     pub tangent: Vec3,
@@ -349,6 +358,7 @@ impl<'a> ShadingContext<'a> {
     pub fn new(textures: &'a TextureCache) -> Self {
         Self {
             uv: Vec2::ZERO,
+            extra_uvs: &[],
             position: Vec3::ZERO,
             normal: Vec3::Y,
             tangent: Vec3::X,
@@ -362,6 +372,20 @@ impl<'a> ShadingContext<'a> {
         self.uv = uv;
         self.position += offset;
         self
+    }
+
+    /// The coordinate a texture bound to `set` should sample. UV0 and missing
+    /// sets read the primary coordinate, so a material never samples a stale
+    /// set just because the mesh lost one.
+    pub fn uv_for_set(&self, set: u32) -> Vec2 {
+        if set == 0 {
+            self.uv
+        } else {
+            self.extra_uvs
+                .get(set as usize - 1)
+                .copied()
+                .unwrap_or(self.uv)
+        }
     }
 }
 
@@ -392,7 +416,115 @@ impl Default for Surface {
     }
 }
 
+impl ShaderValue {
+    pub fn is_finite(self) -> bool {
+        match self {
+            Self::Float(value) => value.is_finite(),
+            Self::Color(value) | Self::Vector(value) => value.is_finite(),
+        }
+    }
+}
+
+fn shader_kind_is_finite(kind: &ShaderNodeKind) -> bool {
+    match kind {
+        ShaderNodeKind::MaterialOutput | ShaderNodeKind::Principled | ShaderNodeKind::Uv => true,
+        ShaderNodeKind::Value { value } => value.is_finite(),
+        ShaderNodeKind::Rgb { color } => color.is_finite(),
+        ShaderNodeKind::Noise {
+            scale,
+            roughness,
+            distortion,
+            ..
+        } => scale.is_finite() && roughness.is_finite() && distortion.is_finite(),
+        ShaderNodeKind::Voronoi { scale, jitter } => scale.is_finite() && jitter.is_finite(),
+        ShaderNodeKind::Checker {
+            scale,
+            color_a,
+            color_b,
+        } => scale.is_finite() && color_a.is_finite() && color_b.is_finite(),
+        ShaderNodeKind::Gradient { scale, .. } => scale.is_finite(),
+        ShaderNodeKind::Geometry { .. } => true,
+        ShaderNodeKind::Fresnel { ior } => ior.is_finite(),
+        ShaderNodeKind::Bump { strength, distance } => strength.is_finite() && distance.is_finite(),
+        ShaderNodeKind::NormalMap { strength } => strength.is_finite(),
+        ShaderNodeKind::Mapping {
+            scale,
+            offset,
+            rotation_z_deg,
+        } => scale.is_finite() && offset.is_finite() && rotation_z_deg.is_finite(),
+        ShaderNodeKind::Math { .. } | ShaderNodeKind::Mix { .. } => true,
+        ShaderNodeKind::ColorRamp { stops } => stops
+            .iter()
+            .all(|stop| stop.position.is_finite() && stop.color.is_finite()),
+        ShaderNodeKind::Texture { .. } => true,
+    }
+}
+
 impl ShaderGraph {
+    /// Check the invariants that the editor's link/add operations maintain.
+    /// Serialized graphs arrive from outside the process, so a graph with a
+    /// duplicate node id, a dangling link or a non-finite parameter must be
+    /// rejected before it can replace a material.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut outputs = 0usize;
+        let mut max_id = None;
+        for node in &self.nodes {
+            if !ids.insert(node.id) {
+                return Err(format!("duplicate shader node id {}", node.id));
+            }
+            max_id = Some(max_id.map_or(node.id, |max: u32| max.max(node.id)));
+            if matches!(node.kind, ShaderNodeKind::MaterialOutput) {
+                outputs += 1;
+            }
+            if !node.position.is_finite() {
+                return Err(format!("shader node {} has a non-finite position", node.id));
+            }
+            if node.inputs.iter().any(|value| !value.is_finite()) {
+                return Err(format!("shader node {} has a non-finite input", node.id));
+            }
+            if !shader_kind_is_finite(&node.kind) {
+                return Err(format!("shader node {} has non-finite parameters", node.id));
+            }
+        }
+        if outputs > 1 {
+            return Err("a shader graph can contain only one Material Output node".into());
+        }
+        if let Some(max_id) = max_id {
+            if self.next_id <= max_id {
+                return Err(format!(
+                    "shader graph next_id {} must be greater than the highest node id {max_id}",
+                    self.next_id
+                ));
+            }
+        }
+        let mut targets = std::collections::BTreeSet::new();
+        for link in &self.links {
+            let Some(from) = self.node(link.from) else {
+                return Err(format!("shader link references missing node {}", link.from));
+            };
+            let Some(to) = self.node(link.to) else {
+                return Err(format!("shader link references missing node {}", link.to));
+            };
+            if from.id == to.id {
+                return Err(format!("shader node {} links to itself", link.from));
+            }
+            if link.to_input >= to.kind.input_names().len() {
+                return Err(format!(
+                    "shader node {} has no input {}",
+                    link.to, link.to_input
+                ));
+            }
+            if !targets.insert((link.to, link.to_input)) {
+                return Err(format!(
+                    "shader node {} input {} is linked more than once",
+                    link.to, link.to_input
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn empty() -> Self {
         Self::default()
     }
@@ -470,7 +602,7 @@ impl ShaderGraph {
         self.nodes
             .iter()
             .filter_map(|n| match &n.kind {
-                ShaderNodeKind::Texture { path } if !path.is_empty() => Some(path.clone()),
+                ShaderNodeKind::Texture { path, .. } if !path.is_empty() => Some(path.clone()),
                 _ => None,
             })
             .collect()
@@ -488,8 +620,9 @@ impl ShaderGraph {
                     ShaderValue::Color(c) | ShaderValue::Vector(c) => h.write_vec3(*c),
                 }
             }
-            if let ShaderNodeKind::Texture { path } = &n.kind {
+            if let ShaderNodeKind::Texture { path, uv_set } = &n.kind {
                 h.write_str(path);
+                h.write_u32(*uv_set);
             }
             if let ShaderNodeKind::ColorRamp { stops } = &n.kind {
                 for s in stops {
@@ -698,12 +831,12 @@ impl ShaderGraph {
                 };
                 ShaderValue::Color(c)
             }
-            ShaderNodeKind::Texture { path } => {
+            ShaderNodeKind::Texture { path, uv_set } => {
                 let uv = if self.has_link(id, 0) {
                     let v = self.input_value(id, 0, ctx, depth, stack).as_vector();
                     Vec2::new(v.x, v.y)
                 } else {
-                    ctx.uv
+                    ctx.uv_for_set(*uv_set)
                 };
                 let color = if path.is_empty() {
                     Vec3::splat(0.8)
@@ -824,6 +957,7 @@ mod tests {
             tangent: Vec3::X,
             view_dir: Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures: &tex,
         };
         let s = graph.evaluate(&c);
@@ -842,6 +976,7 @@ mod tests {
             tangent: Vec3::X,
             view_dir: Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures: &tex,
         };
         let mut graph = ShaderGraph::new_principled();
@@ -863,6 +998,49 @@ mod tests {
     }
 
     #[test]
+    fn texture_uv_set_selects_the_coordinate() {
+        use crate::texture::{Texture2D, TextureCache};
+        let mut tex = TextureCache::default();
+        tex.insert(
+            "two",
+            Texture2D::from_pixels(2, 1, vec![Vec3::ZERO, Vec3::ONE]),
+        );
+        let mut graph = ShaderGraph::new_principled();
+        let principled = graph.nodes[1].id;
+        let node = graph.add_node(
+            ShaderNodeKind::Texture {
+                path: "two".into(),
+                uv_set: 1,
+            },
+            Vec2::ZERO,
+        );
+        assert!(graph.link(node, principled, 0));
+        let sample = |uv: Vec2, extra: &[Vec2]| {
+            let ctx = ShadingContext {
+                uv,
+                extra_uvs: extra,
+                position: Vec3::ZERO,
+                normal: Vec3::Y,
+                tangent: Vec3::X,
+                view_dir: Vec3::Z,
+                time: 0.0,
+                textures: &tex,
+            };
+            graph.evaluate(&ctx).base_color.x
+        };
+        // UV0 is the black texel; UV1 is the white one, so the selected set
+        // decides the sampled colour.
+        assert!(sample(Vec2::new(0.25, 0.5), &[Vec2::new(0.75, 0.5)]) > 0.9);
+        // A mesh without UV1 falls back to UV0 instead of a stale coordinate.
+        assert!(sample(Vec2::new(0.25, 0.5), &[]) < 0.1);
+        let sig = graph.signature();
+        if let ShaderNodeKind::Texture { uv_set, .. } = &mut graph.nodes[2].kind {
+            *uv_set = 0;
+        }
+        assert_ne!(graph.signature(), sig);
+    }
+
+    #[test]
     fn cycles_do_not_hang_or_panic() {
         let (tex, uv, pos, normal) = ctx();
         let c = ShadingContext {
@@ -872,6 +1050,7 @@ mod tests {
             tangent: Vec3::X,
             view_dir: Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures: &tex,
         };
         let mut graph = ShaderGraph::new_principled();
@@ -897,6 +1076,7 @@ mod tests {
             tangent: Vec3::X,
             view_dir: Vec3::Z,
             time: 0.0,
+            extra_uvs: &[],
             textures: &tex,
         };
         let mut graph = ShaderGraph::new_principled();
@@ -939,5 +1119,40 @@ mod tests {
         let back: ShaderGraph = serde_json::from_str(&json).unwrap();
         assert_eq!(g, back);
         assert_eq!(g.signature(), back.signature());
+    }
+    #[test]
+    fn validate_rejects_malformed_serialized_graphs() {
+        let graph = ShaderGraph::new_principled();
+        assert!(graph.validate().is_ok());
+
+        let mut duplicate = graph.clone();
+        duplicate.nodes[1].id = duplicate.nodes[0].id;
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .contains("duplicate shader node id"));
+
+        let mut dangling = graph.clone();
+        dangling.links[0].from = 99;
+        assert!(dangling.validate().unwrap_err().contains("missing node 99"));
+
+        let mut bad_input = graph.clone();
+        bad_input.links[0].to_input = 9;
+        assert!(bad_input.validate().is_err());
+
+        let mut repeated = graph.clone();
+        repeated.links.push(repeated.links[0].clone());
+        assert!(repeated
+            .validate()
+            .unwrap_err()
+            .contains("linked more than once"));
+
+        let mut stale_next = graph.clone();
+        stale_next.next_id = 0;
+        assert!(stale_next.validate().is_err());
+
+        let mut non_finite = graph.clone();
+        non_finite.nodes[0].position.x = f32::NAN;
+        assert!(non_finite.validate().is_err());
     }
 }

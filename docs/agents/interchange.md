@@ -18,14 +18,16 @@ must say so.
 - `obj.rs` — OBJ/MTL pairs, transactional writes.
 - `stl.rs` — binary and ASCII STL.
 - `gltf.rs` — glTF 2.0 JSON and GLB parse/write, skins, morph targets, node
-  animation, `ImportReport`.
+  animation, `ImportReport` and `animation_export_report`.
 - `common.rs` — shared path/atomic-write helpers.
 
 ## Invariants
 
 - Never silently drop authored data. Anything the target format cannot carry is
   reported in `ImportReport`/the status line, and a lossy import is never
-  presented as complete.
+  presented as complete. Export resolves animation channels through
+  `ChannelAddress`/`track_for`; a channel with no glTF TRS path is skipped and
+  named by `animation_export_report`, never written onto another node.
 - Importers reject malformed data with a message and never panic on bad
   indices, truncation, NaN/infinite values or unsupported extensions. Delegate
   final sanitization to the document loader.
@@ -36,6 +38,10 @@ must say so.
   Do not duplicate evaluation, undo or node-ID allocation.
 - Determinism: write containers in stable order and avoid `HashMap` iteration
   order in output. No network, clock or unseeded randomness.
+- glTF carries extra mesh UV sets as `TEXCOORD_1`… in both export and import,
+  preserving them as parallel `Mesh::extra_uvs`. OBJ has one UV channel: it
+  writes UV0 and a `# skipped N additional UV set(s)` comment so the loss is
+  visible rather than silent.
 - Units and conventions follow the format: glTF is metres and radians, OBJ/STL
   are as authored, native is metres and normalized quaternions.
 

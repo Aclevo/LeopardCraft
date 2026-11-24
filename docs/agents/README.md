@@ -8,6 +8,12 @@ agent reads that file first, then this playbook, then its own brief.
 The repository does not run agents itself. The orchestrator (a main Claude Code
 session, another coding host, or a human) dispatches task packets, collects
 handoffs, applies shared-document edits and runs the full integration gate.
+[`scripts/spawn-lane.sh`](../../scripts/spawn-lane.sh) is the single dispatch
+interface for that: it hands one lane packet to the host's `spawn_agents` bridge
+when one is exported, otherwise to the promptable Codebuff CLI, and it prints
+the composed prompt for an interactive session. Host mechanics — why an
+in-session `spawn_agents` can refuse every lane id, and the exact command for
+Codebuff, `claude` and a manual session — are in [`spawning.md`](spawning.md).
 
 ## Lane model
 
@@ -35,12 +41,25 @@ parallel agents would create constant conflicts.
 The lane briefs are host-agnostic. Two thin adapters expose the same lanes:
 
 - `.claude/agents/lc-*.md` — Claude Code project subagents.
-- `.agents/lc-*.ts` plus `.agents/lc-coordinator.ts` — Freebuff/Codebuff CLI
-  local agents. See [`../../.agents/README.md`](../../.agents/README.md) for the
-  trust gate, Projects access and the shared model constant.
+- `.agents/lc-*.ts` plus `.agents/lc-coordinator.ts` — Codebuff CLI local
+  agents (Freebuff loads the same files but refuses their turns; see
+  [`spawning.md`](spawning.md)).
+  [`../../.agents/README.md`](../../.agents/README.md) covers the trust gate,
+  Projects access and the shared model constant.
 
 Both adapters are integrator-owned and change with the lane table and
 `scripts/check-lane.sh`.
+
+## Batch goals
+
+Multi-lane batches are recorded under [`goals/`](goals/) with a stable id, lane
+packets, acceptance checks and a definition of done. The goal file is the
+startable unit for a new session: hand it to `lc-coordinator` in Codebuff, or
+start a Freebuff Mission with the goal text (a Mission runs Freebuff's own
+agents, not the lane definitions). [`goals/ROADMAP.md`](goals/ROADMAP.md) indexes the
+remaining backlog as G30–G39; G30, G31 and G32 are complete, and `G33.md` is the next
+startable mission. Update a goal's status as lanes land, and remove its pointers
+from `AGENTS.md` and `TODO.md` when it closes.
 
 ## Shared files
 
@@ -49,7 +68,7 @@ integrator (the main/orchestrating session), not by a lane:
 
 - `AGENTS.md`, `CLAUDE.md`, `README.md`, `TODO.md`
 - `Cargo.toml`, `Cargo.lock`
-- `scripts/check.sh`, `scripts/check-lane.sh`
+- `scripts/check.sh`, `scripts/check-lane.sh`, `scripts/spawn-lane.sh`
 - `.github/`, `packaging/`, `.gitignore`
 - `docs/cheetah3d-parity.md`, `docs/agents/README.md`, `.claude/agents/`
 
@@ -74,7 +93,7 @@ changes", and the owning lane lands them before dependent work starts:
 | `lc-scene/src/eval.rs` `EvaluatedScene` | document | rendering, editor, automation | rendering + editor lane checks |
 | `lc-scene/src/undo.rs` command vocabulary | document | editor, automation | editor + automation lane checks |
 | `lc-scene/src/format.rs` serialized schema | document | interchange, editor | interchange lane check and a legacy-load test |
-| `lc-anim/src/lib.rs` `AnimChannel` registry | document | editor, interchange | editor lane check |
+| `lc-anim/src/lib.rs` `AnimChannel` registry and `ChannelAddress` | document | editor, interchange | editor lane check |
 | MCP tool inventory and schemas | automation | root docs, rendered/exported output | `scripts/check-lane.sh automation` |
 | `crates/lc-core` public math/types | geometry | every crate | full gate after merge |
 
@@ -133,6 +152,13 @@ Two worked examples:
   missing skin/animation types with serde defaults and a legacy-load test;
   interchange reads them and reports skipped data. If no contract change is
   needed, interchange runs alone and adds parse/round-trip tests.
+- **Multiple UV sets** (geometry + document + editor + interchange): geometry
+  adds the parallel-set storage helpers and slot-preserving operations;
+  document gives the field a serde default, repairs damaged lengths and tests
+  native round-trip; editor adds the set selector and routes UV edits to the
+  active set; interchange finally maps the sets to glTF `TEXCOORD_n` and names
+  the OBJ loss. Material binding to a non-zero set stays out of this sequence
+  because it touches the rendering lane.
 
 ## Working agreement
 

@@ -61,6 +61,15 @@ parity.
 39. Manual mirror (Split tool: new object, modes, tags copied) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/SplitTool/SplitTool.html>
 40. Cheetah3D user forum, "Cutting objects in half" (Split leaves the source polygons in place) — <https://www.cheetah3d.com/forum/index.php?threads/3580/>
 41. Manual mirror (Shell tool: wall workflow, modes, Inside/Angle/Quantize) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/ShellTool/ShellTool.html>
+42. Manual mirror (Clone tool: modes and Copy/Holes/Direction/Scale/Rotation/variation properties) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/CloneTool/CloneTool.html>
+43. Manual mirror (Scalpel tool: edge/point clicks, chained cuts and ESC) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/ScalpelTool/ScalpelTool.html>
+44. Stam and Loop, *Quad/Triangle Subdivision*, Computer Graphics Forum 22(1):79–85 (2003) — <https://www.dgp.toronto.edu/public_user/stam/reality/Research/pdf/qtEG.pdf>
+45. Warren and Schaefer, *A Crash Course on Subdivision* (the same two-pass factorization with explicit quad/triangle masks) — <https://www.cs.rice.edu/~jwarren/papers/subdivision_tutorial.pdf>
+46. Manual mirror (Ring Cut tool: edge click, drag adjust and Shift normal move) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/RingCutTool/RingCutTool.html>
+47. Manual mirror (Weld tool: two point clicks, To property and ESC) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/WeldTool/WeldTool.html>
+48. Manual mirror (Bridge tool: two border point clicks) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/BridgeTool/BridgeTool.html>
+49. Manual mirror (Insert Point tool: polygon, edge and empty-space clicks) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Common/InsertPointTool/InsertPointTool.html>
+50. Manual mirror (Catmull-Clark Subdivide tool: menu command on the mesh or the selected polygons) — <https://tgjp.github.io/Cheetah3D_jp/Cheetah3Dmanual/Tools/Polygon/SubdivideTool/SubdivideTool.html>
 
 ## Matrix
 
@@ -68,24 +77,24 @@ parity.
 | --- | --- | --- | --- | --- |
 | Modelling — primitives | 12 parametric primitives | 8: box, sphere, capsule, cylinder, cone, disc, torus, plane | Partial | No tube, polygon, subdivision or other creator objects |
 | Modelling — splines | 9 spline types | 1 spline object with linear, Bézier and smooth interpolation | Partial | No separate Helix, Spiral, Text, Path or similar creators |
-| Modelling — polygon tools | Extrude, inner extrude, bevel, bridge, collapse, cover, create polygon, crumple, disconnect, edge rotate, fill hole, flip normal, jigsaw, normal move/rotate/scale, optimize, point slide, ring cut, scalpel, shell, split, triangulate, weld, array and clone | Extrude, inset, bevel, ring cut, weld, collapse, bridge, fill hole, cover, create polygon, flip normal, split, disconnect, optimize, point slide, shell, triangulate, component move/rotate/scale, material assignment | Partial | No scalpel or clone; Fill Hole acts on the current component selection rather than a viewport click, Split copies the polygons instead of moving them (source 40), Shell uses typed thickness/Inside/Angle/Quantize fields instead of the documented drag gesture (source 41), and Triangulate fans from the polygon's first corner because the manual page is not among the indexed sources |
-| Modelling — modifiers | Roughly 18 documented modifiers including subdivision, displacement, formula, magnet, polygon reduction, smooth and wrap | 15: subdivision (Catmull-Clark or Linear), extrude/bevel faces, array, symmetry, boolean, bend, taper, twist, shear, bulge, spherify, lathe, sweep, ring cut | Partial | No displacement, formula, magnet, polygon reduction, Laplacian smooth, wrap or cage/type controls; Boolean and subdivision favour robustness over speed |
-| Modelling — subdivision | Catmull-Clark, Stam-Loop and linear subdivision; creased edges under the smooth schemes | Catmull-Clark, Stam-Loop and Linear schemes; per-edge creases toggled in Edge mode and honoured by Catmull-Clark and Stam-Loop | Partial | Stam-Loop is a clean-room Loop-on-triangulated-cage approximation, not a verified Stam implementation; no crease weights, partial subdivision or crease display outside Edge mode |
+| Modelling — polygon tools | Extrude, inner extrude, bevel, bridge, collapse, cover, create polygon, crumple, disconnect, edge rotate, fill hole, flip normal, jigsaw, normal move/rotate/scale, optimize, point slide, ring cut, scalpel, shell, split, triangulate, weld, array and clone | Extrude, inset, bevel, ring cut, weld, collapse, bridge, fill hole with border-click tool, cover, create polygon, flip normal, split, disconnect, optimize, point slide, shell, triangulate with Shortest Diagonal/Quad Pair, Clone with Copies/Holes/Direction/Scale/Rotation/variations, scalpel between two boundary picks, component move/rotate/scale, material assignment | Partial | Scalpel cuts one polygon between two edge or point picks and the click tool chains as documented (a cut's end point becomes the next start, ESC resets, source 43), with the polygon under the pointer resolving the face when two picks share an edge; Split copies the polygons instead of moving them (source 40), and Shell uses typed thickness/Inside/Angle/Quantize fields instead of the documented drag gesture (source 41) |
+| Modelling — modifiers | Roughly 18 documented modifiers including subdivision, displacement, formula, magnet, polygon reduction, smooth and wrap | 21: subdivision (Catmull-Clark, Stam-Loop or Linear), extrude/bevel faces, array, symmetry, boolean, bend, taper, twist, shear, bulge, spherify, displacement, magnet, lathe, sweep, ring cut, formula, Laplacian smooth, polygon reduction and wrap, with shared Cage/Type controls on the deformers | Partial | Displacement reads a procedural noise field instead of a texture, Formula is a clean-room per-axis expression dialect, and Laplacian smooth, polygon reduction and wrap are named approximations of undocumented pages; Boolean and subdivision favour robustness over speed |
+| Modelling — subdivision | Catmull-Clark, Stam-Loop and linear subdivision; creased edges under the smooth schemes | Catmull-Clark, Stam-Loop and Linear schemes; full and fractional per-edge creases honoured by both smooth schemes and visible in every selection mode; watertight face-selective Subdivide tool; Constrained/Unconstrained/Cage Type on the deformers | Partial | Stam-Loop is still a clean-room Loop-on-triangulated-cage approximation, not the documented hybrid: Cheetah3D's Subdivision modifier says Stam-Loop "behaves much better on mixed meshes which include both quads and triangles" (source 5) while LeopardCraft triangulates the whole cage first, and the published two-pass hybrid (sources 44 and 45) is researched but not implemented |
 | Modelling — booleans | Union, subtract, intersect | Union, subtract, intersect BSP boolean modifier | Yes | Mesh operand is chosen in the modifier stack |
-| UV | UV editor, cubic/spherical/flat/cylindrical/frontal mapping, ABF/LSCM unwrap, Autoseam, pinned UVs, UV PDF | UV view, planar/box/cylindrical/spherical projection, seam edges, seam-driven automatic unwrap and per-chart relax, pinned UVs | Partial | No ABF/LSCM, Autoseam, chart tools, multiple UV sets or UV PDF export; seams are authored in the 3D view only and the UV view pins one point at a time |
+| UV | UV editor, cubic/spherical/flat/cylindrical/frontal mapping, ABF/LSCM unwrap, Autoseam, pinned UVs, UV PDF | UV view with multi-point selection, seam authoring (toggle/all/loop/clear), multi-point pins, chart move/rotate/scale, shelf packing with padding/rotation/alignment, weld/split/align/distribute/flip/rotate/numeric entry, UV0/UV1/… sets, per-texture UV set binding, checker and distortion overlays | Partial | No ABF/LSCM, Autoseam or UV PDF export; charts are a seams-and-angle splitter and packing is a shelf packer, not a distortion-minimising solver |
 | Materials | Node materials, PBR/Principled workflow, procedural textures | Node material graph, Principled surface, procedural noise, texture cache | Partial | Core authoring path exists; not every Cheetah node type is present |
 | Rendering — engines | Cheetah raytracer (irradiance cache, photon maps) and Falcon path tracer | One CPU path tracer with progressive accumulation | Partial | No second engine or photon-mapped caustics |
-| Rendering — camera/lighting | HDRI/sky, area/spot/point/distant lights, depth of field, motion blur (Falcon), caustics | Environment/HDRI, sun, directional, point, area and spot lights (cone angle controls), depth of field | Partial | No motion blur or caustics; light radius is authored but soft shadows still sample the light exactly |
+| Rendering — camera/lighting | HDRI/sky, area/spot/point/distant lights, depth of field, motion blur (Falcon), caustics | Environment/HDRI, sun, directional, point, area and spot lights (cone angle controls), depth of field | Partial | No motion blur or caustics; point and spot radius samples a spherical shell for soft shadows (a clean-room approximation), while area lights use their own shape |
 | Rendering — output | Up to 8K, G-buffer/AOV output, texture baking | PNG and EXR, single-frame background render at editable resolution | Partial | No 8K preset, G-buffer, baking or animation-sequence render |
-| Animation — curves | Keyframes and F-curve editor; Constant, Linear (manual default), Smooth and Spline interpolation; `Animation -> Tangent -> Type`, `Left Tangent -> Type` and `Right Tangent -> Type` | Keyframes, F-curve editor, all four per-key interpolation modes, selection-wide `Tangent`/`Left Tangent`/`Right Tangent` Type menus, Spline tangent handles for scalar/morph curves, quaternion interpolation with per-side tangent types, key select/drag/copy/paste and selected-key factor retiming | Partial | Key filtering remains open; quaternion curves have no scalar handles; Cheetah3D calls Linear its default while LeopardCraft records new keys as Smooth |
-| Animation — takes | Take Manager for multiple animation takes | Per-object animation clips; Takes tab reports the per-object model and can retime a whole take by a factor | Partial | No document-level takes or per-take fps; a take is still stored per object |
-| Character — skinning | Joints, bind mesh with automatic weights, max influence/dropoff, weight painting with add/subtract brushes and auto-normalise | Joint objects, chosen-joint bind/rebind with normalized proximity auto-weights (dropoff/strength/max influences), four-influence paint brush, active-joint heat map | Partial | No viewport joint picking or heat-diffusion solver; selected-joint and preserve-on-rebind behavior is a clean-room extension; brush UI details are native |
-| Character — rigging | FK, IK, spline IK and constraints | Joint transforms; tip-origin IK chains with target/optional pole, analytic two-bone and damped CCD solving, reach clamping, per-joint local XYZ rotation limits and per-frame take baking | Partial | The limits are a clean-room local-Euler approximation, not Cheetah3D's IK Constraint tag/heading-pitch-bank semantics or documented 3D-only behavior; no Spline IK, IK Angle/Point constraints, stiffness, or viewport joint picking; bake uses the global playback range and writes ordinary rotation F-curves |
-| Character — morphs | Morph tag with recorded base and named target poses | Morph targets with recorded base, named poses, capture/restore and undo; dynamic Morph Weight F-curve rows, evaluation with 0–1 clamping, native round-trip and glTF export | Partial | Weight rows use LeopardCraft's F-curve interpolation and a clean-room 0–1 range; Cheetah3D documents neither the numeric range nor morph-specific interpolation; glTF import now reads morph base, target names, offsets and default weights, but not skinning or animation |
+| Animation — curves | Keyframes and F-curve editor; Constant, Linear (manual default), Smooth and Spline interpolation; `Animation -> Tangent -> Type`, `Left Tangent -> Type` and `Right Tangent -> Type` | Keyframes, F-curve editor, all four per-key interpolation modes, selection-wide `Tangent`/`Left Tangent`/`Right Tangent` Type menus, Spline tangent handles for scalar/morph curves, quaternion interpolation with per-side tangent types, key select/drag/copy/paste, key filtering, selected-key factor retiming and an editable global playback range/loop | Partial | Quaternion curves have no scalar handles; Cheetah3D calls Linear its default while LeopardCraft records new keys as Smooth |
+| Animation — takes | Take Manager for multiple animation takes | Document-level named takes with an active take, per-take fps, node/tag/material clips, create/rename/duplicate/delete/activate, and whole-clip retiming | Partial | The Takes tab is a compact document list rather than Cheetah3D's multi-column Take Manager; take-level render/visibility flags and split/trim commands are absent |
+| Character — skinning | Joints, bind mesh with automatic weights, max influence/dropoff, weight painting with add/subtract brushes and auto-normalise | Joint objects, chosen-joint bind/rebind with normalized proximity auto-weights (dropoff/strength/max influences), four-influence paint brush, active-joint heat map | Partial | No heat-diffusion solver; selected-joint, preserve-on-rebind and screen-space viewport joint picking are clean-room extensions; brush UI details are native |
+| Character — rigging | FK, IK, spline IK and constraints | Joint transforms; tip-origin IK chains with target/optional pole, analytic two-bone and damped CCD solving, reach clamping, per-joint local XYZ rotation limits, guide-curve Spline IK, chain stiffness, IK Point/Angle/Orient/Parent tags and per-frame take baking | Partial | The limits and tags are clean-room approximations, not Cheetah3D's IK Constraint tag/heading-pitch-bank semantics or documented 3D-only behavior; the chain stiffness is the opposite convention to the documented tag stiffness; Spline IK follows a guide as a chain of chords because the manual defines no solver; bake uses the global playback range and writes ordinary rotation F-curves |
+| Character — morphs | Morph tag with recorded base and named target poses | Morph targets with recorded base, named poses, capture/restore, in-place base updates that keep target poses, and undo; dynamic Morph Weight F-curve rows, evaluation with 0–1 clamping, native round-trip and glTF export | Partial | Weight rows use LeopardCraft's F-curve interpolation, base rebasing keeps each target's absolute pose (the manual does not define that transition), and the 0–1 range is clean-room; Cheetah3D documents neither the numeric range nor morph-specific interpolation; glTF import now reads morph base, target names, offsets and default weights, but not skinning or animation |
 | Dynamics | Bullet rigid and soft bodies, particles | None | No | |
-| Scene management | Tags, takes, layers, Smart Folder, autosave | Tags, layers, hierarchy, object browser, autosave/recovery, selection sets and multi-object editing | Partial | No Smart Folder or document-level takes |
+| Scene management | Tags, takes, layers, Smart Folder, autosave | Tags, document takes, layers, hierarchy, object browser, autosave/recovery, selection sets and multi-object editing | Partial | No Smart Folder or take-level render/visibility flags |
 | Interchange — native | `.jas` scene format | `.lcscene` JSON document with validation and recovery | Yes | Clean-room format, not Cheetah3D-compatible |
-| Interchange — import | FBX, OBJ/MTL, 3DS, DAE, USDZ, SCN, STL, DXF, SIA (public 8.1.3 docs list no glTF/GLB import) | OBJ/MTL, STL, glTF/GLB (mesh, materials, morph targets, cameras and all punctual light types with cones and range) and native `.lcscene` | Partial | LeopardCraft's glTF/GLB import is an extension beyond the documented Cheetah3D import list; it does not read skins or animation, and reports those and camera `aspectRatio` hints instead of dropping them silently. No FBX, 3DS, DAE, USDZ, SCN, DXF or SIA |
+| Interchange — import | FBX, OBJ/MTL, 3DS, DAE, USDZ, SCN, STL, DXF, SIA (public 8.1.3 docs list no glTF/GLB import) | OBJ/MTL, STL, glTF/GLB (mesh, materials, morph targets, cameras, punctual lights, skins and animation channels) and native `.lcscene` | Partial | LeopardCraft's glTF/GLB import is an extension beyond the documented Cheetah3D import list; cubic quaternion rotation becomes Smooth keys and camera `aspectRatio` hints are reported instead of read. No FBX, 3DS, DAE, USDZ, SCN, DXF or SIA |
 | Interchange — export | FBX, OBJ, 3DS, DAE, glTF/GLB, USDZ, STL, DXF | OBJ, STL, animated/skinned/morphing glTF/GLB and native `.lcscene` | Partial | glTF export now carries skins, morph targets and animated TRS/morph weights; no FBX, DAE, USDZ, DXF or 3DS |
 | Scripting and automation | JavaScript/WebKit macros, custom tools, loaders and exporters | Headless `selftest`/CLI paths and a headless MCP stdio server | Partial | No embedded scripting, plugin API, custom import/export hooks or live-editor automation; MCP edits its own document |
 | UI | Customisable Cheetah-style workspace, object browser, property editor, timeline, render manager | Fixed Cheetah-style egui workspace, object browser, properties, material shelf, timeline, Render Manager | Partial | Customisable panel layouts are not implemented |
@@ -107,13 +116,21 @@ LeopardCraft now mirrors the useful core of that workflow:
   `MorphTarget` offset arrays. Targets default to weight 0 and are additive.
 - **Morph Targets** appears in the mesh inspector. It records the base, captures
   the current editable-mesh pose as a target, renames targets, blends each with
-  a 0–1 slider, removes targets and restores the base.
+  a 0–1 slider, removes targets and restores the base. The Object Browser's
+  **Morphs** tab lists the same targets by owning object with weight and derived
+  On/Off state, and selecting a row selects that object.
 - Each target contributes a dynamic **Morph Weight** row to the object's
   F-curve editor. The row reads and writes `AnimationClip.morph_weights`, keyed
   by target index, and uses the same key selection, drag, copy/paste,
   interpolation and delete paths as transform channels. Recording a row stores
   the target's current weight; the row shows the target name and a per-target
   interpolation control.
+- Animation keys address a target (the clip owner, an object id, a tag or a
+  material), a registry channel and a component. The public Cheetah3D manual
+  lists which parameters are animatable but does not publish how its files
+  address them, so this address model is a LeopardCraft clean-room choice. Old
+  files that keyed flat property names load into owner-relative addresses, and
+  their Euler rotation curves stay readable.
 - Evaluation samples each morph-weight curve at the take time, falling back to
   the target's authored weight when no curve exists, restores the recorded base,
   applies the weighted offsets, then runs modifiers, skinning and the node
@@ -168,7 +185,7 @@ The shipped behavior is therefore a clean-room approximation:
 Deliberate limits of this slice:
 
 - The dynamic rows are only shown for object animation targets; morph weights
-  on other scopes do not exist. glTF import is still static, and export does not
+  on other scopes do not exist. glTF import now reads skins and animation, and export does not
   carry tags, constraints or material animations.
 - Cheetah3D's exact weight limits, negative/over-one behavior and any
   morph-specific easing remain unverified rather than claimed. Morph rows use
@@ -272,8 +289,8 @@ LeopardCraft now provides a native retiming extension:
 
 - **F-curve: Scale Keys** retimes the selected keys by a positive numeric
   factor. Its pivot is the earliest selected key, so that key stays fixed and
-  later selected keys move toward or away from it. **Takes: Retime Take**
-  retimes every key in the selected per-object take around **0 seconds**.
+  later selected keys move toward or away from it. **Takes: Retime**
+  retimes every key in the selected object's active-take clip around **0 seconds**.
 - Scalar object, tag and material tracks and morph-weight curves all receive
   new key times. Quaternion rotation keys move in the same pass; their smooth
   tangents are implicit in sampling and therefore follow the new times rather
@@ -294,7 +311,7 @@ LeopardCraft now provides a native retiming extension:
   retimed Linear interval still samples a straight segment; Smooth and Spline
   keep their automatic/manual tangent ownership rather than silently becoming
   one generic curve type.
-- Selected-key retiming and whole-take retiming are each one undo step that
+- Selected-key retiming and active-take clip retiming are each one undo step that
   restores both the old times and the old tangent slopes; the retimed clip
   round-trips through the native `.lcscene` JSON format.
 
@@ -332,8 +349,9 @@ LeopardCraft now provides:
   overwrite the whole painted skin;
 - a viewport **Weight Paint** mode for a bound editable mesh with no modifier
   stack, with Add, Subtract, Replace and Smooth brushes, radius, strength and
-  constant/linear/smooth falloff, plus a joint list and a per-vertex heat map
-  that shows zero-weight vertices in grey;
+  constant/linear/smooth falloff, plus a joint list, screen-space handles on the
+  bound joints that set the active joint, and a per-vertex heat map that shows
+  zero-weight vertices in grey;
 - automatic normalization and compaction after each brush stamp, keeping at
   most four influences;
 - one undo entry per drag stroke, and native-load repair of weight lengths,
@@ -347,9 +365,8 @@ Deliberate limits of these slices:
 - Cheetah3D's Skeleton tag computes weights for all joints in its table. Binding
   a chosen subset and preserving existing weights on rebind are clean-room
   extensions; the bind controls match the documented max-influence/dropoff
-  concepts where the sources are solid. Viewport joint picking, Only-visible
-  brush filtering, heat-diffusion weighting, Spline IK and constraints are not
-  implemented.
+  concepts where the sources are solid. Only-visible brush filtering,
+  heat-diffusion weighting and the constraint system are not implemented.
 - Smooth uses mesh-edge neighbours and smooths only the active joint's weight;
   it is not a general all-channel weight relaxer.
 
@@ -410,21 +427,57 @@ LeopardCraft now provides:
   two-bone and damped CCD paths. A zero-width axis locks that axis; reversed
   finite bounds are swapped; non-finite values fall back to the full range. The
   inspector can add, remove and edit the three ranges;
+- Spline IK: a chain may name a Spline node, and the inspector offers it in the
+  **Spline** row next to the point target. The clean-room semantics sample the
+  spline into a world-space polyline and aim each bone at the curve point one
+  bone length further along from that joint's projection onto the curve, twice
+  per solve. Rotating only keeps every bone length exact, so the chain
+  approximates the curve as a chain of chords; the tip reports its distance from
+  the curve, a guide shorter than the chain clamps to its end instead of
+  stretching, joint limits clamp after each correction, and a missing or
+  non-spline node falls back to the point target. Cheetah3D's public pages list
+  Spline IK but define neither its solver nor its twist control, so this is an
+  explicit approximation rather than claimed parity;
+- stiffness: `IkChain.stiffness` blends every solved joint back toward its
+  pre-solve rotation once, after the solve, so 1 keeps the full solve, 0 keeps
+  the rest pose and 0.5 lands halfway. One shared step serves the analytic
+  two-bone/pole, CCD and spline paths; joint limits re-clamp after the blend, and
+  the blended rotations are what skinning, playback and Bake IK read. The
+  inspector exposes it as a **Stiffness** slider. Cheetah3D's manual instead
+  describes a tag stiffness of one meaning the joint does not bend; the two
+  conventions are opposites, and this chain-wide blend was chosen so a file
+  without the field keeps solving exactly as before;
+- four clean-room constraint tags evaluated in the existing post-IK tag pass:
+  **IK Point** lerps the owner's world origin toward a target's origin by
+  `weight` (on a joint this translates the joint itself, not the bones around
+  it), **IK Angle** keeps the owner's local +X axis inside a `max_degrees` cone
+  around the direction to a target by rotating the excess back toward it (it
+  only pulls, never pushes), **Orient** slerps the owner's world rotation toward
+  a target's, and **Parent** blends a target's world position and rotation. Blend
+  weights are measured against the pose the solver produced, so the evaluator's
+  two ordering passes reproduce the same result instead of compounding a
+  partial weight; tags still apply in list order, so a later Clamp Rotation can
+  win. A joint whose only driver is one of these tags is baked by **Bake IK
+  take**. The Tags section adds them with Target and Weight/Cone rows;
 - skinning consumes the solved world matrices, so a bound mesh deforms through
   IK-driven joints. Skin arrays and their weights are not rewritten by a solve.
 
-Deliberate limits: the per-joint limits are not Cheetah3D's IK Constraint tag:
-Cheetah3D documents heading/pitch/bank coordinates on a tag and marks the limit
-properties as 3D-solver-only, while LeopardCraft uses local XYZ Euler degrees on
-the joint and applies them to direct posing and both solver paths. There is no
-stiffness control, no IK Limits/Angle/Point, Orient or Parent tag, no Spline IK
-and no viewport joint picking. The target and pole are node origins, not
-arbitrary control surfaces or curves. Tag constraints still run after IK and
-can override a solved joint; the broader constraint system remains separate.
-Bake uses the global playback range rather than document-level takes, and IK
-settings are not a glTF interchange feature (baked keys are). The two-bone pole
-is an exact bend-plane selection; the CCD pole is a preferred plane after
-convergence, not a hard twist constraint. glTF import and Cheetah3D-style
+Deliberate limits: the per-joint limits and the four constraint tags are not
+Cheetah3D's IK Constraint tag: Cheetah3D documents heading/pitch/bank
+coordinates on a tag, marks the limit properties as 3D-solver-only and
+publishes no solver for its IK tags, while LeopardCraft uses local XYZ Euler
+degrees on the joint and clean-room world-space rules (aim cone, origin pull,
+rotation copy, transform follow). Stiffness here is a chain-level blend where 1
+is a full solve, the opposite of the documented tag stiffness where one means
+the joint does not bend. Spline IK follows a guide curve as a chain of chords
+with no twist or up-vector control, and the manual publishes no spline-IK solver
+to match. The target and pole are node origins, not arbitrary control surfaces.
+Tag constraints still run after IK and can override a solved joint; the broader
+constraint system remains separate. Bake uses the global playback range rather
+than document-level takes, and IK settings are not a glTF interchange feature
+(baked keys are). The two-bone pole is an exact bend-plane selection; the CCD
+pole is a preferred plane after convergence, not a hard twist constraint. glTF
+import and Cheetah3D-style
 morph-weight interpolation/range semantics remain open. Cheetah3D publicly
 documents glTF/GLB export (source 21) but not glTF/GLB import; LeopardCraft's
 static glTF importer is therefore an extension, not a parity claim (source 22).
@@ -492,13 +545,47 @@ orthographic `ymag`, a dangling `camera`/light index, a spot cone that breaks
 `0 <= inner <= outer <= 90°`, and a light whose `type` is missing or outside the
 extension's set.
 
+Skins and animation import after the node walk, when every joint node exists.
+A node's `skin` becomes a `Skin` whose joints are the mapped node ids,
+`inverseBindMatrices` become the inverse binds (identity when the accessor is
+absent), and `JOINTS_0`/`WEIGHTS_0` are copied per imported point, clamped to
+four influences and renormalized. A joint index outside the skin, missing
+`JOINTS_0`/`WEIGHTS_0` on a skinned mesh, or a malformed inverse-bind accessor
+fails with a message naming the node. Animation channels keep glTF's seconds
+and interpolation: STEP becomes Constant, LINEAR becomes Linear, CUBICSPLINE
+becomes Spline with the authored tangents stored as hand-authored slopes, and
+cubic quaternion rotation becomes Smooth because quaternion keys have no
+tangent handles. The first animation fills the active take, later ones become
+additional takes, and a take's frame range is its clip duration at that take's
+fps.
+
 One authored field is still not representable: a camera `aspectRatio` hint,
-because LeopardCraft takes aspect from the render output. It is counted in
-`ImportReport`, whose actionable summary also counts skinned meshes and
-animation clips, which are still not imported. The editor shows the summary
-after Open and Import, MCP `open_scene` returns it as `import_report`, and
-headless startup prints it to stderr; an import with nothing to report stays
-silent and behaves exactly as before.
+because LeopardCraft takes aspect from the render output. It is the only field
+`ImportReport` still names. When a report is non-empty, Open and Import stage
+the parsed document and show an **Import Report** window before changing the
+scene; Cancel leaves the document untouched. MCP `open_scene` returns the
+summary as `import_report`, and headless startup prints it to stderr.
+
+## Clone: what this slice added
+
+Cheetah3D's Clone tool creates shifted copies of a polygon or point selection
+and exposes Copies, Holes, Direction, Scale, Rotation, position/scale/rotation
+variation and Keep ratio (source 42). LeopardCraft implements the documented
+property set in point and polygon mode; with no selection it clones every point
+or polygon, as the manual states. Each copy is transformed around the selection
+centroid, the last copy lands at the end of the Direction vector, Scale and
+Rotation interpolate from the identity at the start to the authored values at
+the last copy, and rotation is around Direction. Holes skips whole copies at the
+requested probability rather than punching holes in faces; the manual describes
+the value as only approximate, so this is a clean-room interpretation.
+
+Variation uses `Pcg32` with a fixed seed instead of wall-clock randomness, which
+keeps evaluation deterministic and makes repeated Apply commands reproducible.
+With Keep ratio the scale variation is one uniform factor; without it each axis
+varies independently. Cloned faces keep their corner UVs, material slots and
+creases, seams and fractional crease weights inside the selection; point-only
+cloning adds loose points and invents no faces. Mesh Editing's **Clone** section
+and `Tools -> Clone` commit one undo step.
 
 ## Triangulate: what this slice added
 
@@ -506,18 +593,22 @@ Cheetah3D lists a Triangulate polygon tool in its feature set (source 1); the
 manual page for it is not among the pages indexed here, so the split rule below
 is a LeopardCraft clean-room choice rather than a documented Cheetah3D rule.
 
-`lc_geom::triangulate_faces` fans each selected polygon into `corners - 2`
-triangles from its first corner. Only selected polygons change: everything else
-keeps its n-gons, so the operation edits exactly what the user selected. Each
-triangle reuses the original corner records, which keeps point indices, UV slots
-and material slots intact, and because creases, seams and pinned UV slots are
-point/corner indices they survive untouched; the new fan diagonals carry no
-crease or seam. Fans whose corners repeat a point are skipped so the result
-still validates, and out-of-range face indices are ignored. Mesh Editing's
-**Triangulate** button and `Tools -> Triangulate` share one predicate — polygon
-mode on editable meshes with at least one selected polygon of more than three
-corners — so the command is refused with a reason rather than silently doing
-nothing, and one undo step covers the action.
+`lc_geom::triangulate_faces_with` splits each selected polygon into `corners - 2`
+triangles. **Shortest Diagonal** (the default) ear-clips the polygon, removing
+the valid convex ear with the shortest remaining diagonal first; **Quad Pair**
+splits a quad on its shorter diagonal and ear-clips other n-gons. The Mesh
+Editing **Split** selector chooses between them, replacing the earlier fixed
+fan from corner 0. Only selected polygons change: everything else keeps its
+n-gons, so the operation edits exactly what the user selected. Each triangle
+reuses the original corner records, which keeps point indices, UV slots and
+material slots intact, and because creases, seams and pinned UV slots are
+point/corner indices they survive untouched; the new diagonals carry no crease
+or seam. Degenerate triangles are skipped so the result still validates, and
+out-of-range face indices are ignored. Mesh Editing's **Triangulate** button
+and `Tools -> Triangulate` share one predicate — polygon mode on editable
+meshes with at least one selected polygon of more than three corners — so the
+command is refused with a reason rather than silently doing nothing, and one
+undo step covers the action.
 
 ## Flip Normal: what this slice added
 
@@ -668,9 +759,13 @@ axes with a **Strength**, and Spherify with a **Radius** and **Strength**
 (sources 32–35). Its Subdivision modifier exposes **Iterations** (default 2)
 and a **Scheme** of Catmull-Clark, Stam-Loop or Linear (source 31).
 
-LeopardCraft now adds clean-room stack equivalents for four of those
-deformers and all three documented subdivision schemes, including creased
-edges:
+LeopardCraft now adds stack equivalents for those deformers with the shared
+**Type** control: **Constrained** clamps a point to the cage before deforming
+and reuses that border displacement outside it, **Unconstrained** deforms
+freely, and **Cage** modifies only points inside the cage (the manual warns
+this can crack at the border). **Cage** is the cage size as a multiple of the
+object's half bounds. The six deformers and all three documented subdivision
+schemes, including creased edges, are:
 
 - **Twist** rotates the two coordinates perpendicular to a chosen X, Y or Z
   axis linearly along that axis, by the total angle. The object's bounds define
@@ -683,6 +778,46 @@ edges:
   it, and the scale is clamped positive so the mesh cannot invert.
 - **Spherify** moves vertices toward a sphere of the given radius around the
   bounds centre by a 0–1 strength, leaving the topology unchanged.
+- **Displacement** offsets every point along its area-weighted normal by smooth
+  deterministic value noise: `amplitude` scales the field, `frequency` scales
+  the sample position and `seed` selects a different field. Cheetah3D documents
+  a texture input; LeopardCraft has no texture a modifier can read, so the
+  procedural field is the clean-room substitute and the same mesh and
+  parameters always give the same geometry.
+- **Formula** evaluates one expression per axis in the point's rest `x`, `y` and
+  `z`, so a point can be repositioned by `x + 1`, `2 * y - z` or
+  `sin(x * pi)`. Expressions support `+ - * / ^`, parentheses, unary minus, the
+  constants `pi` and `e`, and `sin cos tan abs sqrt exp ln floor ceil round sign
+  min max`. An empty expression keeps that coordinate and a non-finite result
+  (division by zero, an out-of-domain `sqrt`) keeps it too, so a formula cannot
+  write NaN into geometry; a malformed expression is refused by the add/update
+  predicate with a message naming the axis and the syntax problem. The manual
+  does not document Cheetah3D's formula dialect here, so this grammar is a
+  clean-room reading.
+- **Magnet** is an attraction field: points inside `radius` move toward the
+  bounds centre by `strength` times a smoothstep falloff that is 1 at the centre
+  and 0 at the radius, so points beyond the radius feel no field. Negative
+  strength pushes points away, strength is clamped to -1..=1, and the shared
+  Cage/Type control applies like the other deformers.
+- **Laplacian Smooth** runs the uniform umbrella operator: each pass moves every
+  point `strength` of the way toward the average of its edge neighbours, with
+  the iteration count capped at 64 per evaluation. With **Keep border** set, the
+  points of a boundary edge stay put and only the interior relaxes.
+- **Polygon Reduction** collapses the shortest edge that belongs to a triangle,
+  at its midpoint, until the face count reaches `ratio` of the authored count.
+  Only triangle edges are candidates because collapsing one always removes a
+  face, which is what makes the loop terminate instead of merely turning quads
+  into triangles; a quad-only cage is therefore returned unchanged. Creases,
+  seams and pinned UVs follow the surviving point through the same merge tail
+  Collapse and Optimize use, so the reduced mesh still validates. This is a
+  deterministic greedy decimator, not a quadric-error implementation.
+- **Wrap** rotates points around the target object's centre line: the object's
+  normalized position along the chosen X/Y/Z axis becomes a rotation angle of up
+  to `angle_deg / 2` at each end, so the object curls around the target while
+  keeping each point's distance from that line. It is created with **Add Wrap**
+  because it needs a target mesh, and the target is evaluated and moved into the
+  wrapper's local space exactly like a Boolean operand. A Wrap that names its
+  own object has no operand and leaves the mesh alone.
 - **Subdivision** now offers **Catmull-Clark**, **Stam-Loop** and **Linear**
   schemes beside its level count, which now defaults to 2 like Cheetah3D.
   Catmull-Clark produces quads from any n-gon. Stam-Loop triangulates the
@@ -694,16 +829,35 @@ edges:
   and new modifiers default to it.
 - **Edge creases** are a per-mesh list of canonical point pairs, so they are
   independent of temporary edge ordering and survive point compaction,
-  welding and mesh merging. In Edge mode the Mesh Editing panel offers
-  **Toggle Crease** for the selected edges, and the viewport draws creased
-  edges in blue. Catmull-Clark treats a creased edge as a sharp edge: its edge
-  point is the midpoint, a vertex with two incident creases follows the
-  3/4 + 1/8 + 1/8 crease rule, a vertex with three or more stays pinned, and
-  both child edges inherit the crease. Stam-Loop applies the equivalent Loop
-  crease rules. Linear subdivision deliberately ignores crease sharpness, so
-  its geometry is unchanged; the crease marks are still split onto child edges
-  for later editing. Loading normalizes duplicate, degenerate and out-of-range
-  crease entries.
+  welding and mesh merging. Full creases live in one sorted list; fractional
+  strengths live in a second sorted list keyed by the same canonical pair, and
+  `set_crease_weight` moves an edge between them at 0 and 1. In Edge mode the
+  Mesh Editing panel offers **Toggle Crease** and a 0–1 **Weight** field with
+  **Set Crease Weight**; creased edges are drawn blue in every selection mode.
+  Catmull-Clark computes both rules and interpolates: the edge point is
+  `lerp(smooth edge point, midpoint, weight)`, and a vertex with two incident
+  creases interpolates from its smooth vertex point to the 3/4 + 1/8 + 1/8
+  crease rule by the smallest incident weight. A vertex with three or more
+  creases blends from smooth to pinned the same way, and a single crease stays
+  smooth. Both child edges inherit the parent weight, so fractional creases
+  survive further levels. Stam-Loop blends its Loop edge point and crease
+  vertex rule by the same weights. Linear subdivision deliberately ignores
+  crease sharpness, so its geometry is unchanged; the crease marks and weights
+  are still split onto child edges for later editing. Loading normalizes
+  duplicate, degenerate and out-of-range entries, clamps weights to 0–1 and
+  promotes a weight of 1 into the full-crease list.
+- **Partial subdivision**: `subdivide_faces` subdivides only a face selection.
+  It builds a patch from the selected faces, runs any of the three schemes,
+  pins every original patch-boundary vertex and new boundary point onto the
+  original boundary segments, then re-adds the unselected faces with the new
+  collinear boundary points threaded into their corner lists in order. Every
+  selected boundary edge is therefore shared by the patch and its unselected
+  neighbour through the same shared midpoints, and unselected vertices keep
+  their exact positions. UVs for unselected corners are appended to the
+  patch's per-point UV slots, extra UV sets are recomputed through the same
+  path, and creases, weights, seams and material slots are preserved. The Mesh
+  Editing **Subdivide** button and `Tools -> Subdivide` expose level count and
+  scheme and commit one undo step.
 
 The modifier inspector edits each parameter in the stack, and the geometry
 layer has unit tests for shape change, finite extremes, watertight linear
@@ -713,14 +867,17 @@ multiple iteration counts, linear crease independence, material-style
 serialization and legacy documents with neither crease data nor a scheme
 field.
 
-Deliberate gaps: Cheetah3D's shared Cage/Type controls remain unimplemented,
-and LeopardCraft's deformers act on the whole mesh with bounds-relative
-falloff instead. Stam-Loop here is a clean-room Loop-on-triangulated-cage
+Deliberate gaps: Stam-Loop here is a clean-room Loop-on-triangulated-cage
 approximation of the documented mixed quad/triangle scheme, not a verified
-reimplementation of Stam's published rules. Crease weights, partial
-subdivision and crease display outside Edge mode are still open, as are
-Cheetah3D's displacement, formula, magnet, polygon-reduction, Laplacian smooth
-and wrap modifiers.
+reimplementation of Stam's published hybrid rules. That remains the one open
+part of the subdivision item; the public manual does not specify how quad and
+triangle regions should be staged, so implementing it needs a product decision
+on the hybrid topology policy. Displacement, Formula, Magnet, Laplacian Smooth,
+Polygon Reduction and Wrap now exist as clean-room readings of the documented
+modifier names; the pages that would pin their exact parameters (a texture input
+for Displacement, Cheetah3D's formula dialect, its decimation algorithm) are not
+among the indexed sources, so those parameter sets are approximations rather
+than verified parity.
 
 ## UV seams: what this slice added
 
@@ -755,28 +912,28 @@ LeopardCraft now authors seams and uses them as unwrap cut lines:
   normals agree. Without seams the previous normal-angle charting still applies.
   Charts are projected onto their average normal and shelf-packed into 0..1 as
   before.
-- **Relax** is chart-aware: its graph is split at every seam, so the two sides
-  of an authored cut relax inside their own charts instead of being averaged onto
-  one shared point value, and seam or mesh-boundary corners are held when the
-  pin-boundary option is on (the editor's Relax command passes `true`). The
-  manual defines seams only as unwrap cuts (source 37: "A seam is an edge where
-  the mesh will tear up when calling the Unwrap UV command") and documents no
-  Relax tool, so applying the same cut rule to relaxation is a LeopardCraft
-  clean-room choice rather than a documented Cheetah3D behaviour.
+- **Relax** is chart-aware: its graph is split at every seam and at the same
+  normal-angle borders `automatic_unwrap` uses, so neither an authored cut nor a
+  sharp fold is averaged onto one shared point value. Seam, normal-angle-break
+  and mesh-boundary corners are held when the pin-boundary option is on (the
+  editor's Relax command passes `true`), and without pins the smoothed charts
+  are shelf-packed back into 0..1 so two charts cannot drift into each other's
+  bounds. The manual defines seams only as unwrap cuts (source 37: "A seam is an
+  edge where the mesh will tear up when calling the Unwrap UV command") and
+  documents no Relax tool, so applying the same chart rule and adding a pack
+  step to relaxation is a LeopardCraft clean-room choice rather than a
+  documented Cheetah3D behaviour.
 - Subdivision inherits seams onto both child edges of a split seam edge, the way
   it inherits creases, so a seam survives a subdivision modifier stack.
 - Native `.lcscene` documents serialize seams only when present; loading
   removes duplicate, degenerate and out-of-range entries, and older documents
   without the field load with no seams.
 
-Clean-room limits of this slice: seam authoring exists only in the 3D Edge
-mode, not in the UV view, and there are no Select All Seams, Clear Seams or
-"select the seam loop" commands. Unwrapping is a normal-angle chart splitter
+Clean-room limits of this slice: unwrapping is a normal-angle chart splitter
 with seam barriers and a shelf packer, not ABF, LSCM or Autoseam, so it does not
-minimise distortion the way the documented Cheetah3D solvers claim to. The
-relaxation chart splitter divides on seams only, not on the unwrap's
-normal-angle charts, and relaxation does not re-align or re-pack charts after
-smoothing.
+minimise distortion the way the documented Cheetah3D solvers claim to. The later
+G34 UV authoring suite added seam authoring and seam selection inside the UV
+view; its clean-room policy is described in "UV authoring suite" below.
 
 ## Pinned UVs: what this slice added
 
@@ -838,6 +995,37 @@ Clean-room limits, recorded rather than glossed over:
 - Pins do not survive a subdivision modifier or a fresh projection; both replace
   the UV set, and the sources do not describe pin behaviour there either.
 
+## UV authoring suite: what this slice added
+
+The manual's UV editor documents point and edge selection, seams, pins, mapping
+modes, Unwrap UV and packing, but not the internal chart splitter, slot topology
+or how a renderer binds a second set (source 37 and the UV matrix row).
+LeopardCraft therefore uses its own clean-room model:
+
+- A chart is a group of connected faces across edges that are neither authored
+  seams nor normal-angle breaks, reusing the unwrap threshold. Chart tools treat
+  a chart as one island; there is no ABF/LSCM/Autoseam solver, so packing
+  controls (padding, optional 90° rotation, block alignment) change placement,
+  not distortion.
+- Chart transforms move/rotate/scale the selected charts' coordinates around
+  their combined centre. Packing skips charts that contain a pinned slot and
+  reports how many it left in place, so a pin stays exact; this is a documented
+  LeopardCraft policy, not a claim about Cheetah3D.
+- Weld merges selected slots that share a mesh point (the lowest index
+  survives); Split gives every selected shared slot its own per-corner slot.
+  Both change the shared slot topology, so they update every UV set and remap
+  pins. Align, distribute, flip, 90° rotation and numeric entry only rewrite
+  coordinates on the active set.
+- Multiple UV sets are parallel coordinate arrays over one shared slot topology
+  (`Mesh::extra_uvs`). Old documents load as UV0, native files keep every set,
+  and glTF writes and reads `TEXCOORD_1`…; OBJ writes UV0 and records the sets
+  it skipped. Material texture and lightmap binding to a non-zero set is not
+  implemented, so that part of the manual's workflow remains an open
+  rendering-lane gap.
+- The checker and distortion overlays are view state. Distortion is a
+  normalized UV-area to surface-area ratio, not the manual's UV PDF or a solver
+  error metric.
+
 ## Fill Hole: what this slice added
 
 The Fill Hole manual page (source 38) documents the tool's modes and workflow:
@@ -877,10 +1065,12 @@ LeopardCraft now provides it as a selection-driven command:
 
 Clean-room approximations and what closing them would need:
 
-- **Invocation.** Cheetah3D runs Fill Hole as a click tool; LeopardCraft applies
-  it to the current component selection from a menu or panel button. Closing the
-  gap needs a viewport pick mode that maps a click to a boundary point and then
-  calls the same geometry operation.
+- **Invocation.** The selection command remains, and the manual's click
+  workflow is now provided by the **Click tool** checkbox (also
+  `Tools -> Fill Hole Tool`). It maps a viewport click to the nearest point on
+  an open boundary and calls the same `fill_holes` operation, stays active for
+  multiple holes, and ignores clicks away from a border. The manual documents
+  no deactivation key, so the tool stays on until its checkbox is cleared.
 - **UVs.** The manual documents no properties, so the new polygon's UVs are a
   LeopardCraft choice: the border is projected onto its best-fit plane and scaled
   into the loop's own 0..1 box. Cheetah3D's own fill UVs are undocumented; true
@@ -888,9 +1078,14 @@ Clean-room approximations and what closing them would need:
   the new face from the UV editor.
 - **Material slot.** The new face inherits the lowest material slot of the faces
   on the border. The manual does not state a rule.
-- **Topology.** Each loop becomes one n-gon. A hole that encloses an island, and
-  a border that is not a single closed loop, are not filled; the operation
-  rejects borders whose edges have two faces and never invents points.
+- **Topology.** Each loop becomes one n-gon. A hole whose border encloses a
+  separate mesh island is rejected with `that hole encloses an island; fill or
+  remove the island first` instead of placing an n-gon through it; the island is
+  detected by connected-component ownership and planar containment of the
+  border. The manual does not document this case, so refusing is the clean-room
+  choice that cannot silently hide geometry. A border that is not a single
+  closed loop is not filled either; the operation rejects borders whose edges
+  have two faces and never invents points.
 
 ## Split: what this slice added
 
@@ -1021,17 +1216,18 @@ Clean-room approximations and what closing them would need:
 
 1. **Rigging and weight acquisition** — chosen-joint binding, proximity
    auto-weights, preserve-on-rebind, the brush, heat map, auto-normalise,
-   tip-origin IK with take baking and clean-room per-joint limits are in place;
-   viewport joint picking, heat-diffusion weighting, Spline IK, Cheetah3D-style
-   IK Constraint tags and the broader constraint system remain.
+   tip-origin IK with take baking, clean-room per-joint limits, guide-curve
+   Spline IK, chain stiffness and the IK Point/Angle/Orient/Parent tags are in
+   place; heat-diffusion weighting, Cheetah3D's IK Constraint tag semantics and
+   the broader constraint system remain.
 2. **glTF import and tangent semantics** — export covers skins, morphs and
    animations, native morph-weight F-curve rows are keyable, and the four
    documented interpolation modes plus per-side Tangent Type controls are now
    in the F-curve editor. Import now carries a mesh's morph base, target names,
    offsets and default weights, cameras, and every punctual light type with its
    cone angles and falloff distance, refusing inconsistent or unusable data
-   with a message that names the node; skinning, animation and soft shadows
-   driven by the light radius remain. Cheetah3D's public docs do not list a glTF importer,
+   with a message that names the node; skinning and animation import remain.
+   Cheetah3D's public docs do not list a glTF importer,
    so LeopardCraft's import remains an extension; the manual does not specify
    a tangent slope formula, and Cheetah3D's exact morph-weight range remains
    undocumented rather than matched.
@@ -1040,14 +1236,50 @@ Clean-room approximations and what closing them would need:
    multi-point UV pin selection, seam authoring from the UV view, multiple UV
    sets and UV export are the missing daily-modelling pieces.
 4. **Remaining polygon tools and modifiers** — Fill Hole, Cover, Create Polygon,
-   Split, Shell, Triangulate, Flip Normal, Collapse, Disconnect, Optimize and
-   Point Slide are in place; scalpel and clone remain, together with
-   displacement, magnet, polygon reduction, Laplacian smooth and wrap
-   modifiers, crease weights, partial subdivision and the exact Stam-Loop
-   rules; each is a self-contained operation with a clear undo boundary.
+   Split, Shell, Triangulate, Flip Normal, Collapse, Disconnect, Optimize, Point
+   Slide, Clone, Scalpel and the Displacement, Formula, Magnet, Laplacian
+   Smooth, Polygon Reduction and Wrap modifiers are in place; the Scalpel's
+   click chaining now follows source 43, and the exact Stam-Loop hybrid (sources
+   44 and 45) remains; each is a self-contained operation with a clear undo
+   boundary.
 5. **Scripting/plugin surface** — valuable for parity, but it needs an API
    design and cannot be reduced to a single feature slice. A headless MCP server
    now provides external agent automation, but embedded scripting and a plugin
    API remain open.
 6. **Second renderer and advanced AOV/bake output** — expensive and lower
    priority than authoring and interchange.
+
+## Viewport click workflows: researched facts
+
+Cheetah3D splits its polygon tools into pick-driven tools, whose input is a
+viewport click, and selection-driven tools, which act on the current component
+selection from the menu. The pick-driven set is small, and every one of them is
+"pick an element, then commit on a second element or on release":
+
+- **Scalpel** (source 43): click an edge (green) or point (blue) as the start,
+  then click a second edge or point of the same polygon to split it in two; the
+  end point becomes the next cut's start, so cuts chain until ESC resets.
+- **Ring Cut** (source 46): one edge click selects the ring; dragging before
+  release slides the cut, and Shift-drag moves it along the surface normals. The
+  ring stops at a polygon with an odd edge count.
+- **Weld** (source 47): click one point, then a second point; the `To` property
+  chooses the midpoint or the first point, and ESC resets.
+- **Bridge** (source 48): click a point on the border of each of the two polygon
+  groups; the groups are bridged.
+- **Insert Point** (source 49): a click inserts a point where the cursor is —
+  inside a polygon (which is split into triangles), on an edge, or in empty
+  space on the camera-facing plane.
+- **Fill Hole** (source 38): already implemented as a border-click tool.
+
+Everything else in the polygon menu is selection-driven rather than
+click-driven. The Catmull-Clark Subdivide tool subdivides the whole mesh from
+the menu command and only the selected polygons when polygons are selected
+(source 50); Triangulate, Clone, Collapse, Cover, Split, Shell, Extrude and
+Inner Extrude, Point Slide, Optimize, Flip Normal, Disconnect and the normal
+transforms are applied from the menu or their property panel.
+
+Consequence for LeopardCraft: a viewport click tool is warranted only where the
+operation's input is a picked point, edge or loop. Subdivide, Triangulate and
+Clone are selection-driven in the source application and stay menu actions.
+Scalpel chaining now exists; the remaining click-tool candidates are ring cut,
+weld, bridge and insert point.

@@ -66,14 +66,22 @@ fn test_app(label: &str) -> (LeopardApp, TestRoot) {
         selected_material: Some(0),
         selected_shader_node: None,
         selected_uv: None,
+        uv_editor: UvEditorState::default(),
         anim_target: None,
         selected_keys: Vec::new(),
         retime_factor: 1.0,
+        take_name_buffer: doc
+            .active_take()
+            .map(|t| t.name.clone())
+            .unwrap_or_default(),
+        take_fps_buffer: doc.active_take_fps(),
+        take_editor_index: Some(doc.active_take),
         curve_key_drag: None,
         curve_tangent_drag: None,
         curve_box_select: None,
         curve_clipboard: CurveClipboard::default(),
         selected_curve_channel: None,
+        curve_filter: CurveFilter::All,
         native_paste_pending: false,
         doc,
         history: History::new(200),
@@ -94,6 +102,7 @@ fn test_app(label: &str) -> (LeopardApp, TestRoot) {
         viewport: ViewportRenderer::new(None),
         texture_cache: TextureCache::default(),
         dialog: None,
+        pending_import: None,
         lifecycle,
         allow_close: false,
         status: "Ready — demo studio loaded".into(),
@@ -117,6 +126,14 @@ fn test_app(label: &str) -> (LeopardApp, TestRoot) {
         box_select: None,
         mesh_edit: false,
         mesh_select_mode: MeshSelectMode::Polygons,
+        triangulate_mode: lc_geom::TriangulateMode::default(),
+        mesh_crease_weight: 1.0,
+        mesh_clone: lc_geom::CloneOptions::default(),
+        fill_hole_tool: false,
+        scalpel_tool: false,
+        scalpel_start: None,
+        mesh_subdivide_levels: 1,
+        mesh_subdivide_scheme: lc_geom::SubdivisionKind::default(),
         mesh_selected: Vec::new(),
         mesh_components: BTreeMap::new(),
         mesh_transform: MeshTransformMode::Move,
@@ -146,6 +163,8 @@ fn test_app(label: &str) -> (LeopardApp, TestRoot) {
         object_row_highlights: Vec::new(),
         object_row_icons: Vec::new(),
         object_row_flags: Vec::new(),
+        morph_row_rects: Vec::new(),
+        take_row_rects: Vec::new(),
     };
     (app, root)
 }
@@ -176,7 +195,7 @@ fn curve_paste_fixture(label: &str) -> (InputHarness, TestRoot, AnimTarget, Vec<
         node.animation = AnimationClip::default();
         for (time, value) in [(0.0, 4.0), (1.0, 5.0)] {
             node.animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 time,
                 value,
                 Interpolation::Linear,
@@ -194,10 +213,10 @@ fn curve_paste_fixture(label: &str) -> (InputHarness, TestRoot, AnimTarget, Vec<
     (harness, root, target, selected)
 }
 
-fn curve_property_times(app: &LeopardApp, target: AnimTarget, property: AnimProperty) -> Vec<f32> {
+fn curve_property_times(app: &LeopardApp, target: AnimTarget, address: ChannelAddress) -> Vec<f32> {
     let clip = app.target_clip(target).unwrap();
     let mut times: Vec<f32> = clip
-        .track(property)
+        .track(address)
         .map(|track| track.curve.keys.iter().map(|key| key.time).collect())
         .unwrap_or_default();
     times.sort_by(|a, b| a.total_cmp(b));
@@ -207,10 +226,10 @@ fn curve_property_times(app: &LeopardApp, target: AnimTarget, property: AnimProp
 fn assert_property_curve_times(
     app: &LeopardApp,
     target: AnimTarget,
-    property: AnimProperty,
+    address: ChannelAddress,
     expected: &[f32],
 ) {
-    let actual = curve_property_times(app, target, property);
+    let actual = curve_property_times(app, target, address);
     assert_eq!(actual.len(), expected.len(), "times: {actual:?}");
     for (actual, expected) in actual.iter().zip(expected) {
         assert!(
@@ -221,7 +240,12 @@ fn assert_property_curve_times(
 }
 
 fn assert_curve_times(app: &LeopardApp, target: AnimTarget, expected: &[f32]) {
-    assert_property_curve_times(app, target, AnimProperty::TranslationX, expected);
+    assert_property_curve_times(
+        app,
+        target,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        expected,
+    );
 }
 
 fn assert_mat4_close(actual: Mat4, expected: Mat4) {
@@ -247,6 +271,7 @@ fn assert_mat4_close(actual: Mat4, expected: Mat4) {
 enum Surface {
     Viewport,
     Objects,
+    Browser,
     Shortcuts,
     Shell,
 }
@@ -288,6 +313,7 @@ impl InputHarness {
         let mut output = ctx.run_ui(raw, |ui| match surface {
             Surface::Viewport => app.ui_viewport(ui),
             Surface::Objects => app.ui_objects(ui),
+            Surface::Browser => app.ui_browser(ui),
             // Keep the viewport widget registered while testing shortcuts;
             // egui hit-tests a press against the previous frame's widgets.
             Surface::Shortcuts => {
@@ -602,6 +628,15 @@ impl InputHarness {
             .iter()
             .find(|(row, ..)| *row == id)
             .map(|(_, visible, renderable, locked)| (*visible, *renderable, *locked))
+    }
+
+    fn morph_row(&self, id: NodeId, target: usize) -> Rect {
+        self.app
+            .morph_row_rects
+            .iter()
+            .find(|(row, index, _)| *row == id && *index == target)
+            .map(|(_, _, rect)| *rect)
+            .unwrap_or_else(|| panic!("Morphs browser has no row for {id:?} target {target}"))
     }
 
     fn viewport_hits(&self) -> (Vec<NodeId>, Vec<NodeId>) {

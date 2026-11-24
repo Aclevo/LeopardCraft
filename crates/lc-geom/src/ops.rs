@@ -114,6 +114,17 @@ pub fn extract_faces(mesh: &Mesh, faces: &[u32]) -> Result<Mesh, String> {
         });
     }
 
+    // Every additional UV set follows the same slot mapping as UV0.
+    for set in 1..=mesh.extra_uvs.len() {
+        let mut values = vec![Vec2::ZERO; out.uvs.len()];
+        for (old, new) in &uv_map {
+            if let Some(uv) = mesh.uv_value(set, *old) {
+                values[*new as usize] = uv;
+            }
+        }
+        out.extra_uvs.push(values);
+    }
+
     // Marks only follow when both endpoints (or the UV slot) are copied; a
     // mark that reached outside the selection has nothing to belong to.
     let carry = |list: &[[u32; 2]], map: &HashMap<u32, u32>| -> Vec<[u32; 2]> {
@@ -126,6 +137,16 @@ pub fn extract_faces(mesh: &Mesh, faces: &[u32]) -> Result<Mesh, String> {
             .collect()
     };
     out.creases = carry(&mesh.creases, &point_map);
+    out.crease_weights = Box::new(
+        mesh.crease_weights
+            .iter()
+            .filter_map(|(edge, weight)| {
+                let a = *point_map.get(&edge[0])?;
+                let b = *point_map.get(&edge[1])?;
+                Some((if a < b { [a, b] } else { [b, a] }, *weight))
+            })
+            .collect::<Vec<_>>(),
+    );
     out.seams = carry(&mesh.seams, &point_map);
     out.pinned_uvs = mesh
         .pinned_uvs
@@ -684,6 +705,251 @@ pub fn ring_cut(mesh: &Mesh, axis: usize, offset: f32) -> Mesh {
     out
 }
 
+/// Where one end of a Scalpel cut lands on the polygon being cut.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScalpelPick {
+    /// A point the polygon already uses.
+    Point(u32),
+    /// A position on one of the polygon's edges, `t` from 0 at `a` to 1 at `b`.
+    Edge { a: u32, b: u32, t: f32 },
+}
+
+/// A pick resolved against the polygon's corner ring.
+#[derive(Clone, Copy, Debug)]
+enum ScalpelSide {
+    Corner(usize),
+    Edge(usize, f32),
+}
+
+fn resolve_scalpel_pick(
+    poly: &Polygon,
+    face: u32,
+    pick: ScalpelPick,
+) -> Result<ScalpelSide, String> {
+    let count = poly.corners.len();
+    match pick {
+        ScalpelPick::Point(point) => poly
+            .corners
+            .iter()
+            .position(|corner| corner.point == point)
+            .map(ScalpelSide::Corner)
+            .ok_or_else(|| format!("point {point} is not a corner of face {face}")),
+        ScalpelPick::Edge { a, b, t } => {
+            if a == b {
+                return Err("a scalpel edge needs two different points".into());
+            }
+            if !t.is_finite() || !(0.0..=1.0).contains(&t) {
+                return Err("a scalpel edge position must be between 0 and 1".into());
+            }
+            let found = (0..count).find_map(|index| {
+                let start = poly.corners[index].point;
+                let end = poly.corners[(index + 1) % count].point;
+                if start == a && end == b {
+                    Some((index, t))
+                } else if start == b && end == a {
+                    Some((index, 1.0 - t))
+                } else {
+                    None
+                }
+            });
+            let Some((index, t)) = found else {
+                return Err(format!("points {a} and {b} are not an edge of face {face}"));
+            };
+            if t <= 0.0 {
+                Ok(ScalpelSide::Corner(index))
+            } else if t >= 1.0 {
+                Ok(ScalpelSide::Corner((index + 1) % count))
+            } else {
+                Ok(ScalpelSide::Edge(index, t))
+            }
+        }
+    }
+}
+
+/// Position of a resolved pick along the corner ring, used to order the two
+/// ends of the cut so the ring walk is independent of click order.
+fn scalpel_position(side: &ScalpelSide) -> f32 {
+    match side {
+        ScalpelSide::Corner(index) => *index as f32,
+        ScalpelSide::Edge(index, t) => *index as f32 + *t,
+    }
+}
+
+/// The corner record for one cut end, creating the point and UV slot when the
+/// pick sits inside an edge.
+fn scalpel_corner(
+    out: &mut Mesh,
+    original: &Polygon,
+    face: u32,
+    side: ScalpelSide,
+) -> Result<Corner, String> {
+    let (index, t) = match side {
+        ScalpelSide::Corner(index) => return Ok(original.corners[index]),
+        ScalpelSide::Edge(index, t) => (index, t),
+    };
+    let count = original.corners.len();
+    let start = original.corners[index];
+    let end = original.corners[(index + 1) % count];
+    let (Some(start_position), Some(end_position)) = (
+        out.positions.get(start.point as usize).copied(),
+        out.positions.get(end.point as usize).copied(),
+    ) else {
+        return Err(format!("face {face} references a missing point"));
+    };
+    let position = start_position.lerp(end_position, t);
+    let uv = out.uv_of(&start).lerp(out.uv_of(&end), t);
+    let point = out.add_point(position);
+    let slot = out.add_uv(uv);
+    scalpel_split_shared_edge(out, start.point, end.point, point, t);
+    scalpel_split_marks(out, start.point, end.point, point);
+    Ok(Corner::new(point, slot))
+}
+
+/// Insert a new point into every other polygon that uses the split edge, so the
+/// shared edge carries the same point on both sides and the mesh stays
+/// watertight.
+fn scalpel_split_shared_edge(out: &mut Mesh, a: u32, b: u32, point: u32, t: f32) {
+    let mut inserts = Vec::new();
+    for (polygon, poly) in out.polygons.iter().enumerate() {
+        let count = poly.corners.len();
+        for index in 0..count {
+            let start = poly.corners[index];
+            let end = poly.corners[(index + 1) % count];
+            if start.point == b && end.point == a {
+                inserts.push((polygon, index, start, end));
+            }
+        }
+    }
+    // Later corners first, so an earlier insert cannot shift a pending index.
+    inserts.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+    for (polygon, index, start, end) in inserts {
+        // `t` runs from a to b, so the neighbour meets the point at 1 - t.
+        let uv = out.uv_of(&start).lerp(out.uv_of(&end), 1.0 - t);
+        let slot = out.add_uv(uv);
+        out.polygons[polygon]
+            .corners
+            .insert(index + 1, Corner::new(point, slot));
+    }
+}
+
+/// Move an edge's seam and crease weight onto the two halves the new point
+/// creates, so a cut through a marked edge keeps the mark on both sides.
+fn scalpel_split_marks(out: &mut Mesh, a: u32, b: u32, point: u32) {
+    let crease = out.crease_weight(a, b);
+    if crease > 0.0 {
+        out.set_crease_weight(a, b, 0.0);
+        out.set_crease_weight(a, point, crease);
+        out.set_crease_weight(point, b, crease);
+    }
+    if out.is_seam(a, b) {
+        out.set_seam(a, b, false);
+        out.set_seam(a, point, true);
+        out.set_seam(point, b, true);
+    }
+}
+
+/// Cut one polygon between two picks, replacing it with the two faces the cut
+/// leaves behind.
+///
+/// Cheetah3D's Scalpel documents clicking an edge or point and finalizing on a
+/// second edge or point of the same polygon (source 43), so one cut stays inside
+/// one polygon and ends on its boundary. A pick inside an edge inserts a point
+/// there and splits the edge for the neighbouring face too, so the mesh stays
+/// watertight, and a seam or crease weight on that edge follows both halves.
+/// Corner UVs and the material slot are kept and the new cut edge carries no
+/// seam or crease. One call makes one cut between two boundary picks; the
+/// editor's click tool chains calls by feeding a cut's end point back in as the
+/// next start (source 43).
+pub fn scalpel_face(
+    mesh: &Mesh,
+    face: u32,
+    from: ScalpelPick,
+    to: ScalpelPick,
+) -> Result<Mesh, String> {
+    scalpel_face_ends(mesh, face, from, to).map(|(mesh, _, _)| mesh)
+}
+
+/// Cut one polygon like [`scalpel_face`] and also report the points the cut
+/// ends on, `from` first and `to` second. The click tool needs those indices to
+/// chain a cut's end point into the next cut without guessing it from
+/// positions.
+pub fn scalpel_face_ends(
+    mesh: &Mesh,
+    face: u32,
+    from: ScalpelPick,
+    to: ScalpelPick,
+) -> Result<(Mesh, u32, u32), String> {
+    let Some(poly) = mesh.polygons.get(face as usize) else {
+        return Err(format!("face {face} does not exist"));
+    };
+    let count = poly.corners.len();
+    if count < 3 {
+        return Err(format!("face {face} has fewer than three corners"));
+    }
+    let from = resolve_scalpel_pick(poly, face, from)?;
+    let to = resolve_scalpel_pick(poly, face, to)?;
+    let from_position = scalpel_position(&from);
+    let to_position = scalpel_position(&to);
+    if (from_position - to_position).abs() <= 1e-6 {
+        return Err("the scalpel needs two different positions on the polygon".into());
+    }
+    let (first, second) = if from_position < to_position {
+        (from, to)
+    } else {
+        (to, from)
+    };
+
+    let mut out = mesh.clone();
+    let first_corner = scalpel_corner(&mut out, poly, face, first)?;
+    let second_corner = scalpel_corner(&mut out, poly, face, second)?;
+
+    // Rebuild the corner ring with each cut end in its place, then split the
+    // ring between the two ends into the faces on either side of the cut.
+    let mut ring: Vec<Corner> = Vec::with_capacity(count + 2);
+    let mut endpoint = [0usize; 2];
+    for (index, corner) in poly.corners.iter().enumerate() {
+        ring.push(*corner);
+        for (which, side) in [first, second].into_iter().enumerate() {
+            let corner = if which == 0 {
+                first_corner
+            } else {
+                second_corner
+            };
+            match side {
+                ScalpelSide::Corner(base) if base == index => endpoint[which] = ring.len() - 1,
+                ScalpelSide::Edge(base, _) if base == index => {
+                    ring.push(corner);
+                    endpoint[which] = ring.len() - 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let low = endpoint[0].min(endpoint[1]);
+    let high = endpoint[0].max(endpoint[1]);
+    let first_face: Vec<Corner> = ring[low..=high].to_vec();
+    let mut second_face: Vec<Corner> = ring[high..].to_vec();
+    second_face.extend_from_slice(&ring[..=low]);
+    if first_face.len() < 3 || second_face.len() < 3 {
+        return Err("the cut would leave a polygon with fewer than three corners".into());
+    }
+    let material_slot = poly.material_slot;
+    out.polygons[face as usize] = Polygon {
+        corners: first_face,
+        material_slot,
+    };
+    out.polygons.push(Polygon {
+        corners: second_face,
+        material_slot,
+    });
+    let (from_end, to_end) = if from_position < to_position {
+        (first_corner.point, second_corner.point)
+    } else {
+        (second_corner.point, first_corner.point)
+    };
+    Ok((out, from_end, to_end))
+}
+
 /// Bridge two boundary loops with quads. Loops must have the same length.
 pub fn bridge_loops(mesh: &Mesh, loop_a: &[u32], loop_b: &[u32]) -> Result<Mesh, String> {
     if loop_a.len() != loop_b.len() || loop_a.len() < 3 {
@@ -738,14 +1004,38 @@ pub fn bridge_loops(mesh: &Mesh, loop_a: &[u32], loop_b: &[u32]) -> Result<Mesh,
     }
     Ok(out)
 }
-/// Split the selected polygons into triangles with a fan from each polygon's
-/// first corner. Unselected polygons keep their n-gons, so the operation only
-/// rewrites the faces the user selected, and every corner keeps its point, UV
-/// slot and material slot. Creases, seams and pinned UV slots are point/corner
-/// indices, so they survive unchanged; the new fan diagonals carry no crease or
-/// seam. Degenerate fans (two corners on one point) are skipped instead of
-/// producing invalid triangles.
+/// How a selected n-gon is split into triangles. Cheetah3D documents a split
+/// option but its manual page is not among the indexed sources, so the two
+/// choices are clean-room: `ShortestDiagonal` ear-clips the polygon choosing
+/// the shortest valid diagonal first, and `QuadPair` splits a quad along its
+/// shorter diagonal (other n-gons still ear-clip).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriangulateMode {
+    #[default]
+    ShortestDiagonal,
+    QuadPair,
+}
+
+impl TriangulateMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ShortestDiagonal => "Shortest Diagonal",
+            Self::QuadPair => "Quad Pair",
+        }
+    }
+}
+
+/// Split the selected polygons into triangles. Unselected polygons keep their
+/// n-gons, so the operation only rewrites the faces the user selected, and
+/// every corner keeps its point, UV slot and material slot. Creases, seams and
+/// pinned UV slots are point/corner indices, so they survive unchanged; the new
+/// diagonals carry no crease or seam. Degenerate triangles are skipped instead
+/// of producing invalid geometry.
 pub fn triangulate_faces(mesh: &Mesh, faces: &[u32]) -> Mesh {
+    triangulate_faces_with(mesh, faces, TriangulateMode::ShortestDiagonal)
+}
+
+pub fn triangulate_faces_with(mesh: &Mesh, faces: &[u32], mode: TriangulateMode) -> Mesh {
     let selected: HashSet<u32> = faces
         .iter()
         .copied()
@@ -758,19 +1048,138 @@ pub fn triangulate_faces(mesh: &Mesh, faces: &[u32]) -> Mesh {
             out.polygons.push(polygon.clone());
             continue;
         }
-        let first = polygon.corners[0];
-        for pair in polygon.corners[1..].windows(2) {
-            let points = [first.point, pair[0].point, pair[1].point];
-            if points[0] == points[1] || points[1] == points[2] || points[0] == points[2] {
-                continue;
-            }
+        for triangle in triangulate_corners(polygon, &mesh.positions, mode) {
             out.polygons.push(Polygon {
-                corners: vec![first, pair[0], pair[1]],
+                corners: triangle,
                 material_slot: polygon.material_slot,
             });
         }
     }
     out
+}
+
+fn polygon_newell_normal(polygon: &Polygon, positions: &[Vec3]) -> Vec3 {
+    let n = polygon.corners.len();
+    let mut normal = Vec3::ZERO;
+    for i in 0..n {
+        let a = positions[polygon.corners[i].point as usize];
+        let b = positions[polygon.corners[(i + 1) % n].point as usize];
+        normal.x += (a.y - b.y) * (a.z + b.z);
+        normal.y += (a.z - b.z) * (a.x + b.x);
+        normal.z += (a.x - b.x) * (a.y + b.y);
+    }
+    normal.normalize_or(Vec3::Y)
+}
+
+/// Ear-clip one polygon, preserving corner order (and therefore winding). A
+/// quad in `QuadPair` mode takes its shorter diagonal directly; every other
+/// case removes the valid ear with the shortest diagonal.
+fn triangulate_corners(
+    polygon: &Polygon,
+    positions: &[Vec3],
+    mode: TriangulateMode,
+) -> Vec<Vec<Corner>> {
+    let count = polygon.corners.len();
+    if count == 3 {
+        return vec![polygon.corners.clone()];
+    }
+    let point = |index: usize| positions[polygon.corners[index].point as usize];
+    let diagonal = |a: usize, b: usize| point(a).distance(point(b));
+    if count == 4 && mode == TriangulateMode::QuadPair {
+        return if diagonal(0, 2) <= diagonal(1, 3) {
+            vec![
+                vec![polygon.corners[0], polygon.corners[1], polygon.corners[2]],
+                vec![polygon.corners[0], polygon.corners[2], polygon.corners[3]],
+            ]
+        } else {
+            vec![
+                vec![polygon.corners[1], polygon.corners[2], polygon.corners[3]],
+                vec![polygon.corners[1], polygon.corners[3], polygon.corners[0]],
+            ]
+        };
+    }
+
+    let origin = point(0);
+    let normal = polygon_newell_normal(polygon, positions);
+    let u = (point(1) - origin).normalize_or(Vec3::X);
+    let v = normal.cross(u).normalize_or(Vec3::Z);
+    let projected: Vec<Vec2> = (0..count)
+        .map(|index| {
+            let offset = point(index) - origin;
+            Vec2::new(offset.dot(u), offset.dot(v))
+        })
+        .collect();
+    let signed_area: f32 = (0..count)
+        .map(|i| {
+            let a = projected[i];
+            let b = projected[(i + 1) % count];
+            a.x * b.y - b.x * a.y
+        })
+        .sum();
+    let sign = if signed_area >= 0.0 { 1.0 } else { -1.0 };
+    let cross = |a: Vec2, b: Vec2, c: Vec2| (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+
+    let mut remaining: Vec<usize> = (0..count).collect();
+    let mut triangles = Vec::with_capacity(count - 2);
+    while remaining.len() > 3 {
+        let mut best: Option<(usize, f32)> = None;
+        for (slot, &current) in remaining.iter().enumerate() {
+            let len = remaining.len();
+            let prev = remaining[(slot + len - 1) % len];
+            let next = remaining[(slot + 1) % len];
+            if cross(projected[prev], projected[current], projected[next]) * sign <= 1e-9 {
+                continue; // reflex or collinear
+            }
+            let blocked = remaining.iter().any(|&other| {
+                other != prev
+                    && other != current
+                    && other != next
+                    && point_in_triangle(
+                        projected[other],
+                        projected[prev],
+                        projected[current],
+                        projected[next],
+                    )
+            });
+            if blocked {
+                continue;
+            }
+            let length = diagonal(prev, next);
+            if best.is_none_or(|(_, shortest)| length < shortest) {
+                best = Some((slot, length));
+            }
+        }
+        let Some((slot, _)) = best else {
+            break;
+        };
+        let len = remaining.len();
+        let current = remaining[slot];
+        let prev = remaining[(slot + len - 1) % len];
+        let next = remaining[(slot + 1) % len];
+        triangles.push(vec![
+            polygon.corners[prev],
+            polygon.corners[current],
+            polygon.corners[next],
+        ]);
+        remaining.remove(slot);
+    }
+    // Degenerate/self-intersecting polygons leave a fan for the remainder.
+    for index in 1..remaining.len().saturating_sub(1) {
+        triangles.push(vec![
+            polygon.corners[remaining[0]],
+            polygon.corners[remaining[index]],
+            polygon.corners[remaining[index + 1]],
+        ]);
+    }
+    triangles
+}
+
+fn point_in_triangle(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
+    let cross = |p: Vec2, a: Vec2, b: Vec2| (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let d1 = cross(p, a, b);
+    let d2 = cross(p, b, c);
+    let d3 = cross(p, c, a);
+    (d1 >= -1e-9 && d2 >= -1e-9 && d3 >= -1e-9) || (d1 <= 1e-9 && d2 <= 1e-9 && d3 <= 1e-9)
 }
 
 /// Reverse the winding of the selected polygons, so their normals point the
@@ -936,6 +1345,23 @@ pub fn disconnect_faces(mesh: &Mesh, faces: &[u32]) -> Mesh {
         next
     };
     out.creases = follow_marks(&mesh.creases);
+    out.crease_weights = Box::new({
+        let mut next: Vec<([u32; 2], f32)> = Vec::with_capacity(mesh.crease_weights.len());
+        for ([a, b], weight) in mesh.crease_weights.iter() {
+            let key = if a < b { [*a, *b] } else { [*b, *a] };
+            let (ma, mb) = (map[*a as usize], map[*b as usize]);
+            let remapped = ma != *a || mb != *b;
+            if !remapped || other_edges.contains(&key) {
+                next.push((key, *weight));
+            }
+            if remapped && ma != mb && selected_edges.contains(&key) {
+                next.push((if ma < mb { [ma, mb] } else { [mb, ma] }, *weight));
+            }
+        }
+        next.sort_by(|(a, wa), (b, wb)| a.cmp(b).then_with(|| wa.total_cmp(wb)));
+        next.dedup_by(|(a, _), (b, _)| a == b);
+        next
+    });
     out.seams = follow_marks(&mesh.seams);
     out
 }
@@ -969,6 +1395,7 @@ pub fn fill_holes(mesh: &Mesh, loops: &[Vec<u32>]) -> Result<Mesh, String> {
     if loops.is_empty() {
         return Err("select a point on a hole border".into());
     }
+    let components = point_components(mesh);
     let mut edge_faces: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
     for edge in mesh.edges() {
         edge_faces.insert((edge.a, edge.b), edge.faces.clone());
@@ -977,6 +1404,24 @@ pub fn fill_holes(mesh: &Mesh, loops: &[Vec<u32>]) -> Result<Mesh, String> {
     for looped in loops {
         if looped.len() < 3 {
             return Err("a hole border needs at least three points".into());
+        }
+        // A single n-gon cannot represent a hole with an island inside it: it
+        // would pass straight through the island and hide it. The manual says
+        // nothing about this case, so refuse it rather than invent a covering
+        // surface; filling the island's own border or removing the island
+        // first is unambiguous.
+        let outer_component = components
+            .get(looped[0] as usize)
+            .copied()
+            .unwrap_or(u32::MAX);
+        for (point, position) in mesh.positions.iter().enumerate() {
+            let component = components.get(point).copied().unwrap_or(u32::MAX);
+            if component == u32::MAX || component == outer_component {
+                continue;
+            }
+            if loop_encloses_point(mesh, looped, *position) {
+                return Err("that hole encloses an island; fill or remove the island first".into());
+            }
         }
         let mut slot = u16::MAX;
         for i in 0..looped.len() {
@@ -1181,6 +1626,60 @@ pub fn can_optimize(mesh: &Mesh, points: &[u32], tolerance: f32) -> bool {
     mesh.can_weld_points(points, tolerance)
 }
 
+/// Move, rotate and scale a set of points around their combined centroid.
+///
+/// Cheetah3D's component transform works on the point, edge or polygon
+/// selection with its viewport axis gizmo. MCP callers have no persistent
+/// selection, so this helper takes explicit point indices and one world-space
+/// translation, an XYZ Euler rotation in degrees and a per-axis scale. Points
+/// are transformed in that order (`scale`, `rotate`, `translate`); UVs,
+/// topology, creases, seams and pins are untouched. Returns `None` when no
+/// selected index is valid or the result would not change the mesh.
+pub fn transform_points(
+    mesh: &Mesh,
+    points: &[u32],
+    translation: Vec3,
+    rotation_degrees: Vec3,
+    scale: Vec3,
+) -> Option<Mesh> {
+    if !translation.is_finite() || !rotation_degrees.is_finite() || !scale.is_finite() {
+        return None;
+    }
+    let mut selected: Vec<u32> = points
+        .iter()
+        .copied()
+        .filter(|point| (*point as usize) < mesh.positions.len())
+        .collect();
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.is_empty() {
+        return None;
+    }
+    let centre = selected
+        .iter()
+        .map(|point| mesh.positions[*point as usize])
+        .sum::<Vec3>()
+        / selected.len() as f32;
+    let rotation = Quat::from_euler(
+        glam::EulerRot::XYZ,
+        rotation_degrees.x.to_radians(),
+        rotation_degrees.y.to_radians(),
+        rotation_degrees.z.to_radians(),
+    );
+    let mut out = mesh.clone();
+    let mut changed = false;
+    for point in selected {
+        let position = out.positions[point as usize];
+        let local = (position - centre) * scale;
+        let moved = centre + rotation * local + translation;
+        if moved != position {
+            changed = true;
+        }
+        out.positions[point as usize] = moved;
+    }
+    changed.then_some(out)
+}
+
 /// Slide the selected points a fraction of the way toward their neighbours.
 ///
 /// Cheetah3D lists Point Slide in its polygon-tool set (source 1); its manual page
@@ -1292,6 +1791,98 @@ pub fn create_polygon_faces(mesh: &Mesh, points: &[u32]) -> Result<(Mesh, Vec<u3
 }
 
 /// Newell normal of an ordered point loop, or `None` when a point is missing.
+/// Connected components of the polygon mesh, labelled per point. Points that
+/// no polygon uses, and points whose index is out of range, keep `u32::MAX`.
+fn point_components(mesh: &Mesh) -> Vec<u32> {
+    let mut adjacency = vec![Vec::new(); mesh.positions.len()];
+    for polygon in &mesh.polygons {
+        let n = polygon.corners.len();
+        for i in 0..n {
+            let a = polygon.corners[i].point as usize;
+            let b = polygon.corners[(i + 1) % n].point as usize;
+            if a >= adjacency.len() || b >= adjacency.len() || a == b {
+                continue;
+            }
+            adjacency[a].push(b as u32);
+            adjacency[b].push(a as u32);
+        }
+    }
+    let mut components = vec![u32::MAX; mesh.positions.len()];
+    let mut next = 0;
+    for start in 0..adjacency.len() {
+        if components[start] != u32::MAX || adjacency[start].is_empty() {
+            continue;
+        }
+        components[start] = next;
+        let mut stack = vec![start];
+        while let Some(point) = stack.pop() {
+            for &neighbour in &adjacency[point] {
+                let neighbour = neighbour as usize;
+                if components[neighbour] == u32::MAX {
+                    components[neighbour] = next;
+                    stack.push(neighbour);
+                }
+            }
+        }
+        next += 1;
+    }
+    components
+}
+
+/// Whether `point` projects inside the closed boundary in its own best-fit
+/// plane. Used only to detect a separate island enclosed by a hole border;
+/// degenerate borders (no usable plane) never report containment.
+fn loop_encloses_point(mesh: &Mesh, looped: &[u32], point: Vec3) -> bool {
+    if looped.len() < 3 {
+        return false;
+    }
+    let Some(normal) = loop_normal(mesh, looped) else {
+        return false;
+    };
+    let (tangent, bitangent) = lc_core::orthonormal_basis(normal);
+    let Some(origin) = looped
+        .first()
+        .and_then(|p| mesh.positions.get(*p as usize))
+        .copied()
+    else {
+        return false;
+    };
+    let project = |p: Vec3| -> [f64; 2] {
+        let offset = [
+            p.x as f64 - origin.x as f64,
+            p.y as f64 - origin.y as f64,
+            p.z as f64 - origin.z as f64,
+        ];
+        [
+            offset[0] * tangent.x as f64
+                + offset[1] * tangent.y as f64
+                + offset[2] * tangent.z as f64,
+            offset[0] * bitangent.x as f64
+                + offset[1] * bitangent.y as f64
+                + offset[2] * bitangent.z as f64,
+        ]
+    };
+    let border: Vec<[f64; 2]> = looped
+        .iter()
+        .filter_map(|p| mesh.positions.get(*p as usize).map(|p| project(*p)))
+        .collect();
+    if border.len() != looped.len() {
+        return false;
+    }
+    let p = project(point);
+    let mut inside = false;
+    for i in 0..border.len() {
+        let a = border[i];
+        let b = border[(i + 1) % border.len()];
+        if (a[1] > p[1]) != (b[1] > p[1])
+            && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
 fn loop_normal(mesh: &Mesh, points: &[u32]) -> Option<Vec3> {
     let n = points.len();
     if n < 3 {
@@ -1319,6 +1910,241 @@ pub fn array_mesh(mesh: &Mesh, count: u32, offset: Vec3, rotate_y_deg: f32) -> M
         accumulated_rot *= rot;
         let m = Mat4::from_translation(offset * i as f32) * accumulated_rot;
         out.merge(&base, m);
+    }
+    out
+}
+
+/// Parameters for Cheetah3D's Clone tool. Values mirror the manual's tool
+/// properties: `copies`, approximate `holes` ratio, object-space `direction`,
+/// interpolated `scale` and `rotation_deg` around that direction, plus the
+/// random position/scale/rotation variations and `keep_ratio`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloneOptions {
+    pub copies: u32,
+    pub holes: f32,
+    pub direction: Vec3,
+    pub scale: f32,
+    pub rotation_deg: f32,
+    pub position_variation: f32,
+    pub scale_variation: f32,
+    pub rotation_variation_deg: f32,
+    pub keep_ratio: bool,
+}
+
+impl Default for CloneOptions {
+    fn default() -> Self {
+        Self {
+            copies: 1,
+            holes: 0.0,
+            direction: Vec3::X,
+            scale: 1.0,
+            rotation_deg: 0.0,
+            position_variation: 0.0,
+            scale_variation: 0.0,
+            rotation_variation_deg: 0.0,
+            keep_ratio: true,
+        }
+    }
+}
+
+fn clone_offset(options: &CloneOptions, t: f32) -> Vec3 {
+    options.direction * t
+}
+
+/// Apply the Clone tool to a polygon selection. Empty `faces` clones every
+/// polygon, matching the manual. Each copy is transformed around the selection
+/// centroid, and a copy may be skipped according to the approximate `holes`
+/// ratio using a fixed deterministic stream rather than wall-clock randomness.
+pub fn clone_faces(mesh: &Mesh, faces: &[u32], options: &CloneOptions) -> Mesh {
+    let mut out = mesh.clone();
+    let copies = options.copies.min(256);
+    if copies == 0 {
+        return out;
+    }
+    let selected: Vec<usize> = if faces.is_empty() {
+        (0..mesh.polygons.len()).collect()
+    } else {
+        let mut set = vec![false; mesh.polygons.len()];
+        for face in faces {
+            if let Some(slot) = set.get_mut(*face as usize) {
+                *slot = true;
+            }
+        }
+        set.iter()
+            .enumerate()
+            .filter_map(|(index, chosen)| chosen.then_some(index))
+            .collect()
+    };
+    if selected.is_empty() {
+        return out;
+    }
+    let mut used: Vec<u32> = selected
+        .iter()
+        .flat_map(|face| mesh.polygons[*face].corners.iter().map(|c| c.point))
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    if used.is_empty() {
+        return out;
+    }
+    let pivot = used
+        .iter()
+        .map(|point| mesh.positions[*point as usize])
+        .sum::<Vec3>()
+        / used.len() as f32;
+    let direction = options.direction.normalize_or(Vec3::Y);
+    let mut rng = lc_core::Pcg32::new(0xC10E_5EED);
+
+    for copy in 1..=copies {
+        if rng.next_f32() < options.holes.clamp(0.0, 1.0) {
+            continue;
+        }
+        let t = copy as f32 / copies as f32;
+        let base_scale = 1.0 + (options.scale - 1.0) * t;
+        let mut scale = Vec3::splat(base_scale);
+        if options.keep_ratio {
+            if options.scale_variation != 0.0 {
+                let factor = 1.0
+                    + rng.range(
+                        -options.scale_variation.abs(),
+                        options.scale_variation.abs(),
+                    );
+                scale *= factor;
+            }
+        } else {
+            for axis in 0..3 {
+                let factor = 1.0
+                    + rng.range(
+                        -options.scale_variation.abs(),
+                        options.scale_variation.abs(),
+                    );
+                scale[axis] *= factor;
+            }
+        }
+        let mut rotation = Quat::from_axis_angle(direction, options.rotation_deg.to_radians() * t);
+        if options.rotation_variation_deg != 0.0 {
+            let axis = Vec3::new(
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+            )
+            .normalize_or(Vec3::Y);
+            rotation *= Quat::from_axis_angle(
+                axis,
+                rng.range(
+                    -options.rotation_variation_deg.abs(),
+                    options.rotation_variation_deg.abs(),
+                )
+                .to_radians(),
+            );
+        }
+        let variation = Vec3::new(
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        ) * options.position_variation;
+        let offset = clone_offset(options, t) + variation;
+        let transform = Mat4::from_translation(offset + pivot)
+            * Mat4::from_quat(rotation)
+            * Mat4::from_scale(scale)
+            * Mat4::from_translation(-pivot);
+
+        let mut point_map: HashMap<u32, u32> = HashMap::with_capacity(used.len());
+        for point in &used {
+            let position = transform.transform_point3(mesh.positions[*point as usize]);
+            point_map.insert(*point, out.add_point(position));
+        }
+        for face in &selected {
+            let poly = &mesh.polygons[*face];
+            out.polygons.push(Polygon {
+                corners: poly
+                    .corners
+                    .iter()
+                    .filter_map(|corner| {
+                        point_map
+                            .get(&corner.point)
+                            .map(|point| Corner::new(*point, corner.uv))
+                    })
+                    .collect(),
+                material_slot: poly.material_slot,
+            });
+        }
+        let map_edge = |edge: &[u32; 2]| -> Option<[u32; 2]> {
+            let a = *point_map.get(&edge[0])?;
+            let b = *point_map.get(&edge[1])?;
+            Some(if a < b { [a, b] } else { [b, a] })
+        };
+        for edge in &mesh.creases {
+            if let Some(edge) = map_edge(edge) {
+                out.creases.push(edge);
+            }
+        }
+        for (edge, weight) in mesh.crease_weights.iter() {
+            if let Some(edge) = map_edge(edge) {
+                out.crease_weights.push((edge, *weight));
+            }
+        }
+        for edge in &mesh.seams {
+            if let Some(edge) = map_edge(edge) {
+                out.seams.push(edge);
+            }
+        }
+    }
+    out.remove_degenerate_polygons();
+    out.normalize_creases();
+    out.normalize_seams();
+    out
+}
+
+/// Clone selected points as loose points. This is the point-mode behavior of
+/// the same tool; faces are not invented for a point-only selection.
+pub fn clone_points(mesh: &Mesh, points: &[u32], options: &CloneOptions) -> Mesh {
+    let mut out = mesh.clone();
+    let copies = options.copies.min(256);
+    if copies == 0 {
+        return out;
+    }
+    let selected: Vec<u32> = if points.is_empty() {
+        (0..mesh.positions.len() as u32).collect()
+    } else {
+        let mut chosen: Vec<u32> = points
+            .iter()
+            .copied()
+            .filter(|point| (*point as usize) < mesh.positions.len())
+            .collect();
+        chosen.sort_unstable();
+        chosen.dedup();
+        chosen
+    };
+    if selected.is_empty() {
+        return out;
+    }
+    let pivot = selected
+        .iter()
+        .map(|point| mesh.positions[*point as usize])
+        .sum::<Vec3>()
+        / selected.len() as f32;
+    let direction = options.direction.normalize_or(Vec3::Y);
+    let mut rng = lc_core::Pcg32::new(0xC10E_5EED);
+    for copy in 1..=copies {
+        if rng.next_f32() < options.holes.clamp(0.0, 1.0) {
+            continue;
+        }
+        let t = copy as f32 / copies as f32;
+        let scale = 1.0 + (options.scale - 1.0) * t;
+        let rotation = Quat::from_axis_angle(direction, options.rotation_deg.to_radians() * t);
+        let variation = Vec3::new(
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        ) * options.position_variation;
+        let transform = Mat4::from_translation(clone_offset(options, t) + variation + pivot)
+            * Mat4::from_quat(rotation)
+            * Mat4::from_scale(Vec3::splat(scale))
+            * Mat4::from_translation(-pivot);
+        for point in &selected {
+            out.add_point(transform.transform_point3(mesh.positions[*point as usize]));
+        }
     }
     out
 }
@@ -1705,10 +2531,979 @@ pub fn sweep_spline(profile: &[Vec2], spline: &Spline, caps: bool) -> Mesh {
     sweep(profile, &spline.sample(), spline.closed, caps)
 }
 
+// ---------------------------------------------------------------------------
+// Displacement, formula, magnet, smoothing, reduction and wrap modifiers.
+// ---------------------------------------------------------------------------
+
+/// Deterministic lattice hash in -1..=1 for the displacement height field.
+fn lattice_noise(x: i32, y: i32, z: i32, seed: u32) -> f32 {
+    let mut hash = (x as u32).wrapping_mul(0x8da6_b343)
+        ^ (y as u32).wrapping_mul(0xd816_3841)
+        ^ (z as u32).wrapping_mul(0xcb1a_b31f)
+        ^ seed.wrapping_mul(0x9e37_79b9);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0x5bd1_e995);
+    hash ^= hash >> 15;
+    hash as f32 / u32::MAX as f32 * 2.0 - 1.0
+}
+
+/// Smooth trilinear value noise in -1..=1. Every input and seed combination is
+/// deterministic, so a displaced mesh is identical on every evaluation.
+fn value_noise(point: Vec3, seed: u32) -> f32 {
+    if !point.is_finite() {
+        return 0.0;
+    }
+    let base = point.floor();
+    let f = point - base;
+    let t = f * f * (Vec3::splat(3.0) - 2.0 * f);
+    let (x, y, z) = (base.x as i32, base.y as i32, base.z as i32);
+    let corner = |dx: i32, dy: i32, dz: i32| lattice_noise(x + dx, y + dy, z + dz, seed);
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let x00 = lerp(corner(0, 0, 0), corner(1, 0, 0), t.x);
+    let x10 = lerp(corner(0, 1, 0), corner(1, 1, 0), t.x);
+    let x01 = lerp(corner(0, 0, 1), corner(1, 0, 1), t.x);
+    let x11 = lerp(corner(0, 1, 1), corner(1, 1, 1), t.x);
+    lerp(lerp(x00, x10, t.y), lerp(x01, x11, t.y), t.z).clamp(-1.0, 1.0)
+}
+
+/// Area-weighted point normals: every face adds its normal to each of its
+/// corners, so a point moves along the surface it belongs to. Points no face
+/// uses keep a zero normal and therefore stay put.
+fn point_normals(mesh: &Mesh) -> Vec<Vec3> {
+    let mut normals = vec![Vec3::ZERO; mesh.positions.len()];
+    for face in 0..mesh.polygons.len() {
+        let normal = mesh.face_normal(face);
+        for corner in &mesh.polygons[face].corners {
+            if let Some(target) = normals.get_mut(corner.point as usize) {
+                *target += normal;
+            }
+        }
+    }
+    for normal in &mut normals {
+        *normal = normal.normalize_or_zero();
+    }
+    normals
+}
+
+/// Offset every point along its normal by a deterministic value-noise field.
+///
+/// Cheetah3D's Displacement modifier documents a texture input; LeopardCraft has
+/// no texture binding a modifier can read, so this is the clean-room reading:
+/// the height field is smooth value noise in -1..=1 sampled at `frequency` and
+/// scaled by `amplitude`, with `seed` selecting a different field. The same mesh
+/// and parameters always give the same geometry, and a zero amplitude returns
+/// the mesh unchanged.
+pub fn displace(mesh: &Mesh, amplitude: f32, frequency: f32, seed: u32) -> Mesh {
+    let mut out = mesh.clone();
+    if !amplitude.is_finite() || amplitude == 0.0 {
+        return out;
+    }
+    let frequency = if frequency.is_finite() && frequency != 0.0 {
+        frequency
+    } else {
+        1.0
+    };
+    let normals = point_normals(mesh);
+    for (point, normal) in out.positions.iter_mut().zip(normals) {
+        let height = value_noise(*point * frequency, seed);
+        *point += normal * (amplitude * height);
+    }
+    out
+}
+
+/// One parsed Formula expression.
+#[derive(Clone, Debug, PartialEq)]
+enum FormulaExpr {
+    Number(f32),
+    Variable(usize),
+    Neg(Box<FormulaExpr>),
+    Add(Box<FormulaExpr>, Box<FormulaExpr>),
+    Subtract(Box<FormulaExpr>, Box<FormulaExpr>),
+    Multiply(Box<FormulaExpr>, Box<FormulaExpr>),
+    Divide(Box<FormulaExpr>, Box<FormulaExpr>),
+    Power(Box<FormulaExpr>, Box<FormulaExpr>),
+    Call(FormulaFunction, Vec<FormulaExpr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FormulaFunction {
+    Sin,
+    Cos,
+    Tan,
+    Abs,
+    Sqrt,
+    Exp,
+    Ln,
+    Floor,
+    Ceil,
+    Round,
+    Sign,
+    Min,
+    Max,
+}
+
+impl FormulaFunction {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "sin" => Self::Sin,
+            "cos" => Self::Cos,
+            "tan" => Self::Tan,
+            "abs" => Self::Abs,
+            "sqrt" => Self::Sqrt,
+            "exp" => Self::Exp,
+            "ln" => Self::Ln,
+            "floor" => Self::Floor,
+            "ceil" => Self::Ceil,
+            "round" => Self::Round,
+            "sign" => Self::Sign,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            _ => return None,
+        })
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Self::Min | Self::Max => 2,
+            _ => 1,
+        }
+    }
+
+    fn evaluate(self, args: &[f32]) -> f32 {
+        match (self, args) {
+            (Self::Min, [a, b]) => a.min(*b),
+            (Self::Max, [a, b]) => a.max(*b),
+            (Self::Sin, [a]) => a.sin(),
+            (Self::Cos, [a]) => a.cos(),
+            (Self::Tan, [a]) => a.tan(),
+            (Self::Abs, [a]) => a.abs(),
+            (Self::Sqrt, [a]) => a.sqrt(),
+            (Self::Exp, [a]) => a.exp(),
+            (Self::Ln, [a]) => a.ln(),
+            (Self::Floor, [a]) => a.floor(),
+            (Self::Ceil, [a]) => a.ceil(),
+            (Self::Round, [a]) => a.round(),
+            (Self::Sign, [a]) => a.signum(),
+            _ => f32::NAN,
+        }
+    }
+}
+
+impl FormulaExpr {
+    fn evaluate(&self, point: Vec3) -> f32 {
+        match self {
+            Self::Number(value) => *value,
+            Self::Variable(0) => point.x,
+            Self::Variable(1) => point.y,
+            Self::Variable(2) => point.z,
+            Self::Variable(_) => f32::NAN,
+            Self::Neg(inner) => -inner.evaluate(point),
+            Self::Add(a, b) => a.evaluate(point) + b.evaluate(point),
+            Self::Subtract(a, b) => a.evaluate(point) - b.evaluate(point),
+            Self::Multiply(a, b) => a.evaluate(point) * b.evaluate(point),
+            Self::Divide(a, b) => a.evaluate(point) / b.evaluate(point),
+            Self::Power(a, b) => a.evaluate(point).powf(b.evaluate(point)),
+            Self::Call(function, args) => {
+                let values: Vec<f32> = args.iter().map(|arg| arg.evaluate(point)).collect();
+                function.evaluate(&values)
+            }
+        }
+    }
+}
+
+/// Recursive-descent reader for Formula expressions: `+ - * / ^`, parentheses,
+/// the variables `x`, `y`, `z`, the constants `pi` and `e`, and a fixed set of
+/// one- and two-argument functions.
+struct FormulaParser<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl<'a> FormulaParser<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            input: source.as_bytes(),
+            position: 0,
+        }
+    }
+
+    fn skip_space(&mut self) {
+        while let Some(byte) = self.input.get(self.position) {
+            if !byte.is_ascii_whitespace() {
+                break;
+            }
+            self.position += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_space();
+        self.input.get(self.position).copied()
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        if self.peek() == Some(byte) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse(mut self) -> Result<FormulaExpr, String> {
+        let expr = self.expression()?;
+        match self.peek() {
+            None => Ok(expr),
+            Some(byte) => Err(format!("unexpected '{}'", byte as char)),
+        }
+    }
+
+    fn expression(&mut self) -> Result<FormulaExpr, String> {
+        let mut left = self.term()?;
+        loop {
+            match self.peek() {
+                Some(b'+') => {
+                    self.position += 1;
+                    left = FormulaExpr::Add(Box::new(left), Box::new(self.term()?));
+                }
+                Some(b'-') => {
+                    self.position += 1;
+                    left = FormulaExpr::Subtract(Box::new(left), Box::new(self.term()?));
+                }
+                _ => return Ok(left),
+            }
+        }
+    }
+
+    fn term(&mut self) -> Result<FormulaExpr, String> {
+        let mut left = self.unary()?;
+        loop {
+            match self.peek() {
+                Some(b'*') => {
+                    self.position += 1;
+                    left = FormulaExpr::Multiply(Box::new(left), Box::new(self.unary()?));
+                }
+                Some(b'/') => {
+                    self.position += 1;
+                    left = FormulaExpr::Divide(Box::new(left), Box::new(self.unary()?));
+                }
+                _ => return Ok(left),
+            }
+        }
+    }
+
+    fn unary(&mut self) -> Result<FormulaExpr, String> {
+        if self.eat(b'-') {
+            return Ok(FormulaExpr::Neg(Box::new(self.unary()?)));
+        }
+        if self.eat(b'+') {
+            return self.unary();
+        }
+        self.power()
+    }
+
+    fn power(&mut self) -> Result<FormulaExpr, String> {
+        let base = self.primary()?;
+        if self.eat(b'^') {
+            let exponent = self.unary()?;
+            return Ok(FormulaExpr::Power(Box::new(base), Box::new(exponent)));
+        }
+        Ok(base)
+    }
+
+    fn primary(&mut self) -> Result<FormulaExpr, String> {
+        match self.peek() {
+            None => Err("unexpected end of expression".into()),
+            Some(b'(') => {
+                self.position += 1;
+                let inner = self.expression()?;
+                if !self.eat(b')') {
+                    return Err("missing ')'".into());
+                }
+                Ok(inner)
+            }
+            Some(byte) if byte.is_ascii_digit() || byte == b'.' => self.number(),
+            Some(byte) if byte.is_ascii_alphabetic() || byte == b'_' => self.identifier(),
+            Some(byte) => Err(format!("unexpected '{}'", byte as char)),
+        }
+    }
+
+    fn number(&mut self) -> Result<FormulaExpr, String> {
+        let start = self.position;
+        while let Some(byte) = self.input.get(self.position) {
+            if byte.is_ascii_digit() || *byte == b'.' {
+                self.position += 1;
+            } else {
+                break;
+            }
+        }
+        let text = std::str::from_utf8(&self.input[start..self.position]).unwrap_or("");
+        let value: f32 = text
+            .parse()
+            .map_err(|_| format!("'{text}' is not a number"))?;
+        if !value.is_finite() {
+            return Err(format!("'{text}' is not a finite number"));
+        }
+        Ok(FormulaExpr::Number(value))
+    }
+
+    fn identifier(&mut self) -> Result<FormulaExpr, String> {
+        let start = self.position;
+        while let Some(byte) = self.input.get(self.position) {
+            if byte.is_ascii_alphanumeric() || *byte == b'_' {
+                self.position += 1;
+            } else {
+                break;
+            }
+        }
+        let name = std::str::from_utf8(&self.input[start..self.position]).unwrap_or("");
+        match name {
+            "x" => return Ok(FormulaExpr::Variable(0)),
+            "y" => return Ok(FormulaExpr::Variable(1)),
+            "z" => return Ok(FormulaExpr::Variable(2)),
+            "pi" => return Ok(FormulaExpr::Number(std::f32::consts::PI)),
+            "e" => return Ok(FormulaExpr::Number(std::f32::consts::E)),
+            _ => {}
+        }
+        let Some(function) = FormulaFunction::parse(name) else {
+            return Err(format!("unknown name '{name}'"));
+        };
+        if !self.eat(b'(') {
+            return Err(format!("'{name}' needs parentheses"));
+        }
+        let mut args = Vec::new();
+        if !self.eat(b')') {
+            loop {
+                args.push(self.expression()?);
+                if self.eat(b',') {
+                    continue;
+                }
+                if self.eat(b')') {
+                    break;
+                }
+                return Err(format!("missing ')' after '{name}('"));
+            }
+        }
+        if args.len() != function.arity() {
+            return Err(format!(
+                "'{name}' takes {} argument(s), not {}",
+                function.arity(),
+                args.len()
+            ));
+        }
+        Ok(FormulaExpr::Call(function, args))
+    }
+}
+
+/// Whether a Formula axis expression parses. An empty expression means "leave
+/// this axis alone" and is valid.
+pub fn formula_expression_is_valid(expression: &str) -> bool {
+    expression.trim().is_empty() || FormulaParser::new(expression).parse().is_ok()
+}
+
+/// Apply up to three Formula expressions, one per axis, to every point.
+///
+/// Cheetah3D's Formula modifier evaluates a user formula per vertex; its manual
+/// page is not among the indexed sources, so this is the clean-room reading:
+/// each axis takes an expression in `x`, `y` and `z` (the point's rest position)
+/// that produces the new coordinate. An empty expression keeps that coordinate,
+/// and a non-finite result (a division by zero, an out-of-domain `sqrt`) also
+/// keeps it, so a formula can never introduce NaN into geometry. A malformed
+/// expression fails with a message naming the axis and the problem.
+pub fn formula(mesh: &Mesh, x: &str, y: &str, z: &str) -> Result<Mesh, String> {
+    let parse_axis = |axis: &str, expression: &str| -> Result<Option<FormulaExpr>, String> {
+        if expression.trim().is_empty() {
+            return Ok(None);
+        }
+        FormulaParser::new(expression)
+            .parse()
+            .map(Some)
+            .map_err(|error| format!("formula {axis} expression '{expression}': {error}"))
+    };
+    let expressions = [
+        parse_axis("X", x)?,
+        parse_axis("Y", y)?,
+        parse_axis("Z", z)?,
+    ];
+    let mut out = mesh.clone();
+    for point in &mut out.positions {
+        let rest = *point;
+        let mut next = rest;
+        for (axis, expression) in expressions.iter().enumerate() {
+            let Some(expression) = expression else {
+                continue;
+            };
+            let value = expression.evaluate(rest);
+            if value.is_finite() {
+                next[axis] = value;
+            }
+        }
+        *point = next;
+    }
+    Ok(out)
+}
+
+/// Pull points toward `center`, or push them away when `strength` is negative.
+///
+/// Cheetah3D's Magnet is a deformer with a strength; this clean-room reading
+/// treats it as an attraction field: a point inside `radius` moves toward the
+/// bounds centre by `strength` times a smooth falloff that is 1 at the centre
+/// and 0 at the radius, so nothing outside the radius moves and the border
+/// displacement is zero. Strength is clamped to -1..=1 and a non-positive
+/// radius does nothing.
+pub fn magnet(mesh: &Mesh, strength: f32, radius: f32, center: Vec3) -> Mesh {
+    let mut out = mesh.clone();
+    if !strength.is_finite() || strength == 0.0 || !radius.is_finite() || radius <= 0.0 {
+        return out;
+    }
+    let strength = strength.clamp(-1.0, 1.0);
+    for point in &mut out.positions {
+        let offset = *point - center;
+        let distance = offset.length();
+        if !distance.is_finite() || distance > radius || distance <= 1e-6 {
+            continue;
+        }
+        let t = 1.0 - distance / radius;
+        let falloff = t * t * (3.0 - 2.0 * t);
+        *point = point.lerp(center, strength * falloff);
+    }
+    out
+}
+
+/// Umbrella-smooth every point toward the average of its edge neighbours.
+///
+/// Cheetah3D's Laplacian Smooth exposes iterations and a strength; this is the
+/// textbook uniform Laplacian, run `iterations` times (capped at 64 so one
+/// evaluation stays responsive) with `strength` as the step size. Border points
+/// of an open mesh are held when `preserve_boundary` is set, so a patch keeps
+/// its outline and only its interior relaxes.
+pub fn laplacian_smooth(
+    mesh: &Mesh,
+    iterations: u32,
+    strength: f32,
+    preserve_boundary: bool,
+) -> Mesh {
+    let mut out = mesh.clone();
+    let strength = if strength.is_finite() {
+        strength.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if iterations == 0 || strength == 0.0 {
+        return out;
+    }
+    let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); mesh.positions.len()];
+    let mut edge_faces: HashMap<(u32, u32), u32> = HashMap::new();
+    for poly in &mesh.polygons {
+        let count = poly.corners.len();
+        for index in 0..count {
+            let a = poly.corners[index].point;
+            let b = poly.corners[(index + 1) % count].point;
+            if a == b {
+                continue;
+            }
+            if (b as usize) < neighbours.len() {
+                if let Some(list) = neighbours.get_mut(a as usize) {
+                    list.push(b);
+                }
+            }
+            *edge_faces.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    for list in &mut neighbours {
+        list.sort_unstable();
+        list.dedup();
+    }
+    let mut boundary = vec![false; mesh.positions.len()];
+    for ((a, b), faces) in &edge_faces {
+        if *faces == 1 {
+            for point in [*a as usize, *b as usize] {
+                if let Some(flag) = boundary.get_mut(point) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+    for _ in 0..iterations.min(64) {
+        let previous = out.positions.clone();
+        for (index, point) in out.positions.iter_mut().enumerate() {
+            if preserve_boundary && boundary[index] {
+                continue;
+            }
+            let list = &neighbours[index];
+            if list.is_empty() {
+                continue;
+            }
+            let average = list
+                .iter()
+                .map(|neighbour| previous[*neighbour as usize])
+                .sum::<Vec3>()
+                / list.len() as f32;
+            *point = previous[index].lerp(average, strength);
+        }
+    }
+    out
+}
+
+/// Reduce the polygon count toward `ratio` of the authored faces by collapsing
+/// the shortest edge of a triangle at its midpoint.
+///
+/// Cheetah3D's Polygon Reduction takes a target percentage; its manual page is
+/// not among the indexed sources, so this is the clean-room reading: a
+/// deterministic greedy collapse. Only edges that belong to a triangle are
+/// candidates, because collapsing one of those always removes at least one
+/// face, which is what makes the loop terminate instead of just turning quads
+/// into triangles. `collapse_points` keeps the midpoint and carries creases,
+/// seams and pinned UVs across the merge, so the reduced mesh still validates.
+/// The mesh is returned unchanged when the ratio is not in 0..1, when it has no
+/// triangles, or when the target cannot be reached.
+pub fn reduce_polygons(mesh: &Mesh, ratio: f32) -> Mesh {
+    let mut out = mesh.clone();
+    if !ratio.is_finite() || ratio <= 0.0 || ratio >= 1.0 || mesh.polygons.is_empty() {
+        return out;
+    }
+    let target = ((mesh.polygons.len() as f32 * ratio).round() as usize).max(1);
+    let mut attempts = 0usize;
+    let limit = mesh.polygons.len() * 2 + 16;
+    while out.polygons.len() > target && attempts < limit {
+        attempts += 1;
+        let mut triangles: HashSet<(u32, u32)> = HashSet::new();
+        for poly in &out.polygons {
+            let count = poly.corners.len();
+            if count != 3 {
+                continue;
+            }
+            for index in 0..count {
+                let a = poly.corners[index].point;
+                let b = poly.corners[(index + 1) % count].point;
+                if a != b
+                    && (a as usize) < out.positions.len()
+                    && (b as usize) < out.positions.len()
+                {
+                    triangles.insert((a.min(b), a.max(b)));
+                }
+            }
+        }
+        let mut candidates: Vec<(f32, u32, u32)> = triangles
+            .iter()
+            .map(|(a, b)| {
+                let length = (out.positions[*a as usize] - out.positions[*b as usize]).length();
+                (if length.is_finite() { length } else { f32::MAX }, *a, *b)
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then(left.1.cmp(&right.1))
+                .then(left.2.cmp(&right.2))
+        });
+        let Some(&(_, a, b)) = candidates.first() else {
+            break;
+        };
+        out = collapse_points(&out, &[a, b]).0;
+    }
+    out
+}
+
+/// Rotate every point around the target object's `axis` so the source's extent
+/// along that axis becomes a rotation angle.
+///
+/// Cheetah3D's Wrap modifier takes a target object; its manual page is not
+/// among the indexed sources, so this is the clean-room reading: the source's
+/// position along `axis` maps to an angle of up to `angle_deg / 2` at each end
+/// around the target's centre line, which curls the source around the target
+/// while keeping each point's distance from that line. A zero angle, an empty
+/// target and a degenerate extent all return the mesh unchanged.
+pub fn wrap_mesh(mesh: &Mesh, target: &Mesh, axis: usize, angle_deg: f32) -> Mesh {
+    let mut out = mesh.clone();
+    let source_bounds = mesh.bounds();
+    let target_bounds = target.bounds();
+    if !angle_deg.is_finite() || angle_deg == 0.0 {
+        return out;
+    }
+    if !source_bounds.is_valid() || !target_bounds.is_valid() {
+        return out;
+    }
+    let axis = axis.min(2);
+    let (u, v) = match axis {
+        0 => (1, 2),
+        1 => (2, 0),
+        _ => (0, 1),
+    };
+    let center = target_bounds.center();
+    let extent = source_bounds.size()[axis].max(1e-6);
+    let total = angle_deg.to_radians();
+    for point in &mut out.positions {
+        let t = (point[axis] - source_bounds.min[axis]) / extent - 0.5;
+        let angle = t * total;
+        let du = point[u] - center[u];
+        let dv = point[v] - center[v];
+        point[u] = center[u] + du * angle.cos() - dv * angle.sin();
+        point[v] = center[v] + du * angle.sin() + dv * angle.cos();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{primitives, uv};
+
+    /// A flat 3×3 point grid with four quads and a raised centre and corner, so
+    /// the smoothing and reduction tests have an open border and a bump.
+    fn bumpy_quad_grid() -> Mesh {
+        let mut mesh = Mesh::new("grid");
+        for z in 0..3 {
+            for x in 0..3 {
+                mesh.add_point(Vec3::new(x as f32, 0.0, z as f32));
+            }
+        }
+        for z in 0..2 {
+            for x in 0..2 {
+                let start = (z * 3 + x) as u32;
+                mesh.add_face(&[start, start + 1, start + 4, start + 3]);
+            }
+        }
+        mesh.positions[4].y = 1.0;
+        mesh.positions[0].y = 1.0;
+        mesh
+    }
+
+    #[test]
+    fn displacement_moves_points_along_normals_deterministically() {
+        let source = primitives::sphere_mesh(1.0, 16, 8);
+        let displaced = displace(&source, 0.2, 2.0, 7);
+        assert_eq!(displaced.positions.len(), source.positions.len());
+        assert_eq!(displaced.polygons, source.polygons);
+        assert!(displaced.positions.iter().all(|point| point.is_finite()));
+        assert!(displaced.validate().is_ok());
+        assert_ne!(displaced.positions, source.positions);
+        for (before, after) in source.positions.iter().zip(&displaced.positions) {
+            assert!((*after - *before).length() <= 0.2 + 1e-4);
+        }
+        assert_eq!(
+            displaced.positions,
+            displace(&source, 0.2, 2.0, 7).positions
+        );
+        assert_ne!(
+            displaced.positions,
+            displace(&source, 0.2, 2.0, 8).positions
+        );
+        assert_eq!(displace(&source, 0.0, 2.0, 7).positions, source.positions);
+    }
+
+    #[test]
+    fn formula_evaluates_per_axis_and_rejects_malformed_input() {
+        let mut mesh = Mesh::new("formula");
+        mesh.add_point(Vec3::new(1.0, 2.0, 3.0));
+        mesh.add_point(Vec3::new(-2.0, 0.5, 0.0));
+
+        let moved = formula(&mesh, "x + 1", "y * 2", "sqrt(16)").unwrap();
+        assert_eq!(moved.positions[0], Vec3::new(2.0, 4.0, 4.0));
+        assert_eq!(moved.positions[1], Vec3::new(-1.0, 1.0, 4.0));
+
+        let precedence = formula(&mesh, "", "", "x + 2 * 3 ^ 2").unwrap();
+        assert_eq!(precedence.positions[0], Vec3::new(1.0, 2.0, 19.0));
+
+        // An empty expression and a non-finite result both keep the coordinate.
+        let guarded = formula(&mesh, "", "", "1 / (x - x)").unwrap();
+        assert_eq!(guarded.positions[0], mesh.positions[0]);
+
+        let error = formula(&mesh, "x +", "", "").unwrap_err();
+        assert!(
+            error.contains("formula X") && error.contains("unexpected end"),
+            "{error}"
+        );
+        assert!(formula(&mesh, "", "nope(1)", "").is_err());
+        assert!(formula(&mesh, "", "min(x)", "").is_err());
+        assert!(formula_expression_is_valid("min(x, 2) + max(y, 0)"));
+        assert!(!formula_expression_is_valid("min(x)"));
+        assert!(formula_expression_is_valid(""));
+    }
+
+    #[test]
+    fn magnet_pulls_nearer_points_further_and_respects_the_radius() {
+        let mesh = Mesh::from_polygons(
+            "magnet",
+            vec![
+                Vec3::new(0.25, 0.0, 0.0),
+                Vec3::new(0.75, 0.0, 0.0),
+                Vec3::new(3.0, 0.0, 0.0),
+            ],
+            vec![vec![0, 1, 2]],
+        );
+        let pulled = magnet(&mesh, 1.0, 1.0, Vec3::ZERO);
+        let near = pulled.positions[0].length();
+        let far = pulled.positions[1].length();
+        assert!(near < far && far < 0.75, "near {near} far {far}");
+        assert_eq!(pulled.positions[2], Vec3::new(3.0, 0.0, 0.0));
+
+        let pushed = magnet(&mesh, -1.0, 1.0, Vec3::ZERO);
+        assert!(pushed.positions[0].length() > 0.25);
+        assert_eq!(
+            magnet(&mesh, 1.0, 0.0, Vec3::ZERO).positions,
+            mesh.positions
+        );
+    }
+
+    #[test]
+    fn laplacian_smooth_relaxes_the_interior_and_can_hold_the_border() {
+        let grid = bumpy_quad_grid();
+        let smoothed = laplacian_smooth(&grid, 1, 1.0, true);
+        assert!(smoothed.positions[4].y < 1.0 - 1e-3);
+        assert_eq!(smoothed.positions[0].y, 1.0, "the corner is a border point");
+        assert!(smoothed.positions.iter().all(|point| point.is_finite()));
+        assert_eq!(smoothed.polygons, grid.polygons);
+
+        let loose = laplacian_smooth(&grid, 1, 1.0, false);
+        assert!(loose.positions[0].y.abs() < 1e-6);
+        assert_eq!(
+            smoothed.positions[4],
+            laplacian_smooth(&grid, 1, 1.0, true).positions[4]
+        );
+        assert_eq!(
+            laplacian_smooth(&grid, 0, 1.0, true).positions,
+            grid.positions
+        );
+    }
+
+    #[test]
+    fn polygon_reduction_halves_a_triangulated_grid() {
+        let grid = bumpy_quad_grid();
+        let triangles = triangulate_faces(&grid, &[0, 1, 2, 3]);
+        assert_eq!(triangles.polygons.len(), 8);
+        let reduced = reduce_polygons(&triangles, 0.5);
+        assert!(reduced.polygons.len() < triangles.polygons.len());
+        assert!(reduced.polygons.len() <= 4, "{}", reduced.polygons.len());
+        assert!(reduced.validate().is_ok());
+        assert_eq!(
+            reduced.positions.len(),
+            reduce_polygons(&triangles, 0.5).positions.len()
+        );
+        // A quad-only cage has no triangle edge to collapse, so it is unchanged.
+        assert_eq!(reduce_polygons(&grid, 0.5).polygons, grid.polygons);
+        assert_eq!(
+            reduce_polygons(&triangles, 1.0).polygons,
+            triangles.polygons
+        );
+    }
+
+    #[test]
+    fn wrap_bends_the_source_around_the_target_axis() {
+        let source = Mesh::from_polygons(
+            "source",
+            vec![
+                Vec3::new(-1.0, 3.0, 0.0),
+                Vec3::new(0.0, 3.0, 0.0),
+                Vec3::new(1.0, 3.0, 0.0),
+            ],
+            vec![vec![0, 1, 2]],
+        );
+        let target = Mesh::from_polygons(
+            "target",
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2]],
+        );
+        let center = target.bounds().center();
+        let wrapped = wrap_mesh(&source, &target, 0, 90.0);
+        assert!(wrapped.positions.iter().all(|point| point.is_finite()));
+        assert_ne!(wrapped.positions, source.positions);
+        // The source's middle stays put and its ends swing around the target; a
+        // point keeps its distance from the target's centre line.
+        assert_eq!(wrapped.positions[1], source.positions[1]);
+        for (before, after) in source.positions.iter().zip(&wrapped.positions) {
+            let radius_before = (*before - center).length();
+            let radius_after = (*after - center).length();
+            assert!((radius_before - radius_after).abs() < 1e-4);
+        }
+        assert!((wrapped.positions[0] - source.positions[0]).length() > 1e-3);
+        assert_eq!(
+            wrap_mesh(&source, &target, 0, 0.0).positions,
+            source.positions
+        );
+    }
+
+    fn flat_quad() -> Mesh {
+        Mesh::from_polygons(
+            "quad",
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+    }
+
+    fn two_quad_strip() -> Mesh {
+        Mesh::from_polygons(
+            "strip",
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 1.0),
+            ],
+            vec![vec![0, 1, 2, 3], vec![1, 4, 5, 2]],
+        )
+    }
+
+    #[test]
+    fn scalpel_cuts_one_polygon_between_two_edges() {
+        let quad = flat_quad();
+        let cut = scalpel_face(
+            &quad,
+            0,
+            ScalpelPick::Edge { a: 0, b: 1, t: 0.5 },
+            ScalpelPick::Edge { a: 3, b: 2, t: 0.5 },
+        )
+        .unwrap();
+        assert_eq!(cut.polygons.len(), 2);
+        assert_eq!(cut.positions.len(), 6);
+        assert!(cut.validate().is_ok());
+        assert_eq!(cut.polygons[0].corners.len(), 4);
+        assert_eq!(cut.polygons[1].corners.len(), 4);
+        // The two ends of the cut sit on the midpoints and both faces share them.
+        assert_eq!(cut.positions[4], Vec3::new(0.5, 0.0, 0.0));
+        assert_eq!(cut.positions[5], Vec3::new(0.5, 0.0, 1.0));
+        for point in [4u32, 5] {
+            for poly in &cut.polygons {
+                assert!(poly.corners.iter().any(|corner| corner.point == point));
+            }
+        }
+    }
+
+    #[test]
+    fn scalpel_face_ends_reports_the_points_a_chained_cut_continues_from() {
+        let quad = flat_quad();
+        // The edge pick inserts point 4 and the corner pick keeps point 2, so a
+        // chained cut needs exactly those indices, in from/to order.
+        let (cut, from, to) = scalpel_face_ends(
+            &quad,
+            0,
+            ScalpelPick::Edge { a: 0, b: 1, t: 0.5 },
+            ScalpelPick::Point(2),
+        )
+        .unwrap();
+        assert_eq!((from, to), (4, 2));
+        assert_eq!(cut.positions[from as usize], Vec3::new(0.5, 0.0, 0.0));
+        // The reported ends are corners of both new faces, which is what lets
+        // the next cut start on either half.
+        for point in [from, to] {
+            for poly in &cut.polygons {
+                assert!(poly.corners.iter().any(|corner| corner.point == point));
+            }
+        }
+        // Reversed picks report the ends in their own order.
+        let (_, from, to) = scalpel_face_ends(
+            &quad,
+            0,
+            ScalpelPick::Point(2),
+            ScalpelPick::Edge { a: 0, b: 1, t: 0.5 },
+        )
+        .unwrap();
+        assert_eq!((from, to), (2, 4));
+    }
+
+    #[test]
+    fn scalpel_corner_to_edge_makes_a_triangle_and_a_quad() {
+        let quad = flat_quad();
+        let cut = scalpel_face(
+            &quad,
+            0,
+            ScalpelPick::Point(0),
+            ScalpelPick::Edge { a: 2, b: 3, t: 0.5 },
+        )
+        .unwrap();
+        assert!(cut.validate().is_ok());
+        assert_eq!(cut.polygons.len(), 2);
+        assert_eq!(cut.polygons[0].corners.len(), 4);
+        assert_eq!(cut.polygons[1].corners.len(), 3);
+        // Both faces keep the authored material slot.
+        assert_eq!(
+            cut.polygons[0].material_slot,
+            quad.polygons[0].material_slot
+        );
+        assert_eq!(
+            cut.polygons[1].material_slot,
+            quad.polygons[0].material_slot
+        );
+    }
+
+    #[test]
+    fn scalpel_splits_shared_edges_and_keeps_seams_and_creases() {
+        let strip = two_quad_strip();
+        let mut marked = strip.clone();
+        assert!(marked.set_seam(1, 2, true));
+        assert!(marked.set_crease_weight(1, 2, 0.5));
+        let cut = scalpel_face(
+            &marked,
+            0,
+            ScalpelPick::Edge { a: 1, b: 2, t: 0.5 },
+            ScalpelPick::Edge { a: 3, b: 0, t: 0.5 },
+        )
+        .unwrap();
+        assert!(cut.validate().is_ok());
+        let inserted = cut
+            .positions
+            .iter()
+            .position(|point| (*point - Vec3::new(1.0, 0.0, 0.5)).length() < 1e-6)
+            .expect("the cut adds the midpoint of the shared edge") as u32;
+        // The neighbour keeps its corner count plus the split point, so the
+        // shared edge is split the same way on both sides.
+        assert_eq!(cut.polygons[1].corners.len(), 5);
+        for (a, b) in [(1, inserted), (inserted, 2)] {
+            let edge = cut
+                .edges()
+                .into_iter()
+                .find(|edge| (edge.a == a && edge.b == b) || (edge.a == b && edge.b == a))
+                .expect("the split edge exists");
+            assert_eq!(edge.faces.len(), 2, "the split edge stays interior");
+        }
+        let cut_edge = cut
+            .edges()
+            .into_iter()
+            .find(|edge| edge.a >= 6 && edge.b >= 6)
+            .expect("the cut edge exists");
+        assert_eq!(cut_edge.faces.len(), 2);
+        // Seam and crease weight follow both halves of the split edge.
+        assert!(!cut.is_seam(1, 2));
+        assert!(cut.is_seam(1, inserted) && cut.is_seam(inserted, 2));
+        assert_eq!(cut.crease_weight(1, inserted), 0.5);
+        assert_eq!(cut.crease_weight(inserted, 2), 0.5);
+    }
+
+    #[test]
+    fn scalpel_rejects_picks_outside_the_polygon_and_degenerate_cuts() {
+        let quad = flat_quad();
+        let cases = [
+            (ScalpelPick::Point(9), ScalpelPick::Point(0)),
+            (
+                ScalpelPick::Edge { a: 0, b: 2, t: 0.5 },
+                ScalpelPick::Edge { a: 1, b: 3, t: 0.5 },
+            ),
+            (
+                ScalpelPick::Edge { a: 0, b: 1, t: 1.5 },
+                ScalpelPick::Edge { a: 2, b: 3, t: 0.5 },
+            ),
+            (ScalpelPick::Point(1), ScalpelPick::Point(1)),
+            (ScalpelPick::Point(0), ScalpelPick::Point(1)),
+        ];
+        for (from, to) in cases {
+            assert!(
+                scalpel_face(&quad, 0, from, to).is_err(),
+                "{from:?} to {to:?} should be refused"
+            );
+        }
+        assert!(scalpel_face(&quad, 4, ScalpelPick::Point(0), ScalpelPick::Point(2)).is_err());
+    }
 
     #[test]
     fn triangulate_splits_only_the_selected_polygons() {
@@ -1747,10 +3542,6 @@ mod tests {
         assert_eq!(triangles.len(), 2);
         for triangle in &triangles {
             assert_eq!(triangle.corners.len(), 3);
-            assert_eq!(
-                triangle.corners[0], quad.corners[0],
-                "the fan keeps the polygon's first corner"
-            );
         }
         let covered: Vec<u32> = triangles
             .iter()
@@ -1759,22 +3550,72 @@ mod tests {
         for corner in &quad.corners {
             assert!(
                 covered.contains(&corner.point),
-                "the fan dropped point {}",
+                "triangulation dropped point {}",
                 corner.point
             );
         }
+        // The two triangles share exactly one edge: the new diagonal.
         let diagonal = (triangles[0].corners[0].point, triangles[0].corners[2].point);
+        assert!(
+            triangles[1]
+                .corners
+                .iter()
+                .filter(|corner| { corner.point == diagonal.0 || corner.point == diagonal.1 })
+                .count()
+                == 2,
+            "the split triangles do not share the diagonal"
+        );
         assert!(
             out.creases
                 .iter()
                 .all(|edge| !(edge.contains(&diagonal.0) && edge.contains(&diagonal.1))),
-            "the new fan diagonal must not inherit a crease"
+            "the new diagonal must not inherit a crease"
         );
 
         // Selecting nothing leaves every n-gon alone.
         let untouched = triangulate_faces(&mesh, &[]);
         assert_eq!(untouched.polygons.len(), mesh.polygons.len());
         assert_eq!(untouched.polygons[0].corners.len(), 4);
+    }
+
+    #[test]
+    fn triangulation_modes_choose_different_diagonals() {
+        // A skewed quad whose 1-3 diagonal is shorter than 0-2. Shortest
+        // Diagonal must pick 1-3 instead of the old fixed fan from corner 0.
+        let mut mesh = Mesh::new("Skew");
+        mesh.positions = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.1, 3.0, 0.0),
+            Vec3::new(0.0, 3.0, 0.0),
+        ];
+        mesh.add_face(&[0, 1, 2, 3]);
+        let shortest = triangulate_faces_with(&mesh, &[0], TriangulateMode::ShortestDiagonal);
+        assert_eq!(shortest.polygons.len(), 2);
+        let points: Vec<Vec<u32>> = shortest
+            .polygons
+            .iter()
+            .map(|polygon| polygon.corners.iter().map(|corner| corner.point).collect())
+            .collect();
+        assert!(points.iter().all(|triangle| triangle.len() == 3));
+        assert!(
+            points
+                .iter()
+                .any(|triangle| triangle.contains(&1) && triangle.contains(&3)),
+            "ShortestDiagonal should split along the 1-3 diagonal: {points:?}"
+        );
+        assert!(
+            !points
+                .iter()
+                .any(|triangle| triangle.contains(&0) && triangle.contains(&2)),
+            "the longer 0-2 diagonal must not be used: {points:?}"
+        );
+        let paired = triangulate_faces_with(&mesh, &[0], TriangulateMode::QuadPair);
+        assert_eq!(paired.polygons.len(), 2);
+        assert_eq!(paired.polygons[0].corners[0].point, 1);
+        assert_eq!(paired.polygons[0].corners[2].point, 3);
+        assert!(shortest.validate().is_ok());
+        assert!(paired.validate().is_ok());
     }
 
     #[test]
@@ -3059,4 +4900,182 @@ mod tests {
         assert!(!out.uvs.is_empty());
         assert!(out.validate().is_ok());
     }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+
+    fn quad() -> Mesh {
+        Mesh::from_polygons(
+            "quad",
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 2.0),
+                Vec3::new(0.0, 0.0, 2.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        )
+    }
+
+    #[test]
+    fn clone_faces_offsets_scales_and_rotates_each_copy() {
+        let mesh = quad();
+        let options = CloneOptions {
+            copies: 2,
+            direction: Vec3::X * 2.0,
+            scale: 0.5,
+            ..Default::default()
+        };
+        let out = clone_faces(&mesh, &[0], &options);
+        assert_eq!(out.polygons.len(), 3);
+        assert_eq!(out.positions.len(), 12);
+        assert!(out.validate().is_ok());
+        let centroid = |start: usize| {
+            (start..start + 4)
+                .map(|index| out.positions[index])
+                .sum::<Vec3>()
+                / 4.0
+        };
+        assert!(
+            (centroid(4).x - 2.0).abs() < 1e-5,
+            "copy1 centroid {}",
+            centroid(4)
+        );
+        assert!((centroid(8).x - 1.0 - 2.0).abs() < 1e-5);
+        // The second copy ends at the requested 0.5 scale.
+        let width = out.positions[8].distance(out.positions[9]);
+        assert!((width - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clone_empty_selection_copies_every_polygon_and_holes_skip_copies() {
+        let cube = crate::primitives::box_mesh(1.0, 1.0, 1.0);
+        let out = clone_faces(
+            &cube,
+            &[],
+            &CloneOptions {
+                copies: 1,
+                direction: Vec3::Y,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.polygons.len(), cube.polygons.len() * 2);
+        let holed = clone_faces(
+            &cube,
+            &[],
+            &CloneOptions {
+                copies: 3,
+                holes: 1.0,
+                direction: Vec3::Y,
+                ..Default::default()
+            },
+        );
+        assert_eq!(holed.polygons.len(), cube.polygons.len());
+    }
+
+    #[test]
+    fn clone_copies_creases_and_is_deterministic_with_variation() {
+        let mut mesh = quad();
+        assert!(mesh.set_crease(0, 1, true));
+        let options = CloneOptions {
+            copies: 3,
+            direction: Vec3::X,
+            scale_variation: 0.25,
+            position_variation: 0.1,
+            rotation_variation_deg: 15.0,
+            ..Default::default()
+        };
+        let first = clone_faces(&mesh, &[0], &options);
+        let second = clone_faces(&mesh, &[0], &options);
+        assert_eq!(first, second);
+        assert_eq!(first.creases.len(), 4);
+        assert_eq!(first.polygons.len(), 4);
+        assert!(first.validate().is_ok());
+    }
+
+    #[test]
+    fn clone_points_duplicates_only_the_selected_points() {
+        let mesh = quad();
+        let out = clone_points(
+            &mesh,
+            &[0, 2],
+            &CloneOptions {
+                copies: 2,
+                direction: Vec3::Y,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.positions.len(), mesh.positions.len() + 4);
+        assert_eq!(out.polygons.len(), mesh.polygons.len());
+        assert_eq!(out.positions[4].y, 0.5);
+        assert_eq!(out.positions[6].y, 1.0);
+    }
+}
+
+#[test]
+fn clone_keep_ratio_makes_scale_variation_uniform() {
+    let mesh = Mesh::from_polygons(
+        "rect",
+        vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+            Vec3::new(4.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    );
+    let mut options = CloneOptions {
+        copies: 1,
+        scale_variation: 0.5,
+        keep_ratio: true,
+        ..Default::default()
+    };
+    let uniform = clone_faces(&mesh, &[0], &options);
+    let width = uniform.positions[4].distance(uniform.positions[5]);
+    let depth = uniform.positions[4].distance(uniform.positions[7]);
+    assert!((width / depth - 2.0).abs() < 1e-5);
+
+    options.keep_ratio = false;
+    let independent = clone_faces(&mesh, &[0], &options);
+    let width = independent.positions[4].distance(independent.positions[5]);
+    let depth = independent.positions[4].distance(independent.positions[7]);
+    assert!(
+        (width / depth - 2.0).abs() > 1e-4,
+        "independent scale variation kept the original ratio"
+    );
+}
+
+#[test]
+fn fill_holes_refuses_a_hole_that_encloses_an_island() {
+    let mesh = Mesh::from_polygons(
+        "hole with island",
+        vec![
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+            Vec3::new(-1.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(-1.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.3, 0.0, 0.0),
+            Vec3::new(0.0, 0.3, 0.0),
+        ],
+        vec![
+            vec![0, 1, 5, 4],
+            vec![1, 2, 6, 5],
+            vec![2, 3, 7, 6],
+            vec![3, 0, 4, 7],
+            vec![8, 9, 10],
+        ],
+    );
+    let holes = open_holes(&mesh, &[4]);
+    assert_eq!(holes.len(), 1);
+    let Err(error) = fill_holes(&mesh, &holes) else {
+        panic!("filled a hole through the island");
+    };
+    assert!(error.contains("island"), "unexpected error: {error}");
 }

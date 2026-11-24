@@ -86,6 +86,7 @@ pub fn add_texture_to_base_color(material: &mut Material, path: &str) {
     let node = material.graph.add_node(
         ShaderNodeKind::Texture {
             path: path.to_string(),
+            uv_set: 0,
         },
         glam::Vec2::new(40.0, 220.0),
     );

@@ -10,11 +10,13 @@ use lc_shading::{Material, MaterialLibrary, ShadingContext, Surface, TextureCach
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Triangle {
     pub p: [Vec3; 3],
     pub n: [Vec3; 3],
     pub uv: [Vec2; 3],
+    /// Additional UV sets (UV1, …) at the same three corners.
+    pub extra_uv: Vec<[Vec2; 3]>,
     pub tangent: Vec3,
     pub material: u32,
 }
@@ -103,11 +105,13 @@ pub struct RenderScene {
     pub transparent_background: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Hit {
     pub t: f32,
     pub position: Vec3,
     pub uv: Vec2,
+    /// Interpolated additional UV sets, starting at UV1.
+    pub extra_uvs: Vec<Vec2>,
     /// Interpolated, outward facing normal.
     pub normal: Vec3,
     pub geometric_normal: Vec3,
@@ -144,6 +148,15 @@ impl RenderScene {
                     .v
                     .map(|v| (normal_matrix * v.normal).normalize_or(Vec3::Y));
                 let uv = tri.v.map(|v| v.uv);
+                let extra_uv = (1..mesh.uv_set_count())
+                    .map(|set| {
+                        [0usize, 1, 2].map(|k| {
+                            let corner = &mesh.polygons[tri.polygon as usize].corners
+                                [tri.v[k].corner as usize];
+                            mesh.uv_of_set(corner, set)
+                        })
+                    })
+                    .collect();
                 let mut tangent = triangle_tangent(p, uv);
                 tangent = (world_dir * tangent).normalize_or(orthonormal_basis(n[0]).0);
                 if !n.iter().all(|v| v.length_squared() > 1e-12) {
@@ -154,6 +167,7 @@ impl RenderScene {
                     p,
                     n,
                     uv,
+                    extra_uv,
                     tangent,
                     material,
                 });
@@ -253,10 +267,16 @@ impl RenderScene {
         let normal = (tri.n[0] * w + tri.n[1] * hit.u + tri.n[2] * hit.v)
             .normalize_or(tri.geometric_normal());
         let uv = tri.uv[0] * w + tri.uv[1] * hit.u + tri.uv[2] * hit.v;
+        let extra_uvs = tri
+            .extra_uv
+            .iter()
+            .map(|set| set[0] * w + set[1] * hit.u + set[2] * hit.v)
+            .collect();
         Some(Hit {
             t: hit.t,
             position,
             uv,
+            extra_uvs,
             normal,
             geometric_normal: tri.geometric_normal(),
             tangent: tri.tangent,
@@ -295,6 +315,7 @@ impl RenderScene {
         };
         let ctx = ShadingContext {
             uv: hit.uv,
+            extra_uvs: &hit.extra_uvs,
             position: hit.position,
             normal: faceforward,
             tangent,
@@ -421,6 +442,50 @@ mod tests {
         assert!(scene
             .environment_radiance(Vec3::new(0.0, 1.0, 0.0))
             .is_finite());
+    }
+
+    #[test]
+    fn hits_carry_interpolated_additional_uv_sets() {
+        use crate::camera::RenderCamera;
+        use lc_geom::Bvh;
+        use lc_scene::Camera;
+        use lc_shading::{MaterialLibrary, TextureCache};
+        use std::sync::Arc;
+        let tri = Triangle {
+            p: [
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            n: [Vec3::Z; 3],
+            uv: [Vec2::ZERO; 3],
+            extra_uv: vec![[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(0.0, 1.0),
+            ]],
+            tangent: Vec3::X,
+            material: 0,
+        };
+        let scene = RenderScene {
+            bvh: Bvh::build(std::slice::from_ref(&tri)),
+            triangles: vec![tri],
+            materials: MaterialLibrary::default(),
+            textures: Arc::new(TextureCache::default()),
+            lights: Vec::new(),
+            environment: lc_scene::Environment::default(),
+            background: Vec3::ZERO,
+            camera: RenderCamera::new(glam::Mat4::IDENTITY, Camera::default()),
+            time: 0.0,
+            bounds: lc_core::Aabb::new(Vec3::splat(-1.0), Vec3::splat(1.0)),
+            max_bounces: 1,
+            exposure: 0.0,
+            transparent_background: false,
+        };
+        let ray = lc_core::Ray::new(Vec3::new(0.25, 0.25, 1.0), -Vec3::Z);
+        let hit = scene.intersect(&ray, f32::INFINITY).unwrap();
+        assert_eq!(hit.extra_uvs.len(), 1);
+        assert!((hit.extra_uvs[0] - Vec2::new(0.25, 0.25)).length() < 1e-5);
     }
 
     #[test]

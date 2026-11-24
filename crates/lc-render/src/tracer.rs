@@ -70,7 +70,6 @@ impl PathTracer {
             .enumerate()
             .for_each(|(y, (row, coverage_row))| {
                 for x in 0..width as usize {
-                    let mut sum = Vec3::ZERO;
                     let mut covered = 0.0;
                     for s in 0..spp {
                         let sample_index = sample_base + s;
@@ -86,11 +85,12 @@ impl PathTracer {
                         );
                         let (radiance, hit) = trace_path(scene, ray, max_bounces, &mut rng);
                         if radiance.is_finite() {
-                            sum += radiance.max(Vec3::ZERO).min(Vec3::splat(1e6));
+                            // Accumulate per sample, in sample order, so splitting
+                            // a render into passes stays bit-identical to one pass.
+                            row[x] += radiance.max(Vec3::ZERO).min(Vec3::splat(1e6));
                         }
                         covered += hit;
                     }
-                    row[x] += sum;
                     coverage_row[x] += covered;
                 }
             });
@@ -207,6 +207,24 @@ fn trace_path(scene: &RenderScene, mut ray: Ray, max_bounces: u32, rng: &mut Pcg
     (radiance, hit_any)
 }
 
+/// Sample a point on the light's spherical shell for soft shadows. A zero or
+/// non-finite radius returns the centre and consumes no randomness, so the
+/// hard-shadow path stays byte-identical.
+fn sample_light_position(center: Vec3, radius: f32, rng: &mut Pcg32) -> Vec3 {
+    let radius = if radius.is_finite() {
+        radius.max(0.0)
+    } else {
+        0.0
+    };
+    if radius <= 0.0 {
+        return center;
+    }
+    let z = rng.next_f32() * 2.0 - 1.0;
+    let phi = std::f32::consts::TAU * rng.next_f32();
+    let ring = (1.0 - z * z).max(0.0).sqrt();
+    center + Vec3::new(ring * phi.cos(), ring * phi.sin(), z) * radius
+}
+
 fn direct_light(
     scene: &RenderScene,
     hit: &Hit,
@@ -238,8 +256,10 @@ fn direct_light(
             let f = evaluate_bsdf(surface, wo, wi, n_dot_l);
             f * light.emission * n_dot_l / count
         }
-        SceneLightKind::Point { position, .. } => {
-            let to_light = *position - hit.position;
+        SceneLightKind::Point { position, radius } => {
+            // A light with a radius is a sphere: sampling its shell widens the
+            // penumbra instead of casting a hard-edged shadow.
+            let to_light = sample_light_position(*position, *radius, rng) - hit.position;
             let dist2 = to_light.length_squared().max(1e-6);
             let wi = to_light / dist2.sqrt();
             let n_dot_l = n.dot(wi);
@@ -257,12 +277,12 @@ fn direct_light(
         }
         SceneLightKind::Spot {
             position,
+            radius,
             direction,
             cos_inner,
             cos_outer,
-            ..
         } => {
-            let to_light = *position - hit.position;
+            let to_light = sample_light_position(*position, *radius, rng) - hit.position;
             let dist2 = to_light.length_squared().max(1e-6);
             let dist = dist2.sqrt();
             let wi = to_light / dist;
@@ -510,5 +530,116 @@ mod tests {
         let rgba = tracer.rgba8(0.0, true);
         assert_eq!(rgba.len(), 16 * 12);
         assert_eq!(rgba.len(), 16 * 12);
+    }
+
+    #[test]
+    fn light_radius_creates_a_deterministic_penumbra_and_stays_finite() {
+        use crate::camera::RenderCamera;
+        use crate::scene::{SceneLight, Triangle};
+        use lc_geom::Bvh;
+        use lc_scene::Camera;
+        use lc_shading::{MaterialLibrary, TextureCache};
+
+        fn scene_with_radius(radius: f32) -> RenderScene {
+            // A small blocker one metre above the shaded point. A radius-zero
+            // point light is fully blocked; sampling a spherical shell lets
+            // light around it, and a larger radius lets more through.
+            let blocker = [
+                Triangle {
+                    p: [
+                        Vec3::new(-0.1, 1.0, -0.1),
+                        Vec3::new(0.1, 1.0, -0.1),
+                        Vec3::new(0.1, 1.0, 0.1),
+                    ],
+                    n: [Vec3::Y; 3],
+                    uv: [Vec2::ZERO; 3],
+                    extra_uv: Vec::new(),
+                    tangent: Vec3::X,
+                    material: 0,
+                },
+                Triangle {
+                    p: [
+                        Vec3::new(-0.1, 1.0, -0.1),
+                        Vec3::new(0.1, 1.0, 0.1),
+                        Vec3::new(-0.1, 1.0, 0.1),
+                    ],
+                    n: [Vec3::Y; 3],
+                    uv: [Vec2::ZERO; 3],
+                    extra_uv: Vec::new(),
+                    tangent: Vec3::X,
+                    material: 0,
+                },
+            ];
+            RenderScene {
+                bvh: Bvh::build(&blocker),
+                triangles: blocker.to_vec(),
+                materials: MaterialLibrary::default(),
+                textures: std::sync::Arc::new(TextureCache::default()),
+                lights: vec![SceneLight {
+                    kind: SceneLightKind::Point {
+                        position: Vec3::new(0.0, 2.0, 0.0),
+                        radius,
+                    },
+                    emission: Vec3::ONE,
+                    casts_shadow: true,
+                }],
+                environment: lc_scene::Environment::default(),
+                background: Vec3::ZERO,
+                camera: RenderCamera::new(glam::Mat4::IDENTITY, Camera::default()),
+                time: 0.0,
+                bounds: lc_core::Aabb::new(Vec3::splat(-1.0), Vec3::splat(1.0)),
+                max_bounces: 1,
+                exposure: 0.0,
+                transparent_background: false,
+            }
+        }
+
+        fn shadowed_fraction(radius: f32, samples: usize) -> f32 {
+            let scene = scene_with_radius(radius);
+            let hit = Hit {
+                t: 0.0,
+                position: Vec3::ZERO,
+                uv: Vec2::ZERO,
+                extra_uvs: Vec::new(),
+                normal: Vec3::Y,
+                geometric_normal: Vec3::Y,
+                tangent: Vec3::X,
+                material: 0,
+            };
+            let surface = Surface {
+                normal: Vec3::Y,
+                ..Default::default()
+            };
+            let mut shadowed = 0usize;
+            for sample in 0..samples {
+                let mut rng = Pcg32::new(sample as u64 + 17);
+                let value = direct_light(&scene, &hit, &surface, Vec3::Y, &mut rng);
+                assert!(value.is_finite(), "radius {radius} produced {value}");
+                if value.max_element() <= 0.0 {
+                    shadowed += 1;
+                }
+            }
+            shadowed as f32 / samples as f32
+        }
+
+        // The shaded point sits in the hard-shadow umbra. Sampling a spherical
+        // shell lets light around the blocker; a wider radius leaves a smaller
+        // fully-shadowed core, which is a wider penumbra.
+        let hard = shadowed_fraction(0.0, 256);
+        let small = shadowed_fraction(0.5, 256);
+        let large = shadowed_fraction(2.0, 256);
+        assert!(hard > 0.99, "a radius-zero light is fully blocked: {hard}");
+        assert!(
+            small < hard,
+            "a small radius must light part of the umbra: {small} vs {hard}"
+        );
+        assert!(
+            large < small,
+            "a larger radius must widen the penumbra: {small} vs {large}"
+        );
+        for radius in [f32::NAN, f32::INFINITY, -1.0] {
+            let value = shadowed_fraction(radius, 8);
+            assert!(value.is_finite(), "radius {radius} produced {value}");
+        }
     }
 }

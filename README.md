@@ -64,7 +64,7 @@ gate, including a real MCP handshake smoke test. The repository is split into
 six agent lanes with scoped briefs under [`docs/agents/`](docs/agents/README.md);
 `scripts/check-lane.sh <lane>` runs one lane's fast gate, `.claude/agents/`
 exposes the same lanes as Claude Code project subagents, and `.agents/` provides
-a Freebuff/Codebuff CLI coordinator plus the six lanes. The project-scoped
+a Codebuff CLI coordinator plus the six lanes. The project-scoped
 `.mcp.json` exposes the MCP server to compatible clients.
 
 The native scene format is pretty-printed JSON with a format/version header. It is
@@ -75,9 +75,9 @@ save/load round-trips can be compared deterministically.
 
 The fixed workspace is laid out like a classic Mac modeller: a menu bar and
 original vector-icon toolbar, a `3D view | UVs | Nodes` switcher above the
-viewport, a Properties column over an `Objects | Takes | Layers | Console`
-browser, a material-sphere shelf, a full-width timeline and a separate Render
-Manager window.
+viewport, a Properties column over an `Objects | Morphs | Takes | Layers |
+Console` browser, a material-sphere shelf, a full-width timeline and a separate
+Render Manager window.
 
 - **3D Viewport** — wgpu shaded/wireframe display with a blue-grey gradient,
   light floor grid, white selected wireframe, light and camera helpers,
@@ -107,7 +107,9 @@ Manager window.
   any selected mesh lacks the required component selection. Mixed selections
   containing lights, cameras or other non-mesh objects are refused.
 - **Object Browser** — hierarchical scene tree with type icons, visibility,
-  render and lock toggles, modifier rows, and a layer manager.
+  render and lock toggles, modifier rows, and a layer manager. Its **Morphs**
+  tab lists every mesh's morph targets under the owning object with weight and
+  On/Off state; clicking a row selects that object without copying the data.
 - **Properties / Tags** — icon tabs for object, material and render settings;
   object, camera, light, spline and primitive parameters; modifier stack; tags;
   skin binding and weight painting; mesh-editing tools; spline control points.
@@ -126,15 +128,41 @@ Manager window.
   closed or smoothly curved surface is cut into non-overlapping islands, and
   relaxation runs per chart so it never averages the two sides of a seam onto
   one UV point.
-  Selecting a UV point and pressing **Toggle Pinned UV** (UV panel toolbar or
-  `Selection -> Toggle Pinned UV`) pins it yellow; unwrap, relax and normalize
-  keep pinned points exactly where they are while everything else re-solves, and
-  pins are saved with the document. Direct UV-point dragging edits the primary
-  editable mesh and needs an existing UV set.
+  The UV view selects several points (shift/command-click adds or removes one;
+  **Select All**, **Select None** and **Island** cover the rest) and authors
+  seams itself: select two adjacent UV points on a mesh edge and press **Toggle
+  Seam**, or use **All Seams**, **Seam Loop** and **Clear Seams** (also under
+  `Tools -> UV Editing`). Each of those seam edits is one undo step.
+  **Toggle Pinned UV** pins every selected point yellow; unwrap, relax and
+  normalize keep pinned points exactly where they are while everything else
+  re-solves, and pins are saved with the document. Direct UV-point dragging
+  moves every selected point on the primary editable mesh.
+  Chart controls move, rotate and scale the charts touched by the selection.
+  **Pack Charts** shelf-packs the selection (or every chart when nothing is
+  selected) with a padding field, optional 90° chart rotation and bottom-left,
+  top-left or centred alignment; a chart that contains pinned points is left
+  exactly as authored and the status line counts it. The slot operations
+  **Weld**, **Split**, **Align U/V**, **Distribute U/V**, **Flip U/V**, **Rotate
+  90°** and the numeric U/V entry each edit only UV coordinates or the shared
+  UV-slot topology, never geometry, and each is one undo step.
+  A **UV0/UV1/…** selector switches the active set; **Add UV Set** duplicates
+  the current layout for a lightmap or secondary texture and **Remove UV Set**
+  drops a non-zero set. Projections author the active set; Unwrap, Relax and
+  Normalize stay UV0 authoring tools and refuse on another set. Every set shares
+  the same slot indices, so weld and split apply to all sets at once. An **Image
+  Texture** node has its own **UV set** field, and the CPU renderer interpolates
+  every set at the hit, so a texture or lightmap can sample UV0 or any authored
+  extra set. The
+  **Checker** overlay draws a denser UV checker and **Distortion** tints faces
+  by their UV-to-surface area stretch; the footer reports mean/max distortion
+  and how many faces exceed 2×. Both overlays are view state and never dirty
+  the document.
 - **Timeline / F-Curves** — transport, frame ruler, key diamonds, orange
-  playhead, scrubbing, key insertion and an expandable curve editor. Click a
-  key to select it, drag it to a new frame, right-click it or use Delete Key to
-  remove it. Selected keys can be set per key to Constant, Linear, Smooth or
+  playhead, scrubbing, key insertion and an expandable curve editor. The
+  timeline's **Range** menu edits playback start and end frames plus loop mode;
+  the F-curve header exposes the same controls. Bounds stay finite and ordered
+  (`0..=end`) and never dirty the document or history. Click a key to select it,
+  drag it to a new frame, right-click it or use Delete Key to remove it. Selected keys can be set per key to Constant, Linear, Smooth or
   Spline from the F-curve toolbar or the **Animation -> Tangent -> Type** menu;
   the same menu's Left/Right Tangent entries set one tangent side. Selected
   Spline keys expose draggable Bezier tangent handles for scalar and
@@ -147,8 +175,8 @@ Manager window.
   their per-side tangent types choose flat, secant, or Catmull-Rom controls,
   but they have no scalar handles to drag.
   Selected keys can be retimed by a factor with **Scale Keys**, around the
-  earliest selected key; **Retime Take** in the Takes tab retimes every key in
-  the selected per-object take around 0s. Times are not frame-snapped, and a
+  earliest selected key; **Retime** in the Takes tab retimes the selected
+  object's active-take clip around 0s. Times are not frame-snapped, and a
   collision within 0.001s or an out-of-range result rejects the whole edit.
   Scalar, tag/material and morph-weight keys move with quaternion rotation keys;
   hand-authored tangent slopes are rescaled by their incident segment duration
@@ -158,13 +186,27 @@ Manager window.
   Constant keys hold, Linear keys use shortest-path slerp, and Smooth/Spline
   keys normalise a component-wise cubic, so sign-opposed quaternions cannot
   flip or pop. One channel registry declares every animatable property, its scope
-  (object, tag or material), applicability and component count; recording and
-  the curve editor both resolve channels through it. The curve editor's target
+  (object, tag or material), applicability and component count; keys address a
+  target, a registry channel and one component, and recording and the curve
+  editor both resolve channels through that address. The curve editor's target
   selector switches between the primary object, each Copy Location tag and the
-  selected material. Rows are generated from the registry for that scope,
-  including channels that have no keys yet; select a row and use `Key Channel`
-  to record it. A mesh with Morph targets also gets one **Morph Weight** row per
+  selected material. Rows are grouped under their target object, tag or
+  material and generated from the registry, including channels that have no
+  keys yet; other animated targets appear as further groups with their keyed
+  channels, and clicking one of their rows focuses it. Select a row and use
+  `Key Channel` to record it. A **Filter** selector beside the target switches the list, the
+  drawn curves and key picking between all registry channels, channels that own
+  a selected key, and transforms only. A mesh with Morph targets also gets one
+  **Morph Weight** row per
   named target, backed by the same curve/key machinery and clamped to the target
+  range. The Takes tab is the document take manager: it lists every named take
+  with its fps, creates/renames/duplicates/deletes/activates takes, and applies
+  a per-take fps. The active take owns the node, tag and material clips that the
+  rest of the editor sees, and switching takes restores that clip set. Each
+  take action is one undo step, and changing the active take's fps retimes the
+  playback start/end range from the document's frame bounds; finite fps clamps
+  to 1–240 and non-finite values are refused. Old `.lcscene` files without a
+  take list load into one default take.
   weight range during evaluation. Tag keys are stored in a per-tag clip and
   material keys in the material clip. Shift/command-click or drag a marquee over the curve view to
   select multiple scalar or quaternion keys; dragging one selected key moves the
@@ -228,25 +270,73 @@ The panel provides:
   local or average-normal axes.
 - Region or individual extrude, inset, bevel, ring cut, weld selected points and
   bridge two selected edge loops.
-- Toggle edge creases on the selected edges in Edge mode; creased edges draw
-  blue and stay sharp through Catmull-Clark and Stam-Loop subdivision.
+- Toggle edge creases on the selected edges in Edge mode, or set a fractional
+  **Weight** from 0 to 1 with **Set Crease Weight**. Creased edges draw blue in
+  every selection mode, and subdivision blends the smooth and sharp rules by
+  that weight, so 0.5 is exactly halfway between an uncreased and a fully
+  creased edge.
 - Toggle UV seams on the selected edges in Edge mode (also `Selection -> Toggle
   Seam`); seam edges draw green in the 3D view and over the UV wireframe, and
   automatic unwrap cuts charts along them.
 - Fill an open hole from one selected border point in point, edge or polygon
-  mode (**Fill Hole**, also `Tools -> Fill Hole`). The new polygon winds with
-  its neighbours, creases, seams and UV pins are kept, and the panel reports how
-  many open holes the selection touches.
-- Pin UV points from the UV view (**Toggle Pinned UV**); pinned points draw
-  yellow and unwrap, relax and normalize leave them where they are.
+  mode (**Fill Hole**, also `Tools -> Fill Hole`), or turn on the **Click tool**
+  (also `Tools -> Fill Hole Tool`) and click any point on an open border; the
+  tool stays active for further holes. The new polygon winds with its
+  neighbours, creases, seams and UV pins are kept, and the panel reports how
+  many open holes the selection touches. A hole whose border encloses a separate
+  mesh island is refused with a clear status instead of covering the island;
+  fill or remove the island first.
+- Pin UV points from the UV view (**Toggle Pinned UV**); every selected point
+  is pinned or unpinned as one undo step, pinned points draw yellow, and
+  unwrap, relax and normalize leave them where they are.
+- Select two adjacent UV points in the UV view and use **Toggle Seam** to mark
+  that mesh edge as a seam; **All Seams**, **Seam Loop**, **Clear Seams** and
+  the UV chart/slot tools live in the UV panel and `Tools -> UV Editing`.
+- Add a second UV set from the UV panel for lightmaps or secondary textures;
+  the set selector switches which coordinates the view edits, projections and
+  new UV operations target, and all sets survive native save/load and glTF
+  export as `TEXCOORD_0`, `TEXCOORD_1`, …. OBJ writes UV0 only and records the
+  skipped sets in an export comment.
 - Split the selected polygons into a new object (**Split**, also `Tools ->
   Split`). The copy keeps the source's transform, tags, material slots, UVs,
   creases, seams and pins; the source mesh is unchanged and one undo removes the
   copy.
+- Clone selected polygons or points (**Clone**, also `Tools -> Clone`) in point
+  or polygon mode. The **Clone** section sets Copies, Holes, Direction, Scale,
+  Rotation, position/scale/rotation variation and Keep ratio; copies are
+  transformed around the selection centroid with the last copy at the end of
+  the Direction vector, and an empty selection clones every point or polygon.
+  Variation uses a fixed deterministic stream, so repeated Apply gives the same
+  result; cloned faces keep UVs, material slots and interior creases/seams, and
+  one undo restores the exact prior mesh.
+- Subdivide only the selected polygons (**Subdivide**, also `Tools -> Subdivide`)
+  with a level count and Catmull-Clark, Stam-Loop or Linear scheme. The patch
+  boundary is pinned to the original edges, bordering unselected faces receive
+  the new collinear boundary points, and unselected vertices keep their exact
+  positions, so the result is watertight with no crack at the selection border.
+  One undo restores the exact prior topology.
 - Convert the selected polygons to triangles (**Triangulate**, also `Tools ->
-  Triangulate`) by fanning each n-gon from its first corner; unselected polygons
-  stay n-gons, corner UVs and material slots are reused, creases, seams and UV
-  pins survive, and one undo step reverts the split.
+  Triangulate`). The **Split** selector chooses **Shortest Diagonal** (ear-clip
+  along the shortest valid diagonal, the default) or **Quad Pair** (split a quad
+  along its shorter diagonal); unselected polygons stay n-gons, corner UVs and
+  material slots are reused, creases, seams and UV pins survive, and one undo
+  step reverts the split.
+- Cut one polygon between two boundary picks (**Scalpel**, also `Tools ->
+  Scalpel`) in point or edge mode. Two selected edges of one polygon cut at
+  their midpoints, and two selected points of one polygon cut between them. The
+  cut replaces that polygon with the two faces on either side, inserts a real
+  point for an edge pick, splits the picked edge for the neighbouring face as
+  well so the mesh stays watertight, carries a seam or crease weight onto both
+  halves of the split edge, and keeps corner UVs and the material slot. A cut
+  that would leave a polygon with fewer than three corners is refused, and one
+  undo step restores the prior mesh. The **Click tool** checkbox next to
+  **Scalpel** (also `Tools -> Scalpel Tool`) instead cuts from viewport clicks:
+  a click on an edge or point starts a cut, a second click on an edge or point
+  of a polygon that holds the start splits it, and the second click's point
+  becomes the next cut's start, so cuts chain until **Esc** resets the pending
+  cut. The face under the pointer decides which polygon splits when the two
+  picks share an edge, a pick that shares no polygon with the start is refused
+  without losing the start, and each completed cut is one undo step.
 - Reverse the winding of the selected polygons (**Flip Normal**, also `Tools ->
   Flip Normal`) so their normals, shading and exported faces point the other
   way. Only selected faces change, the selection survives so the command flips
@@ -294,16 +384,26 @@ The panel provides:
   closed/open curves and a viewport preview with control-point markers.
 - The modifier stack also includes **Twist**, **Shear**, **Bulge** and
   **Spherify** deformers with per-modifier axis, angle, distance, radius and
-  strength controls. The **Subdivision Surface** modifier offers Catmull-Clark,
+  strength controls, plus **Displacement** (normal offset from a deterministic
+  noise field: amplitude, frequency, seed), **Formula** (one expression per axis
+  in `x`, `y` and `z` using `+ - * / ^`, parentheses, `pi`/`e` and a fixed
+  function set), **Magnet** (signed strength and radius falloff around the
+  object centre), **Laplacian Smooth** (iterations, strength and a Keep border
+  switch), **Polygon Reduction** (collapse the shortest triangle edge until the
+  face count reaches a ratio) and **Wrap** (rotate the object around another
+  mesh's centre line by an angle spread along an axis). The **Subdivision
+  Surface** modifier offers Catmull-Clark,
   Stam-Loop and Linear schemes, defaults to two iterations, and honours edge
-  creases under the two smooth schemes; Linear subdivision increases density
-  without smoothing the surface, keeps the mesh watertight and ignores crease
-  sharpness.
+  creases under the two smooth schemes, including fractional crease weights;
+  Linear subdivision increases density without smoothing the surface, keeps the
+  mesh watertight and ignores crease sharpness.
 - The Boolean modifier is created with **Add Boolean** in the modifier stack and
-  chooses a mesh as Union, Subtract or Intersect operand. Add Modifier enables
-  only entries whose geometry input exists: mesh modifiers on meshes, Sweep on
-  splines, and Lathe everywhere; Boolean entries additionally require a valid
-  mesh operand. Adding and removing a modifier each commit one edit.
+  chooses a mesh as Union, Subtract or Intersect operand; **Add Wrap** picks the
+  mesh it wraps around. Add Modifier enables only entries whose geometry input
+  exists: mesh modifiers on meshes, Sweep on splines, and Lathe everywhere;
+  Boolean and Wrap additionally require a valid mesh target, and a Formula with
+  a malformed expression is disabled until it parses. Adding and removing a
+  modifier each commit one edit.
 - Mesh nodes can be bound from the **Skinning** section to a chosen set of Joint
   objects using the All/None controls and per-joint checklist. Binding creates
   inverse-bind matrices for just those joints. With **Automatic proximity
@@ -328,26 +428,43 @@ The panel provides:
   axis locks that axis. **Bake IK take** keys every solved frame from playback
   start to end into the existing rotation F-curves in one undo step (capped at
   10,000 frames per bake), and skinned meshes deform through the solved joints
-  during playback. Spline IK and the broader constraint system remain open.
+  during playback. Set **Spline** to a Spline object and the chain follows
+  that guide curve instead of the point target: each bone is aimed along the
+  curve, bones keep their length, a guide shorter than the chain clamps to its
+  end, joint limits still clamp, and a non-spline Spline target falls back to
+  the point target. **Stiffness** blends each solved joint back toward its rest
+  rotation: 1 is a full solve and 0.5 lands halfway, for point, pole and spline
+  chains alike. The Tags section also offers the clean-room **IK Point** (pull
+  the origin toward a target by weight), **IK Angle** (keep the local +X axis
+  inside a cone around the direction to a target), **Orient** (blend toward the
+  target's world rotation) and **Parent** (follow the target's position and
+  rotation) tags, each with Target and Weight/Cone rows. The broader constraint
+  system remains open.
 - A bound editable mesh with no modifier stack can enter **Weight Paint** mode
   from the viewport brush icon or the Skinning section. Choose a joint and paint
   Add, Subtract, Replace or Smooth strokes with radius, strength and
   constant/linear/smooth falloff. Vertices show a heat map for the active joint,
   weights are auto-normalized and pruned to four influences after every stamp,
-  and one undo step covers a whole stroke. Viewport joint picking and
-  heat-diffusion weighting remain open.
+  and one undo step covers a whole stroke. The active joint can also be chosen
+  by clicking its viewport handle; unbound joints are not pickable, and an empty
+  viewport click leaves the chosen joint in place. Heat-diffusion weighting
+  remains open.
 - Editable meshes have a **Morph Targets** inspector. Record the rest base, move
   vertices, capture the pose as a named target, then blend targets with 0–1
-  weights or restore the base; each target's weight can also be recorded and
-  edited as a Morph Weight F-curve row. Targets are additive and one **Edit
-  Morph** undo step covers capture, rename, weight drags and removal; loading
-  validates topology, finite deltas and weights.
+  weights, update the rest base in place (targets keep their posed shapes) or
+  restore the base; each target's weight can also be recorded and
+  edited as a Morph Weight F-curve row. The browser's **Morphs** tab lists the
+  same targets scene-wide with weight and On/Off state and selects the owning
+  object. Targets are additive and one **Edit Morph** undo step covers capture,
+  rename, weight drags and removal; loading validates topology, finite deltas
+  and weights.
 
 ### Viewport controls
 
 | Input | Action |
 | --- | --- |
 | Left mouse | select an object or mesh component; Shift/Cmd-click toggles multi-selection; drag empty space to box-select; drag the gizmo to transform the selection |
+| Left mouse on a skin joint handle | make that bound joint the active joint for the Skinning panel, heat map and weight brush |
 | Left mouse in Weight Paint | paint the active joint; drag for a continuous stroke |
 | Middle mouse drag | orbit |
 | Shift + middle drag | pan |
@@ -421,11 +538,28 @@ The server implements both MCP protocol generations: the `2025-06-18`
 `initialize` handshake and the handshake-free `2026-07-28` revision, including
 `server/discover`. Exposed tools:
 
-- **Inspect** — `get_scene`, `list_objects`, `get_object`, `list_materials`.
+- **Inspect** — `get_scene`, `list_objects`, `get_object`, `get_animation`,
+  `get_mesh`, `get_material`, `list_materials`.
 - **Edit** — `create_primitive` (all eight primitives with parameters and local
   transform), `set_transform`, `rename_object`, `delete_object`,
   `set_object_properties` (visibility, render, lock and material assignment),
-  `undo` and `redo`.
+  `add_modifier`, `update_modifier`, `remove_modifier`, `move_modifier`,
+  `create_material`, `update_material`, `set_animation_key`,
+  `remove_animation_key`, `create_take`, `activate_take`, `update_take`,
+  `delete_take`, `edit_mesh`, `edit_uv`, `undo` and `redo`. Modifier tools
+  accept the same snake_case objects `get_object` reports, check the target and
+  parameters before editing, and record one undo entry per call. Material tools
+  accept the complete shader graph `get_material` returns (nodes, links and
+  `next_id`), validate node ids, links and finite parameters, and also record
+  one undo entry per call. Animation tools key object channels in the active
+  take, use the same translation/rotation/scale/FOV/light/morph vocabulary
+  evaluation uses, and edit takes with one undo entry per call. Mesh tools take
+  an explicit per-call point, face, UV-slot or chart selection; `edit_mesh`
+  transforms components and runs direct face/point operations, while `edit_uv`
+  projects, unwraps, relaxes, normalises, packs and transforms charts, edits UV
+  sets, coordinates, seams and pins, and welds/splits/aligns/distributes/flips/
+  rotates slots. A primitive is converted to an editable mesh in the same undo
+  entry, and validation happens before any command.
 - **Files and output** — `save_scene`, `open_scene`, `new_scene`, `export_scene`
   (OBJ, STL, glTF/GLB or native) and `render_image` (PNG or EXR with optional
   size, sample, seed and time overrides).
@@ -434,9 +568,36 @@ The resources `leopardcraft://scene` and `leopardcraft://scene/summary` expose
 the full document JSON and a compact summary. Object arguments accept a numeric
 id or an exact name. Edits go through the editor's undo commands, so `undo`
 reverses one tool call at a time, and the server tracks the document's path and
-dirty state across saves. The server is a separate headless process: it does not
-attach to a running editor window, and the current tool set does not author
-modifiers, shader graphs or mesh components.
+dirty state across saves. Mesh edits use explicit component indices supplied
+with each request instead of a persistent editor selection, so the same payload
+works headlessly. The server is a separate headless process: it does not attach
+to a running editor window.
+
+### HTTP transport, subscriptions and prompts
+
+stdio is the default transport. `leopardcraft --mcp-http [--addr <host:port>]`
+serves the same protocol over the MCP Streamable HTTP transport instead: `POST
+/mcp` carries one JSON-RPC message per request (a notification is answered with
+`202 Accepted` and no body) and `GET /mcp` with `Accept: text/event-stream`
+opens the server's Server-Sent Events stream. The `initialize` response also
+carries an `Mcp-Session-Id`, every later request has to repeat it, a missing
+header is answered with `400`, an unknown or terminated id with `404` (so the
+client initializes again), and `DELETE /mcp` ends a session. Reconnecting an
+event stream with a live id keeps receiving the document's resource updates,
+because subscriptions belong to the server rather than the connection. It
+prints the endpoint URL to stdout when it starts and binds only loopback
+addresses (`127.0.0.1:8765` by default), so enabling it never exposes the
+project to the network; a non-loopback address is refused at startup.
+
+Clients can call `resources/subscribe` and `resources/unsubscribe` for
+`leopardcraft://scene` and `leopardcraft://scene/summary`. Every tool call that
+changes the document then produces `notifications/resources/updated` for the
+subscribed URIs, written to the event stream on the HTTP transport or as an
+extra newline-delimited protocol line on stdio. Three prompt templates are
+available through `prompts/list` and `prompts/get`: `scene_overview`,
+`object_report` (argument `object`, an id or exact name) and `render_check`.
+Each prompt is filled from the live document, so its text describes the scene as
+it stands when the prompt is requested.
 
 `app/tests/mcp_smoke.rs` launches the real binary from a temporary directory,
 completes `initialize` and `tools/list`, runs representative tools, compares the
@@ -455,9 +616,11 @@ composites with overlays. The offline renderer is a CPU path tracer with:
 
 - perspective, orthographic and panoramic camera ray generation;
 - environment/HDRI backgrounds and directional/sun, point, area and spot
-  lights (spot cones with an inner/outer angle ramp and a falloff radius);
+  lights (point and spot radii sample as spherical soft-shadow lights, and spot
+  cones have an inner/outer angle ramp);
 - next-event estimation, GGX specular, diffuse and dielectric transmission;
-- reflections, refraction, shadows, depth of field and progressive accumulation;
+- reflections, refraction, soft shadows, depth of field and progressive
+  accumulation;
 - ACES tone mapping to PNG and linear half-float scanline EXR output.
 
 ## Interchange
@@ -471,19 +634,26 @@ composites with overlays. The offline renderer is a CPU path tracer with:
 
 glTF/GLB export writes bind-pose skinned meshes with `JOINTS_0`/`WEIGHTS_0` and
 inverse-bind matrices, named morph targets with position/normal deltas, and a
-merged `Take` animation for node translation/rotation/scale and morph weights.
+merged animation named after the active document take, sampled on that take's
+fps, for node translation/rotation/scale and morph weights; the take name and
+fps are also written to the animation and root `extras`.
 It samples all channels on one seconds-based grid and preserves uniform
 CONSTANT/LINEAR channels; all-Smooth/Spline scalar channels become sampled
 CUBICSPLINE, while mixed channels and smooth rotations are sampled LINEAR. glTF
 import reads meshes, materials, transforms, a mesh's morph base, target names,
 offsets and default weights, cameras (perspective and orthographic, with field
-of view and clip planes) and every `KHR_lights_punctual` light type (colour,
+of view and clip planes), every `KHR_lights_punctual` light type (colour,
 intensity, spot cone angles converted from radians to degrees, and `range` as
-the light's falloff radius), but not skins or animation channels; those, and a
-camera `aspectRatio` hint, are reported as skipped in the status line after
-Open/Import and as `import_report` in the MCP `open_scene` result, so a lossy
-import is never presented as complete. Tags, constraints and material
-animations are not exported.
+the light's falloff radius), `skins` (joint nodes, inverse-bind matrices and
+four-influence `JOINTS_0`/`WEIGHTS_0`) and `animations`. Animation channels for
+translation, rotation, scale and morph weights keep STEP, LINEAR and
+CUBICSPLINE timing (cubic tangents become hand-authored Spline slopes; cubic
+rotation becomes Smooth), the first animation fills the active take and further
+animations become additional takes, and each take's frame range comes from the
+clip duration at its fps. A camera `aspectRatio` hint is still rewritten and
+reported; if a file carries one, the editor shows the report **before** the
+scene is replaced and the Open/Import buttons wait for confirmation. Tags,
+constraints and material animations are not exported.
 USDZ and Collada are not implemented. The native
 scene format remains the only format that preserves the complete document:
 hierarchy, tags, modifiers, animation, skinning, morph targets and shader
@@ -508,14 +678,14 @@ production modeller. The researched Cheetah3D feature matrix is in
 - The viewport shading is a lightweight material preview, not the offline path
   tracer; the Render tab provides the final image.
 - glTF export covers meshes, transforms, core PBR values, bind-pose skins,
-  named morph targets and object transform/morph-weight animation. Advanced
-  extensions, material animation, tags/constraints and glTF import of skin and
-  animation data remain unsupported.
+  named morph targets and object transform/morph-weight animation; import now
+  reads skins and animation channels too. Advanced extensions, material
+  animation and tags/constraints remain unsupported.
 - There is no external file-picker dependency; file paths are entered in the
   in-app dialog.
-- The MCP server is a separate headless stdio process. It edits its own in-memory
-  document and writes files, but does not attach to a running editor or expose
-  modifier-stack, material-graph, animation or component-level authoring tools.
+- The MCP server is a separate headless process over stdio, or over the opt-in
+  loopback Streamable HTTP transport. It edits its own in-memory document and
+  writes files, but does not attach to a running editor window.
 - GPU compute baking is not implemented; offline rendering is CPU-side.
 - The 0.2 tree is native-first; a WASM/WebGPU application target is not wired up
   yet.
@@ -526,16 +696,22 @@ production modeller. The researched Cheetah3D feature matrix is in
   weight-paint brush (add/subtract/replace/smooth), active-joint heat map and
   per-stroke undo. Existing painted weights survive a rebind while their joints
   remain selected. IK chains drive the same joints and deformed meshes, but
-  viewport joint picking, heat-diffusion weighting, spline IK, Cheetah3D-style
-  IK Constraint tags and the broader constraint system are not implemented.
+  heat-diffusion weighting and the broader constraint system are not
+  implemented; the IK Point/Angle/Orient/Parent tags and the chain stiffness are
+  clean-room approximations rather than Cheetah3D's IK Constraint tag, whose
+  documented stiffness of one means the joint does not bend; Spline IK follows a
+  guide curve as a chain of chords and has no twist control.
 - glTF skins are skipped when a modifier stack changes the bind-mesh topology,
   and morph targets are skipped whenever a modifier stack must be baked or the
   morph base no longer matches the exported rest mesh.
 - Morph targets and their weight curves are authored, evaluated, exposed as
-  native F-curve rows and exported to glTF. Cheetah3D's manual does not document
-  a numeric morph-weight range or morph-specific interpolation, so the 0–1
-  clamp and the shared Constant/Linear/Smooth/Spline key interpolation are
-  clean-room choices rather than confirmed parity.
+  native F-curve rows and exported to glTF. **Update Base** re-records the rest
+  shape while keeping each target's absolute posed vertices; the manual does
+  not define how targets follow a re-recorded base, so the rebase is a
+  clean-room choice. The manual also does not document a numeric morph-weight
+  range or morph-specific interpolation, so the 0–1 clamp and the shared
+  Constant/Linear/Smooth/Spline key interpolation are clean-room choices rather
+  than confirmed parity.
 - Older documents that animate rotation as three Euler curves still load and
   evaluate; new recordings write the quaternion rotation channel. Those legacy
   curves are read as degrees, matching the inspector and the built-in scene.
@@ -544,8 +720,20 @@ production modeller. The researched Cheetah3D feature matrix is in
   the loader cannot tell the two conventions apart.
 - The F-curve editor exposes registry channels for the primary object, a Copy
   Location tag or the selected material. Tag targeting is only offered for tags
-  that declare an animation channel. Key filtering remains open; rotation keys
+  that declare an animation channel. The **Filter** selector only changes what
+  the editor lists, draws and picks; it never edits the document. Rotation keys
   do not expose scalar tangent handles.
+- Additional UV sets are authorable, editable, saved and exported as glTF
+  `TEXCOORD_1`…, and an Image Texture node can sample any of them; the CPU
+  renderer interpolates every set at the hit. Lightmaps are therefore an extra
+  UV set plus a texture node bound to it, not a dedicated lightmap slot.
+- Animation keys address a target, registry channel and component. Files saved
+  before this model used flat property names; the loader maps them to
+  owner-relative addresses and keeps legacy Euler rotation curves in a
+  compatibility field that still samples in degrees. glTF export writes the
+  active take as node translation, rotation, scale and morph-weight channels;
+  an addressed channel with no glTF destination is skipped and named in an
+  export report instead of being written onto another node.
 
 ## License
 

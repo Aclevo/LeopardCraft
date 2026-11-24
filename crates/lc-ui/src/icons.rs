@@ -30,6 +30,7 @@ pub enum Icon {
     Joint,
     Camera,
     PointLight,
+    SpotLight,
     DirectionalLight,
     AreaLight,
     Subdivide,
@@ -204,6 +205,7 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, tint: Color32) {
         Icon::Joint => joint_icon(painter, rect),
         Icon::Camera => camera_icon(painter, rect),
         Icon::PointLight => light_icon(painter, rect, false),
+        Icon::SpotLight => spot_light_icon(painter, rect),
         Icon::DirectionalLight => directional_light_icon(painter, rect),
         Icon::AreaLight => light_icon(painter, rect, true),
         Icon::Subdivide => subdivide_icon(painter, rect, tint),
@@ -847,6 +849,22 @@ fn light_icon(p: &Painter, r: Rect, area: bool) {
             Stroke::new(1.2, Color32::from_rgb(188, 126, 36)),
         );
     }
+}
+
+fn spot_light_icon(p: &Painter, r: Rect) {
+    let c = r.center() + Vec2::new(0.0, -r.height() * 0.1);
+    let radius = r.width() * 0.17;
+    p.circle_filled(c, radius, Color32::from_rgb(244, 198, 82));
+    p.circle_stroke(c, radius, Stroke::new(1.0, Color32::from_rgb(139, 92, 22)));
+    let cone_top = c + Vec2::new(0.0, radius);
+    let cone_bottom = r.bottom() - 3.0;
+    let spread = r.width() * 0.32;
+    let left = Pos2::new(r.center().x - spread, cone_bottom);
+    let right = Pos2::new(r.center().x + spread, cone_bottom);
+    let color = Color32::from_rgb(188, 126, 36);
+    p.line_segment([cone_top, left], Stroke::new(1.2, color));
+    p.line_segment([cone_top, right], Stroke::new(1.2, color));
+    p.line_segment([left, right], Stroke::new(1.0, color));
 }
 
 fn subdivide_icon(p: &Painter, r: Rect, tint: Color32) {

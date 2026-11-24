@@ -192,55 +192,213 @@ impl LeopardApp {
             ui.label("Select an object to edit UVs.");
             return;
         }
+        let set_count = self
+            .selected_editable_mesh()
+            .map(|(_, mesh)| mesh.uv_set_count())
+            .unwrap_or(0);
+        let active_set = self
+            .selected_editable_mesh()
+            .map(|(_, mesh)| self.uv_active_set(&mesh))
+            .unwrap_or(0);
+        ui.horizontal_wrapped(|ui| {
+            if set_count > 0 {
+                egui::ComboBox::from_id_salt("uv-set-selector")
+                    .selected_text(format!("UV{active_set}"))
+                    .show_ui(ui, |ui| {
+                        for set in 0..set_count {
+                            if ui
+                                .selectable_label(set == active_set, format!("UV{set}"))
+                                .clicked()
+                            {
+                                self.uv_editor.set = set;
+                            }
+                        }
+                    });
+            }
+            let can_add = set_count > 0;
+            if ui
+                .add_enabled(can_add, egui::Button::new("Add UV Set"))
+                .clicked()
+            {
+                self.add_uv_set();
+            }
+            if ui
+                .add_enabled(active_set > 0, egui::Button::new("Remove UV Set"))
+                .clicked()
+            {
+                self.remove_uv_set();
+            }
+            ui.checkbox(&mut self.uv_editor.checker, "Checker");
+            ui.checkbox(&mut self.uv_editor.distortion, "Distortion");
+        });
+
         ui.horizontal_wrapped(|ui| {
             let uv_ready = self.selection_uv_ready();
-            if ui
-                .add_enabled(uv_ready, egui::Button::new("Planar"))
-                .clicked()
-            {
-                self.apply_uv_op(UvOp::Planar);
-            }
-            if ui.add_enabled(uv_ready, egui::Button::new("Box")).clicked() {
-                self.apply_uv_op(UvOp::Box);
-            }
-            if ui
-                .add_enabled(uv_ready, egui::Button::new("Cylindrical"))
-                .clicked()
-            {
-                self.apply_uv_op(UvOp::Cylindrical);
-            }
-            if ui
-                .add_enabled(uv_ready, egui::Button::new("Spherical"))
-                .clicked()
-            {
-                self.apply_uv_op(UvOp::Spherical);
-            }
-            if ui
-                .add_enabled(uv_ready, egui::Button::new("Auto Unwrap"))
-                .clicked()
-            {
-                self.apply_uv_op(UvOp::Unwrap);
-            }
-            if ui
-                .add_enabled(uv_ready, egui::Button::new("Relax"))
-                .clicked()
-            {
-                self.apply_uv_op(UvOp::Relax);
-            }
-            if ui
-                .add_enabled(uv_ready, egui::Button::new("Normalize"))
-                .clicked()
-            {
-                self.apply_uv_op(UvOp::Normalize);
+            for (label, op) in [
+                ("Planar", UvOp::Planar),
+                ("Box", UvOp::Box),
+                ("Cylindrical", UvOp::Cylindrical),
+                ("Spherical", UvOp::Spherical),
+                ("Auto Unwrap", UvOp::Unwrap),
+                ("Relax", UvOp::Relax),
+                ("Normalize", UvOp::Normalize),
+            ] {
+                if ui.add_enabled(uv_ready, egui::Button::new(label)).clicked() {
+                    self.apply_uv_op(op);
+                }
             }
             let pin_ready = self.uv_pin_ready();
-            let pin = ui.add_enabled(pin_ready, egui::Button::new("Toggle Pinned UV"));
-            record_menu_item_state("panel:Toggle Pinned UV", &pin, pin_ready);
-            if pin.clicked() {
+            if ui
+                .add_enabled(pin_ready, egui::Button::new("Toggle Pinned UV"))
+                .clicked()
+            {
                 self.perform_mesh_action(MeshAction::TogglePinnedUv);
             }
         });
-        let Some((id, original_mesh)) = self.selected_editable_mesh() else {
+
+        ui.horizontal_wrapped(|ui| {
+            let seam_ready = self.uv_pin_ready();
+            if ui
+                .add_enabled(seam_ready, egui::Button::new("Toggle Seam"))
+                .clicked()
+            {
+                self.toggle_selected_uv_seam();
+            }
+            if ui
+                .add_enabled(self.uv_edit_ready(), egui::Button::new("All Seams"))
+                .clicked()
+            {
+                self.select_all_uv_seams();
+            }
+            if ui
+                .add_enabled(self.uv_edit_ready(), egui::Button::new("Seam Loop"))
+                .clicked()
+            {
+                self.select_uv_seam_loop();
+            }
+            if ui
+                .add_enabled(self.uv_edit_ready(), egui::Button::new("Clear Seams"))
+                .clicked()
+            {
+                self.clear_uv_seams();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(self.uv_edit_ready(), egui::Button::new("Select All"))
+                .clicked()
+            {
+                self.select_all_uv_points();
+            }
+            if ui
+                .add_enabled(self.uv_edit_ready(), egui::Button::new("Select None"))
+                .clicked()
+            {
+                self.clear_uv_selection();
+            }
+            if ui
+                .add_enabled(self.uv_pin_ready(), egui::Button::new("Island"))
+                .clicked()
+            {
+                self.select_uv_island();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Chart");
+            ui.add(
+                egui::DragValue::new(&mut self.uv_editor.chart_move.x)
+                    .speed(0.005)
+                    .prefix("U "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.uv_editor.chart_move.y)
+                    .speed(0.005)
+                    .prefix("V "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.uv_editor.chart_rotate)
+                    .speed(1.0)
+                    .suffix("°"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.uv_editor.chart_scale)
+                    .speed(0.01)
+                    .range(0.05..=20.0),
+            );
+            if ui
+                .add_enabled(self.uv_pin_ready(), egui::Button::new("Transform"))
+                .clicked()
+            {
+                self.transform_selected_uv_charts();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Pack");
+            ui.add(
+                egui::DragValue::new(&mut self.uv_editor.pack_padding)
+                    .speed(0.002)
+                    .range(0.0..=0.2)
+                    .prefix("pad "),
+            );
+            ui.checkbox(&mut self.uv_editor.pack_rotate, "Rotate");
+            egui::ComboBox::from_id_salt("uv-pack-align")
+                .selected_text(match self.uv_editor.pack_align {
+                    lc_geom::UvPackAlign::BottomLeft => "Bottom left",
+                    lc_geom::UvPackAlign::TopLeft => "Top left",
+                    lc_geom::UvPackAlign::Center => "Center",
+                })
+                .show_ui(ui, |ui| {
+                    for (label, align) in [
+                        ("Bottom left", lc_geom::UvPackAlign::BottomLeft),
+                        ("Top left", lc_geom::UvPackAlign::TopLeft),
+                        ("Center", lc_geom::UvPackAlign::Center),
+                    ] {
+                        ui.selectable_value(&mut self.uv_editor.pack_align, align, label);
+                    }
+                });
+            if ui
+                .add_enabled(self.uv_edit_ready(), egui::Button::new("Pack Charts"))
+                .clicked()
+            {
+                self.pack_selected_uv_charts();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            for (label, op) in [
+                ("Weld", UvSlotOp::Weld),
+                ("Split", UvSlotOp::Split),
+                ("Align U", UvSlotOp::AlignU),
+                ("Align V", UvSlotOp::AlignV),
+                ("Distribute U", UvSlotOp::DistributeU),
+                ("Distribute V", UvSlotOp::DistributeV),
+                ("Flip U", UvSlotOp::FlipU),
+                ("Flip V", UvSlotOp::FlipV),
+                ("Rotate 90°", UvSlotOp::Rotate90),
+            ] {
+                if ui
+                    .add_enabled(self.uv_pin_ready(), egui::Button::new(label))
+                    .clicked()
+                {
+                    self.run_uv_slot_op(op);
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Set UV");
+            ui.add(egui::DragValue::new(&mut self.uv_editor.numeric.x).speed(0.005));
+            ui.add(egui::DragValue::new(&mut self.uv_editor.numeric.y).speed(0.005));
+            if ui
+                .add_enabled(self.uv_pin_ready(), egui::Button::new("Apply UV"))
+                .clicked()
+            {
+                self.run_uv_slot_op(UvSlotOp::Numeric);
+            }
+        });
+
+        let Some((_, original_mesh)) = self.selected_editable_mesh() else {
             ui.label(
                 egui::RichText::new(
                     "UV editing requires an editable mesh. Convert a primitive first.",
@@ -259,7 +417,7 @@ impl LeopardApp {
             }
             return;
         };
-        if !self.uv_point_edit_ready() {
+        if original_mesh.uv_set_count() == 0 {
             ui.label(
                 egui::RichText::new(
                     "No UV points yet. Apply a projection above to create a UV set.",
@@ -269,13 +427,10 @@ impl LeopardApp {
             );
             return;
         }
-        if self
-            .selected_uv
-            .is_some_and(|index| index >= original_mesh.uvs.len())
-        {
-            self.selected_uv = None;
-        }
-        let mut mesh = original_mesh.clone();
+        self.prune_uv_selection(&original_mesh);
+        let mesh = original_mesh.clone();
+        let active_set = self.uv_active_set(&mesh);
+        let values: Vec<V2> = mesh.uv_set(active_set).unwrap_or(&[]).to_vec();
         let side = ui
             .available_height()
             .max(160.0)
@@ -284,11 +439,13 @@ impl LeopardApp {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(248, 248, 248));
-        let cells = 8;
+        let cells = if self.uv_editor.checker { 16 } else { 8 };
         for y in 0..cells {
             for x in 0..cells {
                 let color = if (x + y) % 2 == 0 {
                     Color32::from_rgb(247, 247, 247)
+                } else if self.uv_editor.checker {
+                    Color32::from_rgb(206, 214, 226)
                 } else {
                     Color32::from_rgb(231, 231, 231)
                 };
@@ -309,19 +466,33 @@ impl LeopardApp {
                 rect.max.y - uv.y * rect.height(),
             )
         };
+        let distortion = if self.uv_editor.distortion {
+            lc_geom::uv_face_distortion(&mesh, active_set)
+        } else {
+            Vec::new()
+        };
         for (pi, poly) in mesh.polygons.iter().enumerate() {
             let points: Vec<Pos2> = poly
                 .corners
                 .iter()
-                .map(|c| to_screen(mesh.uv_of(c)))
+                .map(|c| to_screen(mesh.uv_of_set(c, active_set)))
                 .collect();
+            if let Some(stats) = distortion.get(pi) {
+                let t = ((stats.stretch - 1.0) / 3.0).clamp(0.0, 1.0);
+                let color =
+                    Color32::from_rgb((70.0 + 170.0 * t) as u8, (170.0 - 110.0 * t) as u8, 70);
+                painter.add(egui::Shape::convex_polygon(
+                    points.clone(),
+                    color.gamma_multiply(0.55),
+                    egui::Stroke::NONE,
+                ));
+            }
             for i in 0..points.len() {
                 painter.line_segment(
                     [points[i], points[(i + 1) % points.len()]],
                     egui::Stroke::new(1.0, Color32::from_rgb(47, 95, 153)),
                 );
             }
-            let _ = pi;
         }
         // Seam edges are chart borders, so draw them green over the UV wire.
         let point_uv = |point: u32| -> Option<V2> {
@@ -330,7 +501,7 @@ impl LeopardApp {
             for poly in &mesh.polygons {
                 for corner in &poly.corners {
                     if corner.point == point {
-                        sum += mesh.uv_of(corner);
+                        sum += mesh.uv_of_set(corner, active_set);
                         count += 1;
                     }
                 }
@@ -351,9 +522,9 @@ impl LeopardApp {
             egui::Stroke::new(1.0, Color32::from_rgb(160, 160, 160)),
             egui::StrokeKind::Inside,
         );
-        for (i, uv) in mesh.uvs.iter().enumerate() {
+        for (i, uv) in values.iter().enumerate() {
             let p = to_screen(*uv);
-            let chosen = self.selected_uv == Some(i);
+            let chosen = self.uv_editor.selection.contains(&(i as u32));
             let pinned = mesh.is_uv_pinned(i as u32);
             painter.circle_filled(
                 p,
@@ -380,37 +551,60 @@ impl LeopardApp {
         if response.clicked() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 let mut best: Option<(f32, usize)> = None;
-                for (i, uv) in mesh.uvs.iter().enumerate() {
+                for (i, uv) in values.iter().enumerate() {
                     let p = to_screen(*uv);
                     let d = (p - pointer).length();
                     if d < 12.0 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
                         best = Some((d, i));
                     }
                 }
-                self.selected_uv = best.map(|(_, i)| i);
-            }
-        }
-        if response.dragged_by(egui::PointerButton::Primary) {
-            if let Some(index) = self.selected_uv {
-                let delta = ui.input(|i| i.pointer.delta());
-                if let Some(uv) = mesh.uvs.get_mut(index) {
-                    uv.x += delta.x / rect.width().max(1.0);
-                    uv.y -= delta.y / rect.height().max(1.0);
-                    self.set_uv_point(id, index, *uv);
+                let additive = ui.input(|input| input.modifiers.shift || input.modifiers.command);
+                match best {
+                    Some((_, index)) => {
+                        if !additive {
+                            self.uv_editor.selection.clear();
+                        }
+                        if additive && !self.uv_editor.selection.insert(index as u32) {
+                            self.uv_editor.selection.remove(&(index as u32));
+                        } else {
+                            self.uv_editor.selection.insert(index as u32);
+                        }
+                        self.selected_uv = Some(index);
+                    }
+                    None if !additive => {
+                        self.uv_editor.selection.clear();
+                        self.selected_uv = None;
+                    }
+                    None => {}
                 }
             }
         }
-        ui.label(
-            egui::RichText::new(format!(
-                "{} UV points · {} polygons · {} seams · {} pinned",
-                mesh.uvs.len(),
-                mesh.polygons.len(),
-                mesh.seams.len(),
-                mesh.pinned_uvs.len()
-            ))
-            .small()
-            .weak(),
+        if response.dragged_by(egui::PointerButton::Primary) {
+            let delta = ui.input(|input| input.pointer.delta());
+            if delta != Vec2::ZERO {
+                self.nudge_selected_uv(V2::new(
+                    delta.x / rect.width().max(1.0),
+                    -delta.y / rect.height().max(1.0),
+                ));
+            }
+        }
+        let stats = lc_geom::uv_distortion_stats(&mesh, active_set);
+        let mut footer = format!(
+            "{} UV{} points · {} polygons · {} seams · {} pinned · {} UV sets",
+            values.len(),
+            active_set,
+            mesh.polygons.len(),
+            mesh.seams.len(),
+            mesh.pinned_uvs.len(),
+            mesh.uv_set_count()
         );
+        if let Some(stats) = stats {
+            footer.push_str(&format!(
+                " · distortion mean {:.2} max {:.2} ({} over 2×)",
+                stats.mean, stats.max, stats.distorted
+            ));
+        }
+        ui.label(egui::RichText::new(footer).small().weak());
     }
 }
 
@@ -704,6 +898,7 @@ fn shader_graph_ui(ui: &mut egui::Ui, material: &mut Material, selected: &mut Op
                     material,
                     ShaderNodeKind::Texture {
                         path: String::new(),
+                        uv_set: 0,
                     },
                     selected,
                 );
@@ -744,9 +939,19 @@ fn shader_graph_ui(ui: &mut egui::Ui, material: &mut Material, selected: &mut Op
                 *selected = None;
             }
             if let Some(node) = material.graph.node_mut(id) {
-                if let ShaderNodeKind::Texture { path } = &mut node.kind {
+                if let ShaderNodeKind::Texture { path, uv_set } = &mut node.kind {
                     ui.label("Texture path");
                     ui.text_edit_singleline(path);
+                    ui.horizontal(|ui| {
+                        ui.label("UV set");
+                        ui.add(
+                            egui::DragValue::new(uv_set)
+                                .range(0..=7)
+                                .speed(0.1)
+                                .prefix("UV"),
+                        );
+                    });
+                    ui.label(format!("Samples generated UV{uv_set} (0 = primary set)"));
                 }
             }
             let target = material
@@ -1042,6 +1247,12 @@ impl LeopardApp {
         let mut seek: Option<f32> = None;
         let mut toggle_play = false;
         let mut key = false;
+        let mut range_start = self.playback.start * self.playback.fps.max(1.0);
+        let mut range_end = self.playback.end * self.playback.fps.max(1.0);
+        let mut range_looping = self.playback.looping;
+        let mut range_start_changed = false;
+        let mut range_end_changed = false;
+        let mut range_loop_changed = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
             if icons::icon_button_sized(ui, Icon::Start, "Go to start", false, true, 22.0).clicked()
@@ -1122,34 +1333,28 @@ impl LeopardApp {
             ui.menu_button("Range", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Start frame");
-                    let mut start = self.playback.start * self.playback.fps;
-                    if ui
+                    range_start_changed |= ui
                         .add(
-                            egui::DragValue::new(&mut start)
+                            egui::DragValue::new(&mut range_start)
                                 .speed(1.0)
-                                .range(0.0..=100000.0),
+                                .range(0.0..=MAX_PLAYBACK_FRAME),
                         )
-                        .changed()
-                    {
-                        self.playback.start = start / self.playback.fps;
-                    }
+                        .changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label("End frame");
-                    let mut end = self.playback.end * self.playback.fps;
-                    if ui
+                    range_end_changed |= ui
                         .add(
-                            egui::DragValue::new(&mut end)
+                            egui::DragValue::new(&mut range_end)
                                 .speed(1.0)
-                                .range(1.0..=100000.0),
+                                .range(0.0..=MAX_PLAYBACK_FRAME),
                         )
-                        .changed()
-                    {
-                        self.playback.end = end / self.playback.fps;
-                    }
+                        .changed();
                 });
-                ui.checkbox(&mut self.playback.looping, "Loop playback");
-            });
+                range_loop_changed |= ui.checkbox(&mut range_looping, "Loop playback").changed();
+            })
+            .response
+            .on_hover_text("Playback start, end and loop mode");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icons::icon_button_sized(
                     ui,
@@ -1170,6 +1375,15 @@ impl LeopardApp {
                 );
             });
         });
+        if range_start_changed {
+            self.set_playback_start(range_start / self.playback.fps.max(1.0));
+        }
+        if range_end_changed {
+            self.set_playback_end(range_end / self.playback.fps.max(1.0));
+        }
+        if range_loop_changed {
+            self.set_playback_looping(range_looping);
+        }
         if toggle_play {
             self.playback.playing = !self.playback.playing;
         }
@@ -1179,9 +1393,6 @@ impl LeopardApp {
         }
         if key {
             self.key_transform_channels();
-        }
-        if self.playback.end < self.playback.start {
-            self.playback.end = self.playback.start + 1.0 / self.playback.fps.max(1.0);
         }
         self.ui_timeline_ruler(ui);
     }
@@ -1284,6 +1495,10 @@ impl LeopardApp {
         let mut end_frame = self.playback.end * self.playback.fps;
         let mut fps = self.playback.fps;
         let mut loop_playback = self.playback.looping;
+        let mut start_changed = false;
+        let mut end_changed = false;
+        let mut fps_changed = false;
+        let mut loop_changed = false;
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("F-Curves")
@@ -1297,20 +1512,26 @@ impl LeopardApp {
                     .size(9.0)
                     .color(theme::TEXT_WEAK),
             );
-            ui.add(
-                egui::DragValue::new(&mut start_frame)
-                    .speed(1.0)
-                    .range(0.0..=100000.0),
-            );
+            start_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut start_frame)
+                        .speed(1.0)
+                        .range(0.0..=MAX_PLAYBACK_FRAME),
+                )
+                .changed();
             ui.label(egui::RichText::new("End").size(9.0).color(theme::TEXT_WEAK));
-            ui.add(
-                egui::DragValue::new(&mut end_frame)
-                    .speed(1.0)
-                    .range(1.0..=100000.0),
-            );
+            end_changed |= ui
+                .add(
+                    egui::DragValue::new(&mut end_frame)
+                        .speed(1.0)
+                        .range(0.0..=MAX_PLAYBACK_FRAME),
+                )
+                .changed();
             ui.label(egui::RichText::new("fps").size(9.0).color(theme::TEXT_WEAK));
-            ui.add(egui::DragValue::new(&mut fps).speed(0.2).range(1.0..=240.0));
-            ui.checkbox(&mut loop_playback, "Loop");
+            fps_changed |= ui
+                .add(egui::DragValue::new(&mut fps).speed(0.2).range(1.0..=240.0))
+                .changed();
+            loop_changed |= ui.checkbox(&mut loop_playback, "Loop").changed();
             let has_selection = !self.selected_curve_keys().is_empty();
             if ui
                 .add_enabled(
@@ -1484,6 +1705,19 @@ impl LeopardApp {
                     self.set_anim_target(target);
                 }
             }
+            ui.label(
+                egui::RichText::new("Filter")
+                    .size(9.0)
+                    .color(theme::TEXT_WEAK),
+            );
+            egui::ComboBox::from_id_salt("curve_key_filter")
+                .width(98.0)
+                .selected_text(self.curve_filter.label())
+                .show_ui(ui, |ui| {
+                    for filter in CurveFilter::ALL {
+                        ui.selectable_value(&mut self.curve_filter, filter, filter.label());
+                    }
+                });
             let key_ready = self.selected_curve_channel.is_some_and(|(target, row)| {
                 self.current_anim_target() == Some(target)
                     && self.channel_applies_to_target(row.channel, target)
@@ -1501,11 +1735,18 @@ impl LeopardApp {
                 }
             }
         });
-        self.playback.fps = fps.max(1.0);
-        self.playback.start = start_frame / self.playback.fps;
-        self.playback.end =
-            (end_frame / self.playback.fps).max(self.playback.start + 1.0 / self.playback.fps);
-        self.playback.looping = loop_playback;
+        if fps_changed {
+            self.set_playback_fps(fps);
+        }
+        if start_changed {
+            self.set_playback_start(start_frame / self.playback.fps.max(1.0));
+        }
+        if end_changed {
+            self.set_playback_end(end_frame / self.playback.fps.max(1.0));
+        }
+        if loop_changed {
+            self.set_playback_looping(loop_playback);
+        }
 
         let start = self.playback.start;
         let end = self.playback.end.max(start + 1e-4);
@@ -1518,8 +1759,8 @@ impl LeopardApp {
         if let Some(drag) = self.curve_key_drag.as_ref() {
             let valid = Some(drag.key.target) == anim_target
                 && clip.as_ref().is_some_and(|clip| match drag.key.track {
-                    CurveTrackId::Scalar(property) => {
-                        Self::curve_key_index(clip, property, drag.original_time).is_some()
+                    CurveTrackId::Scalar(address) => {
+                        Self::curve_key_index(clip, address, drag.original_time).is_some()
                     }
                     CurveTrackId::Rotation => clip.rotation_key_index(drag.original_time).is_some(),
                     CurveTrackId::MorphWeight(target) => {
@@ -1530,7 +1771,7 @@ impl LeopardApp {
                 self.curve_key_drag = None;
             }
         }
-        let mut remove_track: Option<AnimProperty> = None;
+        let mut remove_track: Option<ChannelAddress> = None;
         let mut remove_morph: Option<u32> = None;
         let mut remove_rotation = false;
         let mut set_row_interpolation: Option<(AnimTarget, CurveRow, Interpolation)> = None;
@@ -1542,13 +1783,31 @@ impl LeopardApp {
             Rect::from_min_max(Pos2::new(left_rect.right() + 1.0, area.top()), area.max);
         let list_painter = ui.painter_at(left_rect);
         list_painter.rect_filled(left_rect, 0.0, Color32::from_rgb(243, 243, 243));
-        if let (Some(target), Some(clip)) = (anim_target, clip.as_mut()) {
-            let rows = self.curve_rows(target);
-            let row_count = rows.len();
-            // Shrink rows slightly before hiding channels; a mesh with all
-            // transform rows plus several morph targets still fits.
-            let row_h = if row_count > 8 {
-                (height / row_count as f32).max(14.0)
+        if let (Some(_), Some(clip)) = (anim_target, clip.as_mut()) {
+            enum ListEntry {
+                Header(String),
+                Row(AnimTarget, CurveRow),
+            }
+            // The list groups channels under their target object, tag or
+            // material. The current target shows every filtered row; other
+            // animated targets show only the channels that own keys.
+            let entries: Vec<ListEntry> = self
+                .curve_groups()
+                .iter()
+                .flat_map(|group| {
+                    std::iter::once(ListEntry::Header(group.label.clone())).chain(
+                        group
+                            .rows
+                            .iter()
+                            .map(|row| ListEntry::Row(group.target, *row)),
+                    )
+                })
+                .collect();
+            let row_count = entries.len();
+            // Shrink rows slightly before hiding channels; a grouped list with
+            // all transform rows plus several morph targets still fits.
+            let row_h = if row_count > 9 {
+                (height / row_count as f32).max(13.0)
             } else {
                 16.0
             };
@@ -1556,13 +1815,27 @@ impl LeopardApp {
             if row_count > max_rows {
                 max_rows = max_rows.saturating_sub(1).max(1);
             }
-            for (row_index, row) in rows.iter().take(max_rows).enumerate() {
+            for (row_index, entry) in entries.iter().take(max_rows).enumerate() {
                 let y = left_rect.top() + row_index as f32 * row_h;
                 let row_rect = Rect::from_min_size(
                     Pos2::new(left_rect.left(), y),
                     Vec2::new(left_rect.width(), row_h),
                 );
-                let selected_row = self.selected_curve_channel == Some((target, *row));
+                let (target, row) = match entry {
+                    ListEntry::Header(label) => {
+                        list_painter.text(
+                            Pos2::new(row_rect.left() + 6.0, row_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(8.4),
+                            theme::TEXT_WEAK,
+                        );
+                        continue;
+                    }
+                    ListEntry::Row(target, row) => (*target, *row),
+                };
+                let current_target_row = Some(target) == anim_target;
+                let selected_row = self.selected_curve_channel == Some((target, row));
                 if selected_row {
                     list_painter.rect_filled(row_rect, 2.0, Color32::from_rgb(231, 238, 247));
                 }
@@ -1574,14 +1847,19 @@ impl LeopardApp {
                     )
                     .clicked()
                 {
-                    self.selected_curve_channel = Some((target, *row));
+                    // Clicking another target's row focuses that target before
+                    // selecting the row; view state never edits history.
+                    if !current_target_row {
+                        self.set_anim_target(target);
+                    }
+                    self.selected_curve_channel = Some((target, row));
                 }
                 list_painter.circle_filled(
                     Pos2::new(row_rect.left() + 6.0, row_rect.center().y),
                     3.0,
                     channel_color(row.channel),
                 );
-                let label = self.curve_row_label(target, *row);
+                let label = self.curve_row_label(target, row);
                 list_painter.text(
                     Pos2::new(row_rect.left() + 13.0, row_rect.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -1589,37 +1867,37 @@ impl LeopardApp {
                     egui::FontId::proportional(8.8),
                     theme::TEXT,
                 );
-                let (has_track, interpolation) = if let Some(index) = row.morph_target {
-                    let curve = clip.morph_weights.get(&index);
-                    (
-                        curve.is_some(),
-                        curve
-                            .and_then(|curve| curve.keys.first())
-                            .map(|key| key.interpolation)
-                            .unwrap_or(Interpolation::Smooth),
-                    )
-                } else {
-                    match row.property {
-                        Some(property) => {
-                            let track = clip.track(property);
-                            (
-                                track.is_some(),
-                                track
-                                    .and_then(|track| track.curve.keys.first())
-                                    .map(|key| key.interpolation)
-                                    .unwrap_or(Interpolation::Smooth),
-                            )
-                        }
-                        None => {
-                            let track = clip.rotation.as_ref();
-                            (
-                                track.is_some(),
-                                track
-                                    .and_then(|track| track.keys.first())
-                                    .map(|key| key.interpolation)
-                                    .unwrap_or(Interpolation::Smooth),
-                            )
-                        }
+                let row_track = self.curve_row_track_for(target, row);
+                let (has_track, interpolation) = match row_track {
+                    CurveTrackId::MorphWeight(index) => {
+                        let curve = clip.morph_weights.get(&index);
+                        (
+                            curve.is_some(),
+                            curve
+                                .and_then(|curve| curve.keys.first())
+                                .map(|key| key.interpolation)
+                                .unwrap_or(Interpolation::Smooth),
+                        )
+                    }
+                    CurveTrackId::Scalar(address) => {
+                        let track = clip.track(address);
+                        (
+                            track.is_some(),
+                            track
+                                .and_then(|track| track.curve.keys.first())
+                                .map(|key| key.interpolation)
+                                .unwrap_or(Interpolation::Smooth),
+                        )
+                    }
+                    CurveTrackId::Rotation => {
+                        let track = clip.rotation.as_ref();
+                        (
+                            track.is_some(),
+                            track
+                                .and_then(|track| track.keys.first())
+                                .map(|key| key.interpolation)
+                                .unwrap_or(Interpolation::Smooth),
+                        )
                     }
                 };
                 let interp_rect = Rect::from_min_size(
@@ -1649,6 +1927,7 @@ impl LeopardApp {
                     },
                 );
                 if has_track
+                    && current_target_row
                     && ui
                         .interact(
                             interp_rect,
@@ -1663,9 +1942,9 @@ impl LeopardApp {
                         Interpolation::Constant => Interpolation::Spline,
                         Interpolation::Spline => Interpolation::Smooth,
                     };
-                    set_row_interpolation = Some((target, *row, next));
+                    set_row_interpolation = Some((target, row, next));
                 }
-                if has_track {
+                if has_track && current_target_row {
                     let delete_rect = Rect::from_min_size(
                         Pos2::new(row_rect.right() - 18.0, y + 1.0),
                         Vec2::splat(14.0),
@@ -1687,22 +1966,27 @@ impl LeopardApp {
                         )
                         .clicked()
                     {
-                        if let Some(index) = row.morph_target {
-                            remove_morph = Some(index);
-                        } else {
-                            match row.property {
-                                Some(property) => remove_track = Some(property),
-                                None => remove_rotation = true,
-                            }
+                        match row_track {
+                            CurveTrackId::MorphWeight(index) => remove_morph = Some(index),
+                            CurveTrackId::Scalar(address) => remove_track = Some(address),
+                            CurveTrackId::Rotation => remove_rotation = true,
                         }
                     }
                 }
             }
-            if row_count > max_rows {
+            if row_count == 0 {
+                list_painter.text(
+                    Pos2::new(left_rect.left() + 6.0, left_rect.top() + 14.0),
+                    egui::Align2::LEFT_CENTER,
+                    "No channels match the filter",
+                    egui::FontId::proportional(9.0),
+                    theme::TEXT_WEAK,
+                );
+            } else if row_count > max_rows {
                 list_painter.text(
                     Pos2::new(left_rect.left() + 6.0, left_rect.bottom() - 5.0),
                     egui::Align2::LEFT_BOTTOM,
-                    format!("+{} more channels", row_count - max_rows),
+                    format!("+{} more rows", row_count - max_rows),
                     egui::FontId::proportional(8.0),
                     theme::TEXT_WEAK,
                 );
@@ -1744,12 +2028,24 @@ impl LeopardApp {
                 egui::Stroke::new(0.6, Color32::from_rgb(228, 228, 228)),
             );
         }
+        let visible_rows = anim_target
+            .map(|target| self.visible_curve_rows(target))
+            .unwrap_or_default();
+        let visible_tracks: Vec<CurveTrackId> = match anim_target {
+            Some(target) => visible_rows
+                .iter()
+                .map(|row| self.curve_row_track_for(target, *row))
+                .collect(),
+            None => Vec::new(),
+        };
+        let track_visible = |track: CurveTrackId| visible_tracks.contains(&track);
         let series: Vec<(Color32, Vec<f32>)> = clip
             .as_ref()
             .map(|clip| {
                 let mut series: Vec<(Color32, Vec<f32>)> = clip
                     .tracks
                     .iter()
+                    .filter(|track| track_visible(CurveTrackId::Scalar(track.address)))
                     .map(|track| {
                         let values = (0..=64)
                             .map(|i| {
@@ -1757,22 +2053,27 @@ impl LeopardApp {
                                 track.curve.sample(start + (end - start) * t)
                             })
                             .collect();
-                        (track_color(track.property), values)
+                        (track_color(track.address), values)
                     })
                     .collect();
-                if let Some(track) = &clip.rotation {
-                    let values = (0..=64)
-                        .map(|i| {
-                            let t = i as f32 / 64.0;
-                            track
-                                .sample(start + (end - start) * t)
-                                .map(|q| q.w)
-                                .unwrap_or(1.0)
-                        })
-                        .collect();
-                    series.push((channel_color(AnimChannel::Rotation), values));
+                if track_visible(CurveTrackId::Rotation) {
+                    if let Some(track) = &clip.rotation {
+                        let values = (0..=64)
+                            .map(|i| {
+                                let t = i as f32 / 64.0;
+                                track
+                                    .sample(start + (end - start) * t)
+                                    .map(|q| q.w)
+                                    .unwrap_or(1.0)
+                            })
+                            .collect();
+                        series.push((channel_color(AnimChannel::Rotation), values));
+                    }
                 }
-                for curve in clip.morph_weights.values() {
+                for (&index, curve) in &clip.morph_weights {
+                    if !track_visible(CurveTrackId::MorphWeight(index)) {
+                        continue;
+                    }
                     let values = (0..=64)
                         .map(|i| {
                             let t = i as f32 / 64.0;
@@ -1816,6 +2117,9 @@ impl LeopardApp {
             let clip = clip.as_ref()?;
             let mut best: Option<(f32, CurveTrackId, f32)> = None;
             for track in &clip.tracks {
+                if !track_visible(CurveTrackId::Scalar(track.address)) {
+                    continue;
+                }
                 for key in &track.curve.keys {
                     if key.time < start || key.time > end {
                         continue;
@@ -1824,24 +2128,31 @@ impl LeopardApp {
                     let y = value_y(key.value);
                     let distance = (Pos2::new(x, y) - pointer).length();
                     if distance <= 7.0 && best.map(|(best, _, _)| distance < best).unwrap_or(true) {
-                        best = Some((distance, CurveTrackId::Scalar(track.property), key.time));
+                        best = Some((distance, CurveTrackId::Scalar(track.address), key.time));
                     }
                 }
             }
-            if let Some(rotation) = &clip.rotation {
-                for key in &rotation.keys {
-                    if key.time < start || key.time > end {
-                        continue;
-                    }
-                    let x = rect.left() + (key.time - start) / (end - start) * rect.width();
-                    let y = value_y(key.value.w);
-                    let distance = (Pos2::new(x, y) - pointer).length();
-                    if distance <= 7.0 && best.map(|(best, _, _)| distance < best).unwrap_or(true) {
-                        best = Some((distance, CurveTrackId::Rotation, key.time));
+            if track_visible(CurveTrackId::Rotation) {
+                if let Some(rotation) = &clip.rotation {
+                    for key in &rotation.keys {
+                        if key.time < start || key.time > end {
+                            continue;
+                        }
+                        let x = rect.left() + (key.time - start) / (end - start) * rect.width();
+                        let y = value_y(key.value.w);
+                        let distance = (Pos2::new(x, y) - pointer).length();
+                        if distance <= 7.0
+                            && best.map(|(best, _, _)| distance < best).unwrap_or(true)
+                        {
+                            best = Some((distance, CurveTrackId::Rotation, key.time));
+                        }
                     }
                 }
             }
             for (target, curve) in &clip.morph_weights {
+                if !track_visible(CurveTrackId::MorphWeight(*target)) {
+                    continue;
+                }
                 for key in &curve.keys {
                     if key.time < start || key.time > end {
                         continue;
@@ -1866,8 +2177,8 @@ impl LeopardApp {
                     }
                     let (key, tangent_in, tangent_out) =
                         match selected.track {
-                            CurveTrackId::Scalar(property) => {
-                                let Some(track) = clip.track(property) else {
+                            CurveTrackId::Scalar(address) => {
+                                let Some(track) = clip.track(address) else {
                                     continue;
                                 };
                                 let Some(key) = track.curve.keys.iter().find(|key| {
@@ -2060,8 +2371,8 @@ impl LeopardApp {
             {
                 if let Some((track, time)) = key_at(pointer) {
                     match track {
-                        CurveTrackId::Scalar(property) => {
-                            self.delete_target_curve_key(target, property, time);
+                        CurveTrackId::Scalar(address) => {
+                            self.delete_target_curve_key(target, address, time);
                         }
                         CurveTrackId::Rotation => {
                             self.delete_target_rotation_curve_key(target, time);
@@ -2094,7 +2405,7 @@ impl LeopardApp {
                     }
                     let key_id = SelectedKey {
                         target,
-                        track: CurveTrackId::Scalar(track.property),
+                        track: CurveTrackId::Scalar(track.address),
                         time: key.time,
                     };
                     let selected = self.is_curve_key_selected(&key_id);
@@ -2103,7 +2414,7 @@ impl LeopardApp {
                             .iter()
                             .find(|selected| {
                                 selected.target == target
-                                    && selected.track == CurveTrackId::Scalar(track.property)
+                                    && selected.track == CurveTrackId::Scalar(track.address)
                                     && (selected.time - key.time).abs() <= 1e-3
                             })
                             .map(|_| key.time + (drag.current_time - drag.original_time))
@@ -2115,7 +2426,7 @@ impl LeopardApp {
                     let fill = if selected {
                         theme::ACCENT
                     } else {
-                        track_color(track.property)
+                        track_color(track.address)
                     };
                     let stroke = if selected {
                         egui::Stroke::new(1.5, Color32::WHITE)
@@ -2292,8 +2603,8 @@ impl LeopardApp {
             egui::Stroke::new(1.2, theme::ACCENT),
         );
         if let (Some(target), Some(mut clip)) = (anim_target, clip) {
-            if let Some(property) = remove_track {
-                clip.remove_track(property);
+            if let Some(address) = remove_track {
+                clip.remove_track(address);
             }
             if remove_rotation {
                 clip.remove_rotation_track();
@@ -2874,21 +3185,20 @@ fn channel_color(channel: AnimChannel) -> Color32 {
     }
 }
 
-fn track_color(property: AnimProperty) -> Color32 {
-    match property {
-        AnimProperty::TranslationX => Color32::from_rgb(206, 74, 66),
-        AnimProperty::TranslationY => Color32::from_rgb(86, 158, 82),
-        AnimProperty::TranslationZ => Color32::from_rgb(70, 108, 190),
-        // Legacy Euler rotation tracks keep their component colours.
-        AnimProperty::RotationX => Color32::from_rgb(196, 122, 72),
-        AnimProperty::RotationY => Color32::from_rgb(132, 150, 62),
-        AnimProperty::RotationZ => Color32::from_rgb(122, 92, 168),
-        AnimProperty::ScaleX => Color32::from_rgb(188, 104, 148),
-        AnimProperty::ScaleY => Color32::from_rgb(92, 152, 152),
-        AnimProperty::ScaleZ => Color32::from_rgb(102, 122, 178),
-        _ => AnimChannel::from_scalar_property(property)
-            .map(channel_color)
-            .unwrap_or(Color32::from_rgb(128, 128, 128)),
+fn track_color(address: ChannelAddress) -> Color32 {
+    // Components of one vector channel get distinct tints so its three curves
+    // stay readable; every other channel uses its registry colour.
+    match (address.channel, address.component) {
+        (AnimChannel::Translation, 0) => Color32::from_rgb(206, 74, 66),
+        (AnimChannel::Translation, 1) => Color32::from_rgb(86, 158, 82),
+        (AnimChannel::Translation, 2) => Color32::from_rgb(70, 108, 190),
+        (AnimChannel::Scale, 0) => Color32::from_rgb(188, 104, 148),
+        (AnimChannel::Scale, 1) => Color32::from_rgb(92, 152, 152),
+        (AnimChannel::Scale, 2) => Color32::from_rgb(102, 122, 178),
+        (AnimChannel::LightColor, 0) => Color32::from_rgb(196, 122, 72),
+        (AnimChannel::LightColor, 1) => Color32::from_rgb(132, 150, 62),
+        (AnimChannel::LightColor, 2) => Color32::from_rgb(122, 92, 168),
+        _ => channel_color(address.channel),
     }
 }
 

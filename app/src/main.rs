@@ -25,6 +25,8 @@ fn main() {
         run_headless(&args[1..])
     } else if args[0] == "--mcp" {
         run_mcp(&args[1..])
+    } else if args[0] == "--mcp-http" {
+        run_mcp_http(&args[1..])
     } else if args[0].starts_with('-') {
         Err(format!("unknown option '{}'; see --help", args[0]))
     } else {
@@ -96,9 +98,11 @@ fn print_help() {
            leopardcraft --headless export [options]\n\
            leopardcraft --headless selftest\n\
            leopardcraft --headless lifecycle\n\
-           leopardcraft --mcp [--scene <path>]\n\n\
+           leopardcraft --mcp [--scene <path>]\n\
+           leopardcraft --mcp-http [--addr <host:port>] [--scene <path>]\n\n\
          MCP options:\n\
-           --scene <path>      scene to load (default: built-in studio)\n\n\
+           --scene <path>      scene to load (default: built-in studio)\n\
+           --addr <host:port>  loopback address for --mcp-http (default: 127.0.0.1:8765)\n\n\
          Render options:\n\
            --scene <path>      scene file (default: built-in studio)\n\
            --out <path>        output .png or .exr (default: render.png)\n\
@@ -138,19 +142,29 @@ fn run_headless(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn run_mcp(args: &[String]) -> Result<(), String> {
-    let (doc, path) = match flag(args, "--scene") {
+fn startup_document(args: &[String]) -> Result<(Document, Option<PathBuf>), String> {
+    match flag(args, "--scene") {
         Some(scene) => {
             let path = PathBuf::from(scene);
             let (doc, report) = lc_io::import_with_report(&path)?;
             if let Some(summary) = report.summary() {
                 eprintln!("warning: {summary}");
             }
-            (doc, Some(path))
+            Ok((doc, Some(path)))
         }
-        None => (Document::demo(), None),
-    };
+        None => Ok((Document::demo(), None)),
+    }
+}
+
+fn run_mcp(args: &[String]) -> Result<(), String> {
+    let (doc, path) = startup_document(args)?;
     lc_mcp::McpServer::new(doc, path).serve_stdio()
+}
+
+fn run_mcp_http(args: &[String]) -> Result<(), String> {
+    let (doc, path) = startup_document(args)?;
+    let addr = flag(args, "--addr").unwrap_or_else(|| lc_mcp::DEFAULT_HTTP_ADDR.to_string());
+    lc_mcp::McpServer::new(doc, path).serve_http(&addr)
 }
 
 fn load_document(scene: Option<String>) -> Result<(Document, PathBuf), String> {

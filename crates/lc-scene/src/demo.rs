@@ -5,7 +5,7 @@ use crate::{
     NodeKind, Primitive, ProjectionMode, Tag,
 };
 use glam::Vec3;
-use lc_anim::{AnimProperty, Interpolation};
+use lc_anim::{AnimChannel, ChannelAddress, ChannelTarget, Interpolation};
 use lc_core::{look_at_quat, Transform};
 use lc_shading::{MaterialLibrary, ShaderNodeKind, ShaderValue};
 
@@ -199,8 +199,12 @@ impl Document {
                 (72.0, 1.55),
                 (96.0, 1.05),
             ] {
-                node.animation
-                    .set_key(AnimProperty::TranslationY, t, y, Interpolation::Smooth);
+                node.animation.set_key(
+                    ChannelAddress::owner_component(AnimChannel::Translation, 1),
+                    t,
+                    y,
+                    Interpolation::Smooth,
+                );
             }
             add(&mut doc, node, Some(geometry_root));
         }
@@ -224,10 +228,17 @@ impl Document {
                 Vec3::ONE,
             );
             node.material = Some(1);
-            node.animation
-                .set_key(AnimProperty::RotationY, 0.0, 0.0, Interpolation::Linear);
-            node.animation
-                .set_key(AnimProperty::RotationY, 96.0, 360.0, Interpolation::Linear);
+            // A full turn needs a midpoint key: shortest-path quaternion
+            // interpolation treats 0 and 360 degrees as the same orientation.
+            let tilt = node.transform.rotation;
+            for (time, degrees) in [(0.0f32, 0.0f32), (48.0, 180.0), (96.0, 360.0)] {
+                node.animation.set_rotation_key(
+                    ChannelTarget::Owner,
+                    time,
+                    tilt * glam::Quat::from_rotation_y(degrees.to_radians()),
+                    Interpolation::Linear,
+                );
+            }
             add(&mut doc, node, Some(geometry_root));
         }
 

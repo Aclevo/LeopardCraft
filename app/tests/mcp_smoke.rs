@@ -11,7 +11,8 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -141,6 +142,136 @@ fn project_mcp_config_launches_from_outside_repo() {
     exercise_server(&mut client, &root, temp.path());
 }
 
+#[test]
+fn http_transport_serves_the_protocol_from_the_real_binary() {
+    let temp = TempDir::new("http");
+    let child = Command::new(env!("CARGO_BIN_EXE_leopardcraft"))
+        .arg("--mcp-http")
+        .arg("--addr")
+        .arg("127.0.0.1:0")
+        .current_dir(temp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("launch the MCP HTTP server");
+    let mut guard = ChildGuard(child);
+    let stdout = guard.0.stdout.take().expect("piped stdout");
+    let (sender, lines) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let endpoint_line = lines
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the HTTP server reports its endpoint");
+    let endpoint = endpoint_line
+        .trim()
+        .strip_prefix("MCP Streamable HTTP endpoint: ")
+        .unwrap_or_else(|| panic!("unexpected startup output: {endpoint_line}"));
+    assert!(endpoint.starts_with("http://127.0.0.1:"), "{endpoint}");
+    assert!(endpoint.ends_with("/mcp"), "{endpoint}");
+    let addr = endpoint
+        .trim_start_matches("http://")
+        .trim_end_matches("/mcp")
+        .to_string();
+
+    let response = http_post(
+        &addr,
+        None,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let body = response.split_once("\r\n\r\n").expect("response headers").1;
+    let initialized: Value = serde_json::from_str(body).expect("json response body");
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "leopardcraft");
+    assert_eq!(
+        initialized["result"]["capabilities"]["resources"]["subscribe"],
+        true
+    );
+    // The handshake starts a session, and later requests must repeat its id.
+    let session = response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("mcp-session-id"))
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, value)| value.trim().to_string())
+        .expect("the initialize response carries a session id");
+
+    let response = http_post(
+        &addr,
+        None,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_objects","arguments":{}}}"#,
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "a request without the session header must be refused: {response}"
+    );
+
+    let response = http_post(
+        &addr,
+        Some(&session),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_objects","arguments":{}}}"#,
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let body = response.split_once("\r\n\r\n").expect("response headers").1;
+    let listed: Value = serde_json::from_str(body).expect("json response body");
+    assert_eq!(listed["result"]["isError"], false);
+
+    // The transport refuses to expose the document beyond loopback.
+    let refused = Command::new(env!("CARGO_BIN_EXE_leopardcraft"))
+        .args(["--mcp-http", "--addr", "0.0.0.0:0"])
+        .current_dir(temp.path())
+        .output()
+        .expect("run the refused MCP HTTP server");
+    assert!(!refused.status.success(), "non-loopback bind must fail");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("loopback"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    guard.0.kill().expect("stop the HTTP server");
+}
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn http_post(addr: &str, session: Option<&str>, body: &str) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect to the MCP HTTP endpoint");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("read timeout");
+    let header = session
+        .map(|id| format!("Mcp-Session-Id: {id}\r\n"))
+        .unwrap_or_default();
+    write!(
+        stream,
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         {header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write HTTP request");
+    stream.flush().expect("flush HTTP request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read HTTP response");
+    response
+}
+
 fn exercise_server(client: &mut McpClient, root: &Path, temp: &Path) {
     let initialized = client.request(json!({
         "jsonrpc": "2.0",
@@ -183,7 +314,7 @@ fn exercise_server(client: &mut McpClient, root: &Path, temp: &Path) {
         .as_array()
         .expect("tools/list returns an array")
         .clone();
-    assert_eq!(tools.len(), 16, "unexpected advertised tool count");
+    assert_eq!(tools.len(), 33, "unexpected advertised tool count");
     assert_documented_tools(root, &tools);
     assert_tool_schemas(&tools);
 

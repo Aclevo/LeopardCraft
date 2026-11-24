@@ -8,10 +8,16 @@
 //!
 //! The server owns an in-memory document. Scene edits go through the same
 //! undo commands as the editor, so `undo` and `redo` behave predictably.
+//! Transport is stdio by default; [`HttpTransport`] adds the opt-in Streamable
+//! HTTP transport on a loopback endpoint, and resource subscriptions and prompt
+//! templates are served over both.
 
+mod http;
 mod server;
 mod tools;
 
+pub use http::{HttpTransport, HTTP_ENDPOINT};
 pub use server::{
-    McpServer, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION, SCENE_URI, SERVER_NAME, SUMMARY_URI,
+    McpServer, DEFAULT_HTTP_ADDR, LATEST_PROTOCOL_VERSION, PROTOCOL_VERSION, SCENE_URI,
+    SERVER_NAME, SUMMARY_URI,
 };

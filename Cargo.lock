@@ -1218,10 +1218,13 @@ name = "lc-mcp"
 version = "0.2.0"
 dependencies = [
  "glam",
+ "lc-anim",
  "lc-core",
+ "lc-geom",
  "lc-io",
  "lc-render",
  "lc-scene",
+ "lc-shading",
  "serde_json",
 ]
 

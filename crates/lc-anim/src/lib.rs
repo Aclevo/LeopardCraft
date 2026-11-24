@@ -228,12 +228,22 @@ impl RotationKey {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RotationTrack {
+    /// Target of this quaternion channel. Older files default to the clip's
+    /// owner, which is where every recorded rotation track lives.
+    #[serde(default)]
+    pub target: ChannelTarget,
     pub keys: Vec<RotationKey>,
 }
 
 impl RotationTrack {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Whether this track supplies the rotation of `owner`. A track addressed
+    /// to another entity does not.
+    pub fn applies_to(&self, owner: ChannelTarget) -> bool {
+        self.target == ChannelTarget::Owner || self.target == owner
     }
 
     pub fn insert(&mut self, time: f32, value: Quat, interpolation: Interpolation) -> usize {
@@ -988,82 +998,115 @@ impl Curve {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AnimProperty {
-    TranslationX,
-    TranslationY,
-    TranslationZ,
-    RotationX,
-    RotationY,
-    RotationZ,
-    ScaleX,
-    ScaleY,
-    ScaleZ,
-    Fov,
-    LightIntensity,
-    LightColorR,
-    LightColorG,
-    LightColorB,
-    /// Weight of the object's Copy Location tag(s).
-    CopyLocationWeight,
-    /// Surface roughness of the material the clip belongs to.
-    MaterialRoughness,
-    /// Surface metallic value of the material the clip belongs to.
-    MaterialMetallic,
+/// The entity a channel address names. A clip stored on a node, tag or
+/// material normally addresses its own owner, so legacy and freshly recorded
+/// tracks use `Owner`. An explicit target lets one clip name another object, a
+/// tag or a material, and lets consumers group addresses by their target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChannelTarget {
+    /// The entity that owns the clip.
+    #[default]
+    Owner,
+    Object {
+        id: u64,
+    },
+    Tag {
+        node: u64,
+        index: u32,
+    },
+    Material {
+        /// Matches `lc_shading::MaterialId` without making `lc-anim` depend on
+        /// the shading crate.
+        id: u32,
+    },
 }
 
-impl AnimProperty {
-    pub fn label(self) -> &'static str {
+impl ChannelTarget {
+    fn write_signature(self, h: &mut StableHasher) {
         match self {
-            Self::TranslationX => "Location X",
-            Self::TranslationY => "Location Y",
-            Self::TranslationZ => "Location Z",
-            Self::RotationX => "Rotation X",
-            Self::RotationY => "Rotation Y",
-            Self::RotationZ => "Rotation Z",
-            Self::ScaleX => "Scale X",
-            Self::ScaleY => "Scale Y",
-            Self::ScaleZ => "Scale Z",
-            Self::Fov => "Camera FOV",
-            Self::LightIntensity => "Light Intensity",
-            Self::LightColorR => "Light Color R",
-            Self::LightColorG => "Light Color G",
-            Self::LightColorB => "Light Color B",
-            Self::CopyLocationWeight => "Copy Location Weight",
-            Self::MaterialRoughness => "Material Roughness",
-            Self::MaterialMetallic => "Material Metallic",
+            Self::Owner => h.write_u8(0),
+            Self::Object { id } => {
+                h.write_u8(1);
+                h.write_u64(id);
+            }
+            Self::Tag { node, index } => {
+                h.write_u8(2);
+                h.write_u64(node);
+                h.write_u32(index);
+            }
+            Self::Material { id } => {
+                h.write_u8(3);
+                h.write_u32(id);
+            }
+        }
+    }
+}
+
+/// One animatable channel, addressed by target, registry channel and component.
+///
+/// The registry is the single source of channel scope, component count, label
+/// and applicability, so an address cannot name a fourth translation component
+/// or a scalar rotation component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ChannelAddress {
+    pub target: ChannelTarget,
+    pub channel: AnimChannel,
+    pub component: u8,
+}
+
+impl ChannelAddress {
+    /// Build an address, refusing channels without scalar components and
+    /// components outside the registry's declared count.
+    pub fn new(target: ChannelTarget, channel: AnimChannel, component: u8) -> Option<Self> {
+        (usize::from(component) < channel.scalar_component_count()).then_some(Self {
+            target,
+            channel,
+            component,
+        })
+    }
+
+    /// Address a component of the clip's own owner.
+    pub fn owner(channel: AnimChannel, component: u8) -> Option<Self> {
+        Self::new(ChannelTarget::Owner, channel, component)
+    }
+
+    /// Address a registry-valid component without re-checking it. Recorder
+    /// paths that already matched on the registry, and tests, use this; user
+    /// input goes through `new` so an invalid component is refused.
+    pub fn owner_component(channel: AnimChannel, component: u8) -> Self {
+        debug_assert!(usize::from(component) < channel.scalar_component_count());
+        Self::owner_unchecked(channel, component)
+    }
+
+    fn owner_unchecked(channel: AnimChannel, component: u8) -> Self {
+        Self {
+            target: ChannelTarget::Owner,
+            channel,
+            component,
         }
     }
 
-    pub fn is_rotation(self) -> bool {
-        matches!(self, Self::RotationX | Self::RotationY | Self::RotationZ)
+    /// Registry-derived component label, for example "Location X".
+    pub fn label(&self) -> String {
+        self.channel
+            .component_label(self.component)
+            .unwrap_or_else(|| self.channel.label().to_string())
     }
 
-    pub fn default_value(self) -> f32 {
-        match self {
-            Self::ScaleX | Self::ScaleY | Self::ScaleZ => 1.0,
-            Self::LightIntensity => 1.0,
-            Self::CopyLocationWeight => 1.0,
-            Self::MaterialRoughness => 0.5,
-            Self::LightColorR | Self::LightColorG | Self::LightColorB => 1.0,
-            Self::RotationX | Self::RotationY | Self::RotationZ => 0.0,
-            Self::Fov => 45.0,
-            _ => 0.0,
-        }
+    pub fn scope(&self) -> ChannelScope {
+        self.channel.scope()
     }
 
-    pub const ALL_TRANSFORM: [AnimProperty; 9] = [
-        Self::TranslationX,
-        Self::TranslationY,
-        Self::TranslationZ,
-        Self::RotationX,
-        Self::RotationY,
-        Self::RotationZ,
-        Self::ScaleX,
-        Self::ScaleY,
-        Self::ScaleZ,
-    ];
+    pub fn applies_to(&self) -> ChannelAppliesTo {
+        self.channel.applies_to()
+    }
+
+    /// Whether this address applies to `owner`: it either names the owner
+    /// explicitly or defers to the entity holding the clip.
+    pub fn targets(&self, owner: ChannelTarget) -> bool {
+        self.target == ChannelTarget::Owner || self.target == owner
+    }
 }
 
 /// Where an animatable channel lives.
@@ -1108,7 +1151,8 @@ impl ChannelKind {
 /// has, and whether it belongs to an object, a tag or a material. The recorder
 /// and the F-curve editor both resolve channels through this registry instead of
 /// matching ad-hoc track names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnimChannel {
     Translation,
     Rotation,
@@ -1185,64 +1229,65 @@ impl AnimChannel {
         }
     }
 
-    /// Scalar tracks backing this channel. Rotation has none: it owns a
-    /// quaternion track.
-    pub fn scalar_properties(self) -> &'static [AnimProperty] {
+    /// How many independent scalar curves this channel owns. Rotation is a
+    /// single quaternion track and morph weights are one curve per target, so
+    /// neither has addressable scalar components.
+    pub fn scalar_component_count(self) -> usize {
         match self {
-            Self::Translation => &[
-                AnimProperty::TranslationX,
-                AnimProperty::TranslationY,
-                AnimProperty::TranslationZ,
-            ],
-            Self::Scale => &[
-                AnimProperty::ScaleX,
-                AnimProperty::ScaleY,
-                AnimProperty::ScaleZ,
-            ],
-            Self::LightColor => &[
-                AnimProperty::LightColorR,
-                AnimProperty::LightColorG,
-                AnimProperty::LightColorB,
-            ],
-            Self::Fov => &[AnimProperty::Fov],
-            Self::LightIntensity => &[AnimProperty::LightIntensity],
-            Self::CopyLocationWeight => &[AnimProperty::CopyLocationWeight],
-            Self::MaterialRoughness => &[AnimProperty::MaterialRoughness],
-            Self::MaterialMetallic => &[AnimProperty::MaterialMetallic],
-            Self::Rotation | Self::MorphWeight => &[],
+            Self::Translation | Self::Scale | Self::LightColor => 3,
+            Self::Rotation | Self::MorphWeight => 0,
+            Self::Fov
+            | Self::LightIntensity
+            | Self::CopyLocationWeight
+            | Self::MaterialRoughness
+            | Self::MaterialMetallic => 1,
         }
     }
 
-    pub fn from_scalar_property(property: AnimProperty) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|channel| channel.scalar_properties().contains(&property))
+    /// Suffix that names one component: R/G/B for a colour, X/Y/Z for any
+    /// other multi-component channel, and nothing for a scalar.
+    pub fn component_suffix(self, component: u8) -> Option<&'static str> {
+        if usize::from(component) >= self.scalar_component_count() {
+            return None;
+        }
+        match self {
+            Self::LightColor => [" R", " G", " B"].get(usize::from(component)).copied(),
+            _ if self.scalar_component_count() > 1 => {
+                [" X", " Y", " Z"].get(usize::from(component)).copied()
+            }
+            _ => Some(""),
+        }
     }
 
-    /// Human label for a tracked scalar component, derived from its registry
-    /// channel (for example "Location X" or "Light Color R").
-    pub fn scalar_label(property: AnimProperty) -> Option<String> {
-        let channel = Self::from_scalar_property(property)?;
-        let index = channel
-            .scalar_properties()
-            .iter()
-            .position(|candidate| *candidate == property)?;
-        let suffix = match channel {
-            Self::LightColor => [" R", " G", " B"][index],
-            _ if channel.component_count() > 1 => [" X", " Y", " Z"][index],
-            _ => "",
-        };
-        Some(format!("{}{}", channel.label(), suffix))
+    /// Human label for a component, derived from the registry (for example
+    /// "Location X" or "Light Color R").
+    pub fn component_label(self, component: u8) -> Option<String> {
+        let suffix = self.component_suffix(component)?;
+        Some(format!("{}{}", self.label(), suffix))
+    }
+
+    /// Authored default for one component, used when a channel is keyed before
+    /// its entity has a live value.
+    pub fn component_default(self, component: u8) -> f32 {
+        match self {
+            Self::Scale | Self::LightIntensity | Self::LightColor | Self::CopyLocationWeight => 1.0,
+            Self::MaterialRoughness => 0.5,
+            Self::Fov => 45.0,
+            _ => {
+                let _ = component;
+                0.0
+            }
+        }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AnimationTrack {
-    pub property: AnimProperty,
+    pub address: ChannelAddress,
     pub curve: Curve,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct AnimationClip {
     pub tracks: Vec<AnimationTrack>,
     /// Quaternion rotation channel. Kept separate from the scalar tracks so its
@@ -1253,6 +1298,109 @@ pub struct AnimationClip {
     /// a target without a curve keeps its authored weight.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub morph_weights: BTreeMap<u32, Curve>,
+    /// Compatibility path for pre-address files, which stored rotation as three
+    /// degree-valued Euler curves (axis 0..=2). New recordings use the
+    /// quaternion `rotation` track; this map is kept so old scenes keep
+    /// evaluating and round-trip without losing their keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub legacy_euler_rotation: BTreeMap<u8, Curve>,
+}
+
+/// Per-frame scratch values for one clip. Building a buffer samples every
+/// addressed curve exactly once, so evaluation can read a vector's three
+/// components without re-querying the curve per component.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChannelSamples {
+    scalars: BTreeMap<ChannelAddress, f32>,
+    rotations: BTreeMap<ChannelTarget, Quat>,
+    legacy_euler: BTreeMap<u8, f32>,
+    sampled: usize,
+}
+
+impl ChannelSamples {
+    pub fn len(&self) -> usize {
+        self.scalars.len() + self.rotations.len() + self.legacy_euler.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of curves evaluated to build this buffer. A channel is counted
+    /// once even though it may own several components.
+    pub fn sampled_curves(&self) -> usize {
+        self.sampled
+    }
+
+    pub fn scalar(&self, address: ChannelAddress) -> Option<f32> {
+        self.scalars.get(&address).copied()
+    }
+
+    /// Read one component for `owner`. An explicit address for that owner wins
+    /// over a track addressed to the clip's own owner.
+    pub fn scalar_for(
+        &self,
+        owner: ChannelTarget,
+        channel: AnimChannel,
+        component: u8,
+    ) -> Option<f32> {
+        let explicit = ChannelAddress {
+            target: owner,
+            channel,
+            component,
+        };
+        self.scalars
+            .get(&explicit)
+            .or_else(|| {
+                self.scalars
+                    .get(&ChannelAddress::owner_unchecked(channel, component))
+            })
+            .copied()
+    }
+
+    pub fn rotation(&self, owner: ChannelTarget) -> Option<Quat> {
+        self.rotations
+            .get(&owner)
+            .or_else(|| self.rotations.get(&ChannelTarget::Owner))
+            .copied()
+    }
+
+    pub fn legacy_euler(&self, axis: u8) -> Option<f32> {
+        self.legacy_euler.get(&axis).copied()
+    }
+
+    /// Apply the sampled transform channels to a base transform. Explicit
+    /// targets only apply to the entity they name; `Owner` applies to any.
+    pub fn apply_transform(&self, base: Transform, owner: ChannelTarget) -> Transform {
+        let mut t = base;
+        for (axis, component) in [0u8, 1, 2].into_iter().enumerate() {
+            let value = self
+                .scalar_for(owner, AnimChannel::Translation, component)
+                .unwrap_or(base.translation[axis]);
+            t.translation[axis] = value;
+        }
+        if let Some(rotation) = self.rotation(owner) {
+            t.rotation = rotation;
+        } else if (0..3).any(|axis| self.legacy_euler(axis as u8).is_some()) {
+            // Legacy documents store rotation as three degree-valued Euler
+            // curves; partial keys keep the authored axes of the base pose.
+            let euler = base.euler_degrees();
+            let mut next = euler;
+            for axis in 0..3 {
+                if let Some(value) = self.legacy_euler(axis as u8) {
+                    next[axis] = value;
+                }
+            }
+            t.rotation = Transform::from_euler_degrees(next).rotation;
+        }
+        for (axis, component) in [0u8, 1, 2].into_iter().enumerate() {
+            let value = self
+                .scalar_for(owner, AnimChannel::Scale, component)
+                .unwrap_or(base.scale[axis]);
+            t.scale[axis] = value;
+        }
+        t
+    }
 }
 
 impl AnimationClip {
@@ -1260,52 +1408,107 @@ impl AnimationClip {
         self.tracks.is_empty()
             && self.rotation.as_ref().is_none_or(RotationTrack::is_empty)
             && self.morph_weights.is_empty()
+            && self.legacy_euler_rotation.is_empty()
     }
 
-    pub fn track(&self, property: AnimProperty) -> Option<&AnimationTrack> {
-        self.tracks.iter().find(|t| t.property == property)
+    pub fn track(&self, address: ChannelAddress) -> Option<&AnimationTrack> {
+        self.tracks.iter().find(|t| t.address == address)
     }
 
-    pub fn track_mut(&mut self, property: AnimProperty) -> Option<&mut AnimationTrack> {
-        self.tracks.iter_mut().find(|t| t.property == property)
+    /// Track for one component of `owner`. An address that names the owner
+    /// explicitly wins over an owner-relative track, matching evaluation.
+    pub fn track_for(
+        &self,
+        owner: ChannelTarget,
+        channel: AnimChannel,
+        component: u8,
+    ) -> Option<&AnimationTrack> {
+        self.track(ChannelAddress {
+            target: owner,
+            channel,
+            component,
+        })
+        .or_else(|| self.track(ChannelAddress::owner_unchecked(channel, component)))
+    }
+
+    pub fn track_mut(&mut self, address: ChannelAddress) -> Option<&mut AnimationTrack> {
+        self.tracks.iter_mut().find(|t| t.address == address)
     }
 
     pub fn set_key(
         &mut self,
-        property: AnimProperty,
+        address: ChannelAddress,
         time: f32,
         value: f32,
         interpolation: Interpolation,
     ) {
-        if let Some(track) = self.track_mut(property) {
+        if let Some(track) = self.track_mut(address) {
             track.curve.insert(time, value, interpolation);
         } else {
             let mut curve = Curve::new();
             curve.insert(time, value, interpolation);
-            self.tracks.push(AnimationTrack { property, curve });
+            self.tracks.push(AnimationTrack { address, curve });
         }
     }
 
-    pub fn remove_key(&mut self, property: AnimProperty, time: f32) {
-        if let Some(track) = self.track_mut(property) {
+    pub fn remove_key(&mut self, address: ChannelAddress, time: f32) {
+        if let Some(track) = self.track_mut(address) {
             track.curve.remove_nearest(time);
         }
         self.tracks.retain(|t| !t.curve.keys.is_empty());
     }
 
-    pub fn remove_track(&mut self, property: AnimProperty) {
-        self.tracks.retain(|t| t.property != property);
+    pub fn remove_track(&mut self, address: ChannelAddress) {
+        self.tracks.retain(|t| t.address != address);
     }
 
     pub fn set_rotation_key(
         &mut self,
+        target: ChannelTarget,
         time: f32,
         value: Quat,
         interpolation: Interpolation,
     ) -> usize {
-        self.rotation
-            .get_or_insert_with(RotationTrack::default)
-            .insert(time, value, interpolation)
+        let track = self.rotation.get_or_insert_with(RotationTrack::default);
+        track.target = target;
+        track.insert(time, value, interpolation)
+    }
+
+    /// Curve backing one legacy Euler rotation axis (0 = X, 1 = Y, 2 = Z).
+    pub fn legacy_euler_curve(&self, axis: u8) -> Option<&Curve> {
+        self.legacy_euler_rotation.get(&axis)
+    }
+
+    /// Sample every addressed channel once at `time` into a scratch buffer.
+    pub fn sample_channels(&self, time: f32) -> ChannelSamples {
+        let mut samples = ChannelSamples::default();
+        for track in &self.tracks {
+            samples
+                .scalars
+                .insert(track.address, track.curve.sample(time));
+            samples.sampled += 1;
+        }
+        if let Some(rotation) = &self.rotation {
+            if let Some(value) = rotation.sample(time) {
+                samples.rotations.insert(rotation.target, value);
+                samples.sampled += 1;
+            }
+        }
+        for (axis, curve) in &self.legacy_euler_rotation {
+            samples.legacy_euler.insert(*axis, curve.sample(time));
+            samples.sampled += 1;
+        }
+        samples
+    }
+
+    /// Apply a pre-built buffer to a base transform.
+    pub fn apply_samples(
+        &self,
+        base: Transform,
+        samples: &ChannelSamples,
+        owner: ChannelTarget,
+    ) -> Transform {
+        samples.apply_transform(base, owner)
     }
 
     pub fn remove_rotation_key(&mut self, time: f32) {
@@ -1368,17 +1571,21 @@ impl AnimationClip {
     /// values must match the channel's declared component count.
     pub fn record_channel(
         &mut self,
+        target: ChannelTarget,
         channel: AnimChannel,
         values: &[f32],
         time: f32,
         interpolation: Interpolation,
     ) -> bool {
-        let properties = channel.scalar_properties();
-        if properties.is_empty() || properties.len() != values.len() {
+        let count = channel.scalar_component_count();
+        if count == 0 || count != values.len() {
             return false;
         }
-        for (property, value) in properties.iter().zip(values) {
-            self.set_key(*property, time, *value, interpolation);
+        for (component, value) in values.iter().enumerate() {
+            let Some(address) = ChannelAddress::new(target, channel, component as u8) else {
+                return false;
+            };
+            self.set_key(address, time, *value, interpolation);
         }
         true
     }
@@ -1388,6 +1595,7 @@ impl AnimationClip {
     /// quaternion track or scalar curves.
     pub fn record_transform(
         &mut self,
+        target: ChannelTarget,
         transform: &Transform,
         time: f32,
         interpolation: Interpolation,
@@ -1395,7 +1603,7 @@ impl AnimationClip {
         for channel in AnimChannel::TRANSFORMS {
             match channel {
                 AnimChannel::Rotation => {
-                    self.set_rotation_key(time, transform.rotation, interpolation);
+                    self.set_rotation_key(target, time, transform.rotation, interpolation);
                 }
                 AnimChannel::Translation => {
                     let values = [
@@ -1403,59 +1611,31 @@ impl AnimationClip {
                         transform.translation.y,
                         transform.translation.z,
                     ];
-                    for (property, value) in channel.scalar_properties().iter().zip(values) {
-                        self.set_key(*property, time, value, interpolation);
-                    }
+                    self.record_channel(target, channel, &values, time, interpolation);
                 }
                 AnimChannel::Scale => {
                     let values = [transform.scale.x, transform.scale.y, transform.scale.z];
-                    for (property, value) in channel.scalar_properties().iter().zip(values) {
-                        self.set_key(*property, time, value, interpolation);
-                    }
+                    self.record_channel(target, channel, &values, time, interpolation);
                 }
                 _ => {}
             }
         }
     }
 
-    pub fn sample(&self, property: AnimProperty, time: f32) -> Option<f32> {
-        self.track(property).map(|t| t.curve.sample(time))
+    pub fn sample(&self, address: ChannelAddress, time: f32) -> Option<f32> {
+        self.track(address).map(|t| t.curve.sample(time))
     }
 
-    pub fn sample_or(&self, property: AnimProperty, time: f32, fallback: f32) -> f32 {
-        self.sample(property, time).unwrap_or(fallback)
+    pub fn sample_or(&self, address: ChannelAddress, time: f32, fallback: f32) -> f32 {
+        self.sample(address, time).unwrap_or(fallback)
     }
 
-    /// Apply all transform channels to a base transform at `time`.
+    /// Apply all transform channels for the clip's own owner at `time`. Callers
+    /// that need explicit targets or several components should build a
+    /// `ChannelSamples` buffer once and use `apply_samples`.
     pub fn apply_transform(&self, base: Transform, time: f32) -> Transform {
-        let mut t = base;
-        t.translation.x = self.sample_or(AnimProperty::TranslationX, time, base.translation.x);
-        t.translation.y = self.sample_or(AnimProperty::TranslationY, time, base.translation.y);
-        t.translation.z = self.sample_or(AnimProperty::TranslationZ, time, base.translation.z);
-        if let Some(rotation) = self.sample_rotation(time) {
-            t.rotation = rotation;
-        } else if self.sample(AnimProperty::RotationX, time).is_some()
-            || self.sample(AnimProperty::RotationY, time).is_some()
-            || self.sample(AnimProperty::RotationZ, time).is_some()
-        {
-            // Legacy documents store rotation as three Euler curves. They stay
-            // readable, but new recordings use the quaternion track above.
-            let euler = base.euler_degrees();
-            let rx = self
-                .sample(AnimProperty::RotationX, time)
-                .unwrap_or(euler.x);
-            let ry = self
-                .sample(AnimProperty::RotationY, time)
-                .unwrap_or(euler.y);
-            let rz = self
-                .sample(AnimProperty::RotationZ, time)
-                .unwrap_or(euler.z);
-            t.rotation = Transform::from_euler_degrees(Vec3::new(rx, ry, rz)).rotation;
-        }
-        t.scale.x = self.sample_or(AnimProperty::ScaleX, time, base.scale.x);
-        t.scale.y = self.sample_or(AnimProperty::ScaleY, time, base.scale.y);
-        t.scale.z = self.sample_or(AnimProperty::ScaleZ, time, base.scale.z);
-        t
+        self.sample_channels(time)
+            .apply_transform(base, ChannelTarget::Owner)
     }
 
     pub fn key_times(&self) -> Vec<f32> {
@@ -1469,6 +1649,11 @@ impl AnimationClip {
         }
         times.extend(
             self.morph_weights
+                .values()
+                .flat_map(|curve| curve.keys.iter().map(|key| key.time)),
+        );
+        times.extend(
+            self.legacy_euler_rotation
                 .values()
                 .flat_map(|curve| curve.keys.iter().map(|key| key.time)),
         );
@@ -1533,6 +1718,19 @@ impl AnimationClip {
                 return false;
             }
         }
+        for curve in after.legacy_euler_rotation.values_mut() {
+            if curve.is_empty() {
+                continue;
+            }
+            saw_curve = true;
+            let times: Vec<f32> = curve.keys.iter().map(|key| key.time).collect();
+            if times.iter().all(|time| (*time - pivot).abs() <= 1e-6) {
+                continue;
+            }
+            if !curve.retime_all_keys(pivot, factor) {
+                return false;
+            }
+        }
         if !saw_curve {
             return false;
         }
@@ -1543,11 +1741,19 @@ impl AnimationClip {
     pub fn signature(&self) -> u64 {
         let mut h = StableHasher::new();
         for t in &self.tracks {
-            h.write_u32(t.property as u32);
+            t.address.target.write_signature(&mut h);
+            h.write_u8(
+                AnimChannel::ALL
+                    .iter()
+                    .position(|channel| *channel == t.address.channel)
+                    .unwrap_or(0) as u8,
+            );
+            h.write_u8(t.address.component);
             h.write_u64(t.curve.signature());
         }
         if let Some(rotation) = &self.rotation {
             h.write_u8(0xA7);
+            rotation.target.write_signature(&mut h);
             for key in &rotation.keys {
                 h.write_f32(key.time);
                 h.write_f32(key.value.x);
@@ -1579,7 +1785,162 @@ impl AnimationClip {
             h.write_u32(*target);
             h.write_u64(curve.signature());
         }
+        for (axis, curve) in &self.legacy_euler_rotation {
+            h.write_u8(0xC1);
+            h.write_u8(*axis);
+            h.write_u64(curve.signature());
+        }
         h.finish()
+    }
+}
+
+/// Pre-address track property names. Kept only as a deserialization
+/// compatibility path: they map onto a channel address and, for rotation, onto
+/// the clip-level legacy Euler curves.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyAnimProperty {
+    TranslationX,
+    TranslationY,
+    TranslationZ,
+    RotationX,
+    RotationY,
+    RotationZ,
+    ScaleX,
+    ScaleY,
+    ScaleZ,
+    Fov,
+    LightIntensity,
+    LightColorR,
+    LightColorG,
+    LightColorB,
+    CopyLocationWeight,
+    MaterialRoughness,
+    MaterialMetallic,
+}
+
+impl LegacyAnimProperty {
+    fn channel(self) -> AnimChannel {
+        match self {
+            Self::TranslationX | Self::TranslationY | Self::TranslationZ => {
+                AnimChannel::Translation
+            }
+            Self::RotationX | Self::RotationY | Self::RotationZ => AnimChannel::Rotation,
+            Self::ScaleX | Self::ScaleY | Self::ScaleZ => AnimChannel::Scale,
+            Self::Fov => AnimChannel::Fov,
+            Self::LightIntensity => AnimChannel::LightIntensity,
+            Self::LightColorR | Self::LightColorG | Self::LightColorB => AnimChannel::LightColor,
+            Self::CopyLocationWeight => AnimChannel::CopyLocationWeight,
+            Self::MaterialRoughness => AnimChannel::MaterialRoughness,
+            Self::MaterialMetallic => AnimChannel::MaterialMetallic,
+        }
+    }
+
+    fn component(self) -> u8 {
+        match self {
+            Self::TranslationX | Self::ScaleX | Self::RotationX | Self::LightColorR => 0,
+            Self::TranslationY | Self::ScaleY | Self::RotationY | Self::LightColorG => 1,
+            Self::TranslationZ | Self::ScaleZ | Self::RotationZ | Self::LightColorB => 2,
+            _ => 0,
+        }
+    }
+
+    /// Legacy Euler rotation axes are not addressable: the registry models
+    /// rotation as one quaternion channel.
+    fn legacy_euler_axis(self) -> Option<u8> {
+        match self {
+            Self::RotationX => Some(0),
+            Self::RotationY => Some(1),
+            Self::RotationZ => Some(2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AnimationTrackWire {
+    #[serde(default)]
+    address: Option<ChannelAddress>,
+    #[serde(default)]
+    property: Option<LegacyAnimProperty>,
+    curve: Curve,
+}
+
+type LegacyTrack = (u8, Curve);
+
+fn resolve_track(
+    wire: AnimationTrackWire,
+) -> Result<Result<AnimationTrack, LegacyTrack>, &'static str> {
+    if let Some(address) = wire.address {
+        return Ok(Ok(AnimationTrack {
+            address,
+            curve: wire.curve,
+        }));
+    }
+    let Some(property) = wire.property else {
+        return Err("animation track needs an address");
+    };
+    if let Some(axis) = property.legacy_euler_axis() {
+        return Ok(Err((axis, wire.curve)));
+    }
+    let address = ChannelAddress::owner(property.channel(), property.component())
+        .ok_or("legacy animation property has no channel component")?;
+    Ok(Ok(AnimationTrack {
+        address,
+        curve: wire.curve,
+    }))
+}
+
+impl<'de> Deserialize<'de> for AnimationTrack {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let wire = AnimationTrackWire::deserialize(deserializer)?;
+        match resolve_track(wire).map_err(D::Error::custom)? {
+            Ok(track) => Ok(track),
+            Err(_) => Err(D::Error::custom(
+                "legacy Euler rotation tracks belong to the clip's legacy rotation curves",
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AnimationClipWire {
+    #[serde(default)]
+    tracks: Vec<AnimationTrackWire>,
+    #[serde(default)]
+    rotation: Option<RotationTrack>,
+    #[serde(default)]
+    morph_weights: BTreeMap<u32, Curve>,
+    #[serde(default)]
+    legacy_euler_rotation: BTreeMap<u8, Curve>,
+}
+
+impl<'de> Deserialize<'de> for AnimationClip {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let wire = AnimationClipWire::deserialize(deserializer)?;
+        let mut clip = AnimationClip {
+            tracks: Vec::with_capacity(wire.tracks.len()),
+            rotation: wire.rotation,
+            morph_weights: wire.morph_weights,
+            legacy_euler_rotation: wire.legacy_euler_rotation,
+        };
+        for track in wire.tracks {
+            match resolve_track(track).map_err(D::Error::custom)? {
+                Ok(track) => clip.tracks.push(track),
+                Err((axis, curve)) => {
+                    clip.legacy_euler_rotation.insert(axis, curve);
+                }
+            }
+        }
+        Ok(clip)
     }
 }
 
@@ -1680,7 +2041,10 @@ mod tests {
         // partially keyed clip must keep the other authored axes in the same
         // unit instead of falling back to radians.
         let mut clip = AnimationClip::default();
-        clip.set_key(AnimProperty::RotationY, 0.0, 90.0, Interpolation::Linear);
+        let mut curve = Curve::new();
+        curve.insert(0.0, 90.0, Interpolation::Linear);
+        clip.legacy_euler_rotation.insert(1, curve);
+        assert!(!clip.is_empty());
         let base = Transform::from_euler_degrees(Vec3::new(30.0, 0.0, 0.0));
         let applied = clip.apply_transform(base, 0.0).euler_degrees();
         assert!((applied.x - 30.0).abs() < 1e-3, "x {applied:?}");
@@ -1941,22 +2305,43 @@ mod tests {
     #[test]
     fn retime_all_moves_rotation_morph_and_scalar_channels_together() {
         let mut clip = AnimationClip::default();
-        clip.set_key(AnimProperty::TranslationX, 0.0, 0.0, Interpolation::Smooth);
-        clip.set_key(AnimProperty::TranslationX, 1.0, 1.0, Interpolation::Smooth);
+        clip.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            0.0,
+            Interpolation::Smooth,
+        );
+        clip.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            1.0,
+            Interpolation::Smooth,
+        );
         clip.set_morph_weight_key(0, 0.0, 0.0, Interpolation::Linear);
         clip.set_morph_weight_key(0, 2.0, 1.0, Interpolation::Linear);
-        clip.set_rotation_key(0.0, Quat::IDENTITY, Interpolation::Linear);
         clip.set_rotation_key(
+            ChannelTarget::Owner,
+            0.0,
+            Quat::IDENTITY,
+            Interpolation::Linear,
+        );
+        clip.set_rotation_key(
+            ChannelTarget::Owner,
             2.0,
             Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
             Interpolation::Linear,
         );
-        let curve = &mut clip.track_mut(AnimProperty::TranslationX).unwrap().curve;
+        let curve = &mut clip
+            .track_mut(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+            .unwrap()
+            .curve;
         assert!(curve.set_manual_tangents(0.0, 0.0, 1.0));
         let old_rotation_mid = clip.sample_rotation(1.0).unwrap();
 
         assert!(clip.retime_all(0.0, 2.0));
-        let scalar = clip.track(AnimProperty::TranslationX).unwrap();
+        let scalar = clip
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+            .unwrap();
         assert!((scalar.curve.keys[1].time - 2.0).abs() < 1e-6);
         assert!((scalar.curve.keys[0].tangent_out - 0.5).abs() < 1e-6);
         assert!((clip.sample_morph_weight(0, 2.0).unwrap() - 0.5).abs() < 1e-5);
@@ -1981,15 +2366,30 @@ mod tests {
     fn clip_applies_transform_channels() {
         let base = Transform::from_translation(Vec3::ZERO);
         let mut clip = AnimationClip::default();
-        clip.set_key(AnimProperty::TranslationX, 0.0, 0.0, Interpolation::Linear);
         clip.set_key(
-            AnimProperty::TranslationX,
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            0.0,
+            Interpolation::Linear,
+        );
+        clip.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
             10.0,
             20.0,
             Interpolation::Linear,
         );
-        clip.set_key(AnimProperty::RotationZ, 0.0, 0.0, Interpolation::Linear);
-        clip.set_key(AnimProperty::RotationZ, 10.0, 90.0, Interpolation::Linear);
+        clip.set_rotation_key(
+            ChannelTarget::Owner,
+            0.0,
+            Quat::IDENTITY,
+            Interpolation::Linear,
+        );
+        clip.set_rotation_key(
+            ChannelTarget::Owner,
+            10.0,
+            Quat::from_rotation_z(90f32.to_radians()),
+            Interpolation::Linear,
+        );
         let t = clip.apply_transform(base, 5.0);
         assert!((t.translation.x - 10.0).abs() < 1e-5);
         let rotated = t.transform_vector(Vec3::X);
@@ -2053,8 +2453,8 @@ mod tests {
         let negated = Quat::from_xyzw(-q.x, -q.y, -q.z, -q.w);
         for interpolation in [Interpolation::Linear, Interpolation::Smooth] {
             let mut clip = AnimationClip::default();
-            clip.set_rotation_key(0.0, q, interpolation);
-            clip.set_rotation_key(1.0, negated, interpolation);
+            clip.set_rotation_key(ChannelTarget::Owner, 0.0, q, interpolation);
+            clip.set_rotation_key(ChannelTarget::Owner, 1.0, negated, interpolation);
             for time in [0.25, 0.5, 0.75] {
                 let sampled = clip.sample_rotation(time).expect("rotation sample");
                 // q and -q are the same orientation, so every sample must keep it.
@@ -2070,13 +2470,20 @@ mod tests {
     #[test]
     fn multi_key_rotation_track_samples_non_key_frames() {
         let mut clip = AnimationClip::default();
-        clip.set_rotation_key(0.0, Quat::IDENTITY, Interpolation::Linear);
         clip.set_rotation_key(
+            ChannelTarget::Owner,
+            0.0,
+            Quat::IDENTITY,
+            Interpolation::Linear,
+        );
+        clip.set_rotation_key(
+            ChannelTarget::Owner,
             1.0,
             Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
             Interpolation::Linear,
         );
         clip.set_rotation_key(
+            ChannelTarget::Owner,
             2.0,
             Quat::from_rotation_y(std::f32::consts::PI),
             Interpolation::Linear,
@@ -2105,10 +2512,53 @@ mod tests {
     }
 
     #[test]
+    fn rotation_continuity_across_the_half_turn_uses_the_short_path() {
+        // +170° to -170° is a 20° turn through ±180°, not a 340° sweep back
+        // through zero. Both interpolators must take the short path and keep
+        // adjacent samples in one quaternion hemisphere.
+        let start = Quat::from_rotation_y(170f32.to_radians());
+        let end = Quat::from_rotation_y(-170f32.to_radians());
+        let across = Quat::from_rotation_y(std::f32::consts::PI);
+        for interpolation in [Interpolation::Linear, Interpolation::Smooth] {
+            let mut clip = AnimationClip::default();
+            clip.set_rotation_key(ChannelTarget::Owner, 0.0, start, interpolation);
+            clip.set_rotation_key(ChannelTarget::Owner, 1.0, end, interpolation);
+            let mut previous = clip.sample_rotation(0.0).unwrap();
+            for step in 1..=20 {
+                let sampled = clip.sample_rotation(step as f32 / 20.0).unwrap();
+                assert!((sampled.length() - 1.0).abs() < 1e-5);
+                // q and -q are the same orientation. Track the orientation,
+                // not the stored sign, and require the whole path to stay on
+                // the 170-180 degree short arc instead of sweeping through 0.
+                let angle = quat_angle(sampled).to_degrees();
+                assert!(
+                    (170.0..=180.0).contains(&angle),
+                    "{interpolation:?} left the short arc at step {step}: {angle}°"
+                );
+                assert!(
+                    sampled.dot(previous).abs() > 0.99,
+                    "{interpolation:?} jumped orientation at step {step}"
+                );
+                previous = sampled;
+            }
+            let midpoint = clip.sample_rotation(0.5).unwrap();
+            assert!(
+                midpoint.dot(across).abs() > 0.999,
+                "{interpolation:?} did not pass through ±180°: {midpoint:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rotation_tangent_types_change_the_cubic_derivation() {
         let mut smooth = AnimationClip::default();
         for (time, angle) in [(0.0, 0.0), (1.0, 0.4), (3.0, 0.8)] {
-            smooth.set_rotation_key(time, Quat::from_rotation_y(angle), Interpolation::Smooth);
+            smooth.set_rotation_key(
+                ChannelTarget::Owner,
+                time,
+                Quat::from_rotation_y(angle),
+                Interpolation::Smooth,
+            );
         }
         let smooth_half = quat_angle(smooth.sample_rotation(0.5).unwrap());
 
@@ -2150,15 +2600,23 @@ mod tests {
             AnimChannel::MaterialRoughness.scope(),
             ChannelScope::Material
         );
-        assert_eq!(AnimChannel::Translation.scalar_properties().len(), 3);
-        assert!(AnimChannel::Rotation.scalar_properties().is_empty());
+        assert_eq!(AnimChannel::Translation.scalar_component_count(), 3);
+        assert_eq!(AnimChannel::Rotation.scalar_component_count(), 0);
         assert_eq!(
-            AnimChannel::from_scalar_property(AnimProperty::ScaleZ),
-            Some(AnimChannel::Scale)
+            ChannelAddress::owner(AnimChannel::Scale, 2),
+            Some(ChannelAddress::owner_component(AnimChannel::Scale, 2))
+        );
+        // The registry refuses components it does not declare and channels
+        // without scalar components.
+        assert!(ChannelAddress::new(ChannelTarget::Owner, AnimChannel::Translation, 3).is_none());
+        assert!(ChannelAddress::owner(AnimChannel::Rotation, 0).is_none());
+        assert_eq!(
+            AnimChannel::MaterialMetallic.component_label(0).as_deref(),
+            Some("Material Metallic")
         );
         assert_eq!(
-            AnimChannel::from_scalar_property(AnimProperty::MaterialMetallic),
-            Some(AnimChannel::MaterialMetallic)
+            AnimChannel::LightColor.component_label(1).as_deref(),
+            Some("Light Color G")
         );
     }
 
@@ -2170,16 +2628,90 @@ mod tests {
             rotation: Quat::from_rotation_z(0.5),
             scale: Vec3::splat(2.0),
         };
-        clip.record_transform(&transform, 0.25, Interpolation::Linear);
+        let target = ChannelTarget::Object { id: 7 };
+        clip.record_transform(target, &transform, 0.25, Interpolation::Linear);
         let rotation = clip.rotation.as_ref().expect("quaternion track");
         assert_eq!(rotation.keys.len(), 1);
+        assert_eq!(rotation.target, target);
         assert!(rotation.keys[0].value.dot(transform.rotation).abs() > 0.9999);
-        assert!(clip.track(AnimProperty::RotationX).is_none());
+        assert!(clip.legacy_euler_rotation.is_empty());
         assert_eq!(
-            clip.track(AnimProperty::TranslationY).unwrap().curve.keys[0].value,
+            clip.track_for(target, AnimChannel::Translation, 1)
+                .unwrap()
+                .curve
+                .keys[0]
+                .value,
             2.0
         );
-        let applied = clip.apply_transform(Transform::IDENTITY, 0.25);
+        let samples = clip.sample_channels(0.25);
+        let applied = clip.apply_samples(Transform::IDENTITY, &samples, target);
         assert!(applied.rotation.dot(transform.rotation).abs() > 0.9999);
+    }
+
+    #[test]
+    fn sample_buffer_evaluates_each_addressed_curve_once() {
+        let mut clip = AnimationClip::default();
+        for (component, value) in [4.0f32, 5.0, 6.0].into_iter().enumerate() {
+            clip.set_key(
+                ChannelAddress::owner_component(AnimChannel::Translation, component as u8),
+                0.0,
+                value,
+                Interpolation::Linear,
+            );
+        }
+        clip.set_key(
+            ChannelAddress::owner_component(AnimChannel::Scale, 0),
+            0.0,
+            2.0,
+            Interpolation::Linear,
+        );
+        clip.set_rotation_key(
+            ChannelTarget::Owner,
+            0.0,
+            Quat::from_rotation_y(0.5),
+            Interpolation::Linear,
+        );
+
+        let samples = clip.sample_channels(0.0);
+        // Four scalar tracks plus one quaternion track, not seven scalar
+        // components plus four quaternion values.
+        assert_eq!(samples.sampled_curves(), 5);
+        assert_eq!(samples.len(), 5);
+
+        let base = Transform {
+            translation: Vec3::splat(9.0),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::splat(9.0),
+        };
+        let applied = samples.apply_transform(base, ChannelTarget::Owner);
+        assert_eq!(applied.translation, Vec3::new(4.0, 5.0, 6.0));
+        assert!((applied.scale.x - 2.0).abs() < 1e-6);
+        assert!((applied.scale.y - 9.0).abs() < 1e-6);
+        assert!(applied.rotation.dot(Quat::from_rotation_y(0.5)).abs() > 0.9999);
+
+        // Reading a component again only reads the buffer.
+        assert_eq!(
+            samples.scalar_for(ChannelTarget::Owner, AnimChannel::Translation, 2),
+            Some(6.0)
+        );
+        assert_eq!(samples.sampled_curves(), 5);
+
+        // The same clip and time always produce the same buffer.
+        assert_eq!(clip.sample_channels(0.0), samples);
+    }
+
+    #[test]
+    fn explicit_target_addresses_apply_only_to_their_target() {
+        let mut clip = AnimationClip::default();
+        let address =
+            ChannelAddress::new(ChannelTarget::Object { id: 5 }, AnimChannel::Translation, 0)
+                .expect("registry declares translation X");
+        clip.set_key(address, 0.0, 3.0, Interpolation::Linear);
+
+        let samples = clip.sample_channels(0.0);
+        let owner = samples.apply_transform(Transform::IDENTITY, ChannelTarget::Object { id: 5 });
+        assert_eq!(owner.translation.x, 3.0);
+        let other = samples.apply_transform(Transform::IDENTITY, ChannelTarget::Object { id: 6 });
+        assert_eq!(other.translation.x, 0.0, "an explicit target does not leak");
     }
 }

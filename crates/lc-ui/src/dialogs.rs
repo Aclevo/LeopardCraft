@@ -119,6 +119,60 @@ impl LeopardApp {
         }
     }
 
+    /// Show the skipped-data report before a glTF import touches the scene, so
+    /// the user can cancel without having to undo the import afterwards.
+    pub(super) fn show_import_report_dialog(&mut self, ctx: &egui::Context) {
+        let Some((name, summary, replace_scene)) = self.pending_import.as_ref().map(|p| {
+            (
+                p.path.display().to_string(),
+                p.summary.clone(),
+                p.replace_scene,
+            )
+        }) else {
+            return;
+        };
+        let mut choice = None;
+        egui::Window::new("Import Report")
+            .id(egui::Id::new("import_report_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(440.0);
+                ui.label(format!("Reading {name}"));
+                ui.add_space(6.0);
+                ui.label(summary);
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("The scene has not been changed yet.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let proceed = if replace_scene {
+                        "Open Anyway"
+                    } else {
+                        "Import Anyway"
+                    };
+                    if ui.button(proceed).clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            choice = Some(false);
+        }
+        match choice {
+            Some(true) => self.apply_pending_import(),
+            Some(false) => self.cancel_pending_import(),
+            None => {}
+        }
+    }
+
     pub(super) fn show_recovery_dialog(&mut self, ctx: &egui::Context) {
         let Some(recovered) = self.lifecycle.recovery_prompt() else {
             return;

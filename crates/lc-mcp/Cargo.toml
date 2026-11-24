@@ -5,9 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lc-anim = { path = "../lc-anim" }
 lc-core = { path = "../lc-core" }
+lc-geom = { path = "../lc-geom" }
 lc-scene = { path = "../lc-scene" }
 lc-render = { path = "../lc-render" }
 lc-io = { path = "../lc-io" }
+lc-shading = { path = "../lc-shading" }
 glam.workspace = true
 serde_json.workspace = true

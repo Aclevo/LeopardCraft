@@ -108,6 +108,20 @@ pub fn export(path: impl AsRef<Path>, doc: &Document) -> Result<(), String> {
     }
     let mut out = String::new();
     writeln!(out, "# LeopardCraft OBJ export").ok();
+    let skipped_uv_sets: usize = evaluated
+        .mesh_nodes()
+        .filter_map(|node| node.mesh())
+        .map(|mesh| mesh.extra_uvs.len())
+        .sum();
+    if skipped_uv_sets > 0 {
+        // OBJ has one texture-coordinate channel; say so instead of silently
+        // dropping the lightmap sets a document carries.
+        writeln!(
+            out,
+            "# skipped {skipped_uv_sets} additional UV set(s); OBJ writes UV0 only"
+        )
+        .ok();
+    }
     writeln!(out, "mtllib {mtl_name}").ok();
     let mut v_offset = 1usize;
     let mut vt_offset = 1usize;
@@ -1064,6 +1078,44 @@ mod tests {
         assert!(mtl.is_file());
         assert_exact_dir_contents(&dir, &["model.mtl", "model.obj"]);
         assert!(import(&obj).unwrap().mesh_node_count() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn obj_export_reports_skipped_additional_uv_sets() {
+        let dir = temp_dir("skipped-uv-sets");
+        let obj = dir.join("model.obj");
+        let mut doc = Document::empty();
+        let mut mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        lc_geom::box_projection(&mut mesh, 1.0);
+        mesh.add_uv_set();
+        doc.append_node(
+            lc_scene::NodeKind::Mesh {
+                geometry: lc_scene::GeometrySource::editable(mesh),
+            },
+            "Lightmapped",
+            None,
+        );
+        export(&obj, &doc).unwrap();
+        let text = std::fs::read_to_string(&obj).unwrap();
+        assert!(
+            text.contains("# skipped 1 additional UV set(s); OBJ writes UV0 only"),
+            "OBJ names the set it cannot carry"
+        );
+        let plain = dir.join("plain.obj");
+        let mut plain_mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        lc_geom::box_projection(&mut plain_mesh, 1.0);
+        let mut plain_doc = Document::empty();
+        plain_doc.append_node(
+            lc_scene::NodeKind::Mesh {
+                geometry: lc_scene::GeometrySource::editable(plain_mesh),
+            },
+            "Plain",
+            None,
+        );
+        export(&plain, &plain_doc).unwrap();
+        let plain_text = std::fs::read_to_string(&plain).unwrap();
+        assert!(!plain_text.contains("skipped"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

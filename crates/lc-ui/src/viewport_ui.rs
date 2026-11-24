@@ -27,6 +27,12 @@ impl LeopardApp {
         if redo {
             self.redo();
         }
+        if self.scalpel_tool
+            && self.scalpel_start.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::default(), egui::Key::Escape))
+        {
+            self.scalpel_cancel();
+        }
         let typing = ctx.text_edit_focused();
         let native_copy = ctx.input(|i| i.events.contains(&egui::Event::Copy));
         let native_paste = ctx.input(|i| {
@@ -448,6 +454,39 @@ impl LeopardApp {
             }
         }
 
+        // Creased edges stay visible outside Edge mode, so the subdivisions a
+        // user will get are readable while modelling in point or polygon mode.
+        if !(self.mesh_edit && self.mesh_select_mode == MeshSelectMode::Edges) {
+            for node in evaluated.mesh_nodes() {
+                let Some(mesh) = node.mesh() else {
+                    continue;
+                };
+                let smooth = Vec3::new(0.42, 0.52, 0.64);
+                let sharp = Vec3::new(0.30, 0.68, 1.0);
+                for [a, b] in &mesh.creases {
+                    let (Some(a), Some(b)) = (
+                        mesh.positions.get(*a as usize),
+                        mesh.positions.get(*b as usize),
+                    ) else {
+                        continue;
+                    };
+                    lines.push(Vertex::new(node.world.transform_point3(*a), Vec3::Y, sharp));
+                    lines.push(Vertex::new(node.world.transform_point3(*b), Vec3::Y, sharp));
+                }
+                for ([a, b], weight) in mesh.crease_weights.iter() {
+                    let (Some(a), Some(b)) = (
+                        mesh.positions.get(*a as usize),
+                        mesh.positions.get(*b as usize),
+                    ) else {
+                        continue;
+                    };
+                    let color = smooth.lerp(sharp, weight.clamp(0.0, 1.0));
+                    lines.push(Vertex::new(node.world.transform_point3(*a), Vec3::Y, color));
+                    lines.push(Vertex::new(node.world.transform_point3(*b), Vec3::Y, color));
+                }
+            }
+        }
+
         if self.show_helpers {
             for light in &evaluated.lights {
                 let pos = light.world.w_axis.truncate();
@@ -501,6 +540,45 @@ impl LeopardApp {
             eye: self.orbit.eye(),
             light_dir,
         }
+    }
+
+    /// Screen-space radius of a joint picking handle, in points.
+    const JOINT_HANDLE_RADIUS: f32 = 9.0;
+
+    /// Nearest joint of the primary mesh's skin whose viewport handle is under
+    /// `pointer`. The drawn handle list and the pick list are the same, so an
+    /// unbound joint can never become the active joint from a click.
+    pub(super) fn pick_joint_handle(
+        &self,
+        evaluated: &EvaluatedScene,
+        rect: Rect,
+        pixel_w: u32,
+        pixel_h: u32,
+        pointer: Pos2,
+    ) -> Option<NodeId> {
+        let skin = self
+            .doc
+            .scene
+            .get(self.selection.primary()?)?
+            .skin
+            .as_ref()?;
+        let mut best: Option<(f32, NodeId)> = None;
+        for joint in &skin.joints {
+            let Some(node) = evaluated.node(*joint) else {
+                continue;
+            };
+            let Some(screen) = self.project(node.world.w_axis.truncate(), rect, pixel_w, pixel_h)
+            else {
+                continue;
+            };
+            let distance = (screen - pointer).length();
+            if distance <= Self::JOINT_HANDLE_RADIUS
+                && best.is_none_or(|(nearest, _)| distance < nearest)
+            {
+                best = Some((distance, *joint));
+            }
+        }
+        best.map(|(_, joint)| joint)
     }
 
     pub(super) fn handle_viewport_input(
@@ -618,6 +696,41 @@ impl LeopardApp {
         if response.clicked_by(egui::PointerButton::Primary) {
             if let Some(pointer) = pointer {
                 if self.mesh_edit {
+                    if self.scalpel_tool {
+                        if let Some((id, mesh)) = self.selected_editable_mesh() {
+                            if let Some(node) = evaluated.node(id) {
+                                if let Some(pick) = self.pick_scalpel_pick(
+                                    &mesh, node.world, rect, pixel_w, pixel_h, pointer,
+                                ) {
+                                    let face = self.pick_mesh_face(
+                                        &mesh, node.world, rect, pixel_w, pixel_h, pointer,
+                                    );
+                                    self.scalpel_click_at(pick, face);
+                                } else {
+                                    self.status = "Click a point or edge of a polygon".into();
+                                }
+                            }
+                        } else {
+                            self.status = "Select an editable mesh first".into();
+                        }
+                        return;
+                    }
+                    if self.fill_hole_tool {
+                        if let Some((id, mesh)) = self.selected_editable_mesh() {
+                            if let Some(node) = evaluated.node(id) {
+                                if let Some(point) = self.pick_boundary_point(
+                                    &mesh, node.world, rect, pixel_w, pixel_h, pointer,
+                                ) {
+                                    self.fill_hole_at(point);
+                                } else {
+                                    self.status = "Click a point on an open hole border".into();
+                                }
+                            }
+                        } else {
+                            self.status = "Select an editable mesh first".into();
+                        }
+                        return;
+                    }
                     if let Some((id, mesh)) = self.selected_editable_mesh() {
                         if let Some(node) = evaluated.node(id) {
                             if let Some(hit) = self.pick_mesh_component(
@@ -634,6 +747,12 @@ impl LeopardApp {
                             }
                         }
                     }
+                    return;
+                }
+                if let Some(joint) =
+                    self.pick_joint_handle(evaluated, rect, pixel_w, pixel_h, pointer)
+                {
+                    self.set_active_weight_joint_node(joint);
                     return;
                 }
                 if let Some(id) = self.pick(evaluated, rect, pixel_w, pixel_h, pointer) {
@@ -1059,6 +1178,40 @@ impl LeopardApp {
             {
                 painter.circle_filled(origin, 2.6, Color32::from_rgb(245, 248, 255));
                 painter.circle_stroke(origin, 4.2, egui::Stroke::new(1.2, theme::SELECTION));
+            }
+        }
+        if let Some(primary) = self.selection.primary() {
+            if let Some(skin) = self
+                .doc
+                .scene
+                .get(primary)
+                .and_then(|node| node.skin.as_ref())
+            {
+                let active = self.active_weight_joint();
+                for (index, joint) in skin.joints.iter().enumerate() {
+                    let Some(node) = evaluated.node(*joint) else {
+                        continue;
+                    };
+                    let Some(screen) =
+                        self.project(node.world.w_axis.truncate(), rect, pixel_w, pixel_h)
+                    else {
+                        continue;
+                    };
+                    if active == Some(index) {
+                        painter.circle_filled(screen, 4.6, Color32::from_rgb(245, 150, 60));
+                        painter.circle_stroke(
+                            screen,
+                            6.4,
+                            egui::Stroke::new(1.2, Color32::from_rgb(255, 220, 170)),
+                        );
+                    } else {
+                        painter.circle_stroke(
+                            screen,
+                            4.2,
+                            egui::Stroke::new(1.4, Color32::from_rgb(210, 190, 150)),
+                        );
+                    }
+                }
             }
         }
         if let Some(origin) = self.selection_pivot(evaluated) {

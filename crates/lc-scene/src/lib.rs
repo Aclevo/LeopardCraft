@@ -14,7 +14,8 @@ pub mod undo;
 
 pub use camera::{Camera, ProjectionMode};
 pub use document::{
-    Document, DocumentSettings, Environment, Layer, RenderSettings, FORMAT_NAME, FORMAT_VERSION,
+    Document, DocumentSettings, Environment, Layer, RenderSettings, Take, TakeClips, TakeState,
+    TakeTagClip, FORMAT_NAME, FORMAT_VERSION,
 };
 pub use eval::{
     aim_at, EvaluatedCamera, EvaluatedGeometry, EvaluatedKind, EvaluatedLight, EvaluatedNode,
@@ -25,7 +26,8 @@ pub use format::{
     take_warnings, to_json,
 };
 pub use geometry::{
-    CsgOperation, GeometrySource, Modifier, ModifierInput, Primitive, SubdivisionScheme,
+    CsgOperation, DeformCage, DeformLimit, GeometrySource, Modifier, ModifierInput, Primitive,
+    SubdivisionScheme,
 };
 pub use ik::{
     bake_ik_edits, bake_ik_range_edits, ik_chain_joints, solve_chain, IkChain, IkSolution,
@@ -40,5 +42,5 @@ pub use undo::{
     AddMaterialCmd, AddNodeCmd, AddNodesCmd, Command, DeleteNodeCmd, History, RemoveMaterialCmd,
     RenameNodeCmd, ReparentCmd, ReplaceDocumentCmd, SetAnimationCmd, SetAnimationsCmd,
     SetMaterialCmd, SetMorphCmd, SetNodePropsCmd, SetNodesPropsCmd, SetSettingsCmd, SetShapeCmd,
-    SetShapesCmd, SetTagAnimationCmd, SetTransformCmd, SetTransformsCmd, Shape,
+    SetShapesCmd, SetTagAnimationCmd, SetTakesCmd, SetTransformCmd, SetTransformsCmd, Shape,
 };

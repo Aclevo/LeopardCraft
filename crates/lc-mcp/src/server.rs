@@ -3,6 +3,7 @@
 use crate::tools;
 use lc_scene::{Document, History};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,8 @@ pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
 pub const SERVER_NAME: &str = "leopardcraft";
 pub const SCENE_URI: &str = "leopardcraft://scene";
 pub const SUMMARY_URI: &str = "leopardcraft://scene/summary";
+/// Default address for the opt-in Streamable HTTP transport.
+pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8765";
 
 const INSTRUCTIONS: &str = "LeopardCraft is an offline 3D modelling application. \
 Call get_scene or list_objects before editing. Object arguments accept a numeric id or an exact name. \
@@ -25,6 +28,8 @@ pub struct McpServer {
     pub(crate) path: Option<PathBuf>,
     pub(crate) history: History,
     pub(crate) dirty: bool,
+    subscriptions: BTreeSet<String>,
+    pending: Vec<Value>,
 }
 
 impl McpServer {
@@ -35,7 +40,19 @@ impl McpServer {
             path,
             history: History::new(256),
             dirty,
+            subscriptions: BTreeSet::new(),
+            pending: Vec::new(),
         }
+    }
+
+    /// Take the notifications queued since the last call. Transports write them
+    /// after the response that caused them.
+    pub fn take_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending)
+    }
+
+    pub fn has_subscriptions(&self) -> bool {
+        !self.subscriptions.is_empty()
     }
 
     pub fn document(&self) -> &Document {
@@ -94,6 +111,13 @@ impl McpServer {
             ));
         }
         let params = object.get("params").cloned().unwrap_or(Value::Null);
+        // Only subscribed clients pay for a signature comparison, and only the
+        // request that changed the document queues an update.
+        let revision = if self.subscriptions.is_empty() {
+            None
+        } else {
+            Some(self.doc.signature())
+        };
 
         let result = match method.as_str() {
             "initialize" => Ok(initialize_result()),
@@ -104,9 +128,15 @@ impl McpServer {
             "resources/list" => Ok(resources_list_result()),
             "resources/templates/list" => Ok(cacheable(json!({ "resourceTemplates": [] }))),
             "resources/read" => self.read_resource(&params),
-            "prompts/list" => Ok(cacheable(json!({ "prompts": [] }))),
+            "resources/subscribe" => self.subscribe(&params),
+            "resources/unsubscribe" => self.unsubscribe(&params),
+            "prompts/list" => Ok(prompts_list_result()),
+            "prompts/get" => self.prompt(&params),
             other => Err((-32601, format!("Method not found: {other}"))),
         };
+        if let Some(before) = revision {
+            self.track_resource_updates(before);
+        }
 
         Some(match result {
             Ok(result) => success_response(id, result),
@@ -121,6 +151,20 @@ impl McpServer {
         self.serve(stdin.lock(), stdout.lock())
     }
 
+    /// Run the opt-in Streamable HTTP transport on a loopback address. The
+    /// endpoint is printed to stdout, which is not the protocol channel here.
+    pub fn serve_http(self, addr: &str) -> Result<(), String> {
+        let transport = crate::http::HttpTransport::bind(addr, self)?;
+        println!(
+            "MCP Streamable HTTP endpoint: http://{}/mcp",
+            transport.local_addr()?
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("failed to report the endpoint: {error}"))?;
+        transport.serve()
+    }
+
     /// Transport loop over any buffered reader/writer pair, used by tests.
     pub fn serve<R: BufRead, W: Write>(&mut self, reader: R, mut writer: W) -> Result<(), String> {
         for line in reader.lines() {
@@ -128,12 +172,50 @@ impl McpServer {
             if let Some(response) = self.handle_line(&line) {
                 writeln!(writer, "{response}")
                     .map_err(|error| format!("failed to write stdout: {error}"))?;
-                writer
-                    .flush()
-                    .map_err(|error| format!("failed to flush stdout: {error}"))?;
             }
+            self.flush_notifications(&mut writer)?;
         }
-        Ok(())
+        self.flush_notifications(&mut writer)
+    }
+
+    /// Write queued notifications as extra newline-delimited protocol lines.
+    fn flush_notifications<W: Write>(&mut self, writer: &mut W) -> Result<(), String> {
+        for notification in self.take_notifications() {
+            writeln!(writer, "{}", serialize(notification))
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("failed to flush stdout: {error}"))
+    }
+
+    /// Subscribe to a resource, refusing unknown URIs as invalid params.
+    fn subscribe(&mut self, params: &Value) -> Result<Value, (i64, String)> {
+        let uri = known_resource_uri(params)?;
+        self.subscriptions.insert(uri);
+        Ok(json!({}))
+    }
+
+    fn unsubscribe(&mut self, params: &Value) -> Result<Value, (i64, String)> {
+        let uri = known_resource_uri(params)?;
+        self.subscriptions.remove(&uri);
+        Ok(json!({}))
+    }
+
+    /// Queue one `notifications/resources/updated` per subscription when a
+    /// request changed the document.
+    fn track_resource_updates(&mut self, before: u64) {
+        let after = self.doc.signature();
+        if after == before {
+            return;
+        }
+        for uri in &self.subscriptions {
+            self.pending.push(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": { "uri": uri }
+            }));
+        }
     }
 
     fn call_tool(&mut self, params: &Value) -> Result<Value, (i64, String)> {
@@ -203,8 +285,22 @@ fn server_meta() -> Value {
 fn capabilities() -> Value {
     json!({
         "tools": { "listChanged": false },
-        "resources": { "subscribe": false, "listChanged": false }
+        "resources": { "subscribe": true, "listChanged": false },
+        "prompts": { "listChanged": false }
     })
+}
+
+/// Validate the `uri` of a subscription request against the resources this
+/// server publishes.
+fn known_resource_uri(params: &Value) -> Result<String, (i64, String)> {
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or((-32602, "Missing resource uri".to_string()))?;
+    match uri {
+        SCENE_URI | SUMMARY_URI => Ok(uri.to_string()),
+        other => Err((-32602, format!("Resource not found: {other}"))),
+    }
 }
 
 fn initialize_result() -> Value {
@@ -265,6 +361,35 @@ fn tool_error(message: String) -> Value {
         "content": [{ "type": "text", "text": message }],
         "isError": true
     })
+}
+
+fn prompts_list_result() -> Value {
+    cacheable(json!({
+        "prompts": [
+            {
+                "name": "scene_overview",
+                "title": "LeopardCraft scene overview",
+                "description": "Summarise the open document: object counts, bounds, materials and render settings.",
+                "arguments": []
+            },
+            {
+                "name": "object_report",
+                "title": "LeopardCraft object report",
+                "description": "Describe one object's transform, modifiers, material and animation state.",
+                "arguments": [{
+                    "name": "object",
+                    "description": "Object id or exact name.",
+                    "required": true
+                }]
+            },
+            {
+                "name": "render_check",
+                "title": "LeopardCraft render check",
+                "description": "Review the render settings and prepare a deterministic render_image call.",
+                "arguments": []
+            }
+        ]
+    }))
 }
 
 fn resources_list_result() -> Value {
@@ -344,6 +469,14 @@ mod tests {
             response["result"]["capabilities"]["tools"]["listChanged"],
             false
         );
+        assert_eq!(
+            response["result"]["capabilities"]["resources"]["subscribe"],
+            true
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["prompts"]["listChanged"],
+            false
+        );
         assert_eq!(response["result"]["resultType"], "complete");
         assert!(response["result"]["instructions"]
             .as_str()
@@ -416,6 +549,20 @@ mod tests {
             "rename_object",
             "delete_object",
             "set_object_properties",
+            "add_modifier",
+            "update_modifier",
+            "remove_modifier",
+            "move_modifier",
+            "get_material",
+            "create_material",
+            "update_material",
+            "get_animation",
+            "set_animation_key",
+            "remove_animation_key",
+            "create_take",
+            "activate_take",
+            "update_take",
+            "delete_take",
             "list_materials",
             "undo",
             "redo",
@@ -578,6 +725,171 @@ mod tests {
             json!({ "uri": "leopardcraft://missing" }),
         );
         assert_eq!(missing["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn resource_subscriptions_track_document_changes() {
+        let mut server = server();
+        let response = request(
+            &mut server,
+            "resources/subscribe",
+            json!({ "uri": SCENE_URI }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["resultType"], "complete");
+        assert!(
+            server.take_notifications().is_empty(),
+            "subscribing is not a document change"
+        );
+        request(&mut server, "resources/list", json!({}));
+        assert!(
+            server.take_notifications().is_empty(),
+            "reading the document queues nothing"
+        );
+
+        let response = request(
+            &mut server,
+            "tools/call",
+            json!({ "name": "create_primitive", "arguments": { "primitive": "box" } }),
+        );
+        assert_eq!(response["result"]["isError"], false);
+        let updates = server.take_notifications();
+        assert_eq!(updates.len(), 1, "one update per subscription");
+        assert_eq!(updates[0]["jsonrpc"], "2.0");
+        assert_eq!(updates[0]["method"], "notifications/resources/updated");
+        assert_eq!(updates[0]["params"]["uri"], SCENE_URI);
+
+        // Undo changes the document again, so it notifies again.
+        request(
+            &mut server,
+            "tools/call",
+            json!({ "name": "undo", "arguments": {} }),
+        );
+        assert_eq!(server.take_notifications().len(), 1);
+
+        // Unsubscribing stops the stream.
+        let response = request(
+            &mut server,
+            "resources/unsubscribe",
+            json!({ "uri": SCENE_URI }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(!server.has_subscriptions());
+        request(
+            &mut server,
+            "tools/call",
+            json!({ "name": "create_primitive", "arguments": { "primitive": "sphere" } }),
+        );
+        assert!(server.take_notifications().is_empty());
+
+        // Unknown and missing resource URIs are invalid params, not silent no-ops.
+        let response = request(
+            &mut server,
+            "resources/subscribe",
+            json!({ "uri": "leopardcraft://missing" }),
+        );
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Resource not found"));
+        let response = request(&mut server, "resources/subscribe", json!({}));
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(!server.has_subscriptions());
+    }
+
+    #[test]
+    fn prompt_templates_fill_from_the_live_document() {
+        let mut server = server();
+        let response = request(&mut server, "prompts/list", json!({}));
+        let prompts = response["result"]["prompts"].as_array().unwrap();
+        let names: Vec<&str> = prompts
+            .iter()
+            .map(|prompt| prompt["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["scene_overview", "object_report", "render_check"]);
+        let report = prompts
+            .iter()
+            .find(|prompt| prompt["name"] == "object_report")
+            .unwrap();
+        assert_eq!(report["arguments"][0]["name"], "object");
+        assert_eq!(report["arguments"][0]["required"], true);
+
+        request(
+            &mut server,
+            "tools/call",
+            json!({ "name": "create_primitive", "arguments": { "primitive": "box", "name": "Crate" } }),
+        );
+
+        // The overview prompt embeds the document as it stands now.
+        let response = request(
+            &mut server,
+            "prompts/get",
+            json!({ "name": "scene_overview" }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        let text = response["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("\"meshes\": 1"), "{text}");
+
+        // The object prompt uses the same id-or-name lookup as the tools.
+        let response = request(
+            &mut server,
+            "prompts/get",
+            json!({ "name": "object_report", "arguments": { "object": "Crate" } }),
+        );
+        let text = response["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("\"name\": \"Crate\""), "{text}");
+
+        // Missing, unknown and unresolvable arguments are invalid params.
+        let response = request(
+            &mut server,
+            "prompts/get",
+            json!({ "name": "object_report" }),
+        );
+        assert_eq!(response["error"]["code"], -32602);
+        let response = request(
+            &mut server,
+            "prompts/get",
+            json!({ "name": "object_report", "arguments": { "object": "Nope" } }),
+        );
+        assert_eq!(response["error"]["code"], -32602);
+        let response = request(
+            &mut server,
+            "prompts/get",
+            json!({ "name": "no_such_prompt" }),
+        );
+        assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn stdio_serve_writes_subscription_notifications() {
+        let mut server = server();
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",",
+            "\"params\":{\"uri\":\"leopardcraft://scene/summary\"}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",",
+            "\"params\":{\"name\":\"create_primitive\",\"arguments\":{\"primitive\":\"box\"}}}\n"
+        );
+        let mut output = Vec::new();
+        server
+            .serve(std::io::Cursor::new(input.as_bytes()), &mut output)
+            .expect("stdio serve loop");
+        let text = String::from_utf8(output).expect("utf-8 output");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "two responses and one notification: {lines:?}"
+        );
+        assert!(lines[0].contains("\"id\":1"), "{}", lines[0]);
+        assert!(lines[1].contains("\"id\":2"), "{}", lines[1]);
+        let notification: Value = serde_json::from_str(lines[2]).expect("notification json");
+        assert_eq!(notification["method"], "notifications/resources/updated");
+        assert_eq!(notification["params"]["uri"], SUMMARY_URI);
     }
 
     #[test]
@@ -762,5 +1074,1397 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn modifier_tools_edit_the_stack_with_one_undo_each() {
+        let mut server = server();
+        let id = structured(&tool(
+            &mut server,
+            "create_primitive",
+            json!({ "primitive": "box", "name": "Crate" }),
+        ))["id"]
+            .as_u64()
+            .unwrap();
+        let depth = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+
+        let added = structured(&tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": id,
+                "modifier": { "type": "subdivision", "levels": 2, "scheme": "catmull_clark" }
+            }),
+        ))
+        .clone();
+        assert_eq!(added["modifiers"][0]["type"], "subdivision");
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(depth + 1)
+        );
+
+        let inserted = structured(&tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": "Crate",
+                "index": 0,
+                "modifier": { "type": "array", "count": 2, "offset": [1.0, 0.0, 0.0] }
+            }),
+        ))
+        .clone();
+        assert_eq!(inserted["modifiers"][0]["type"], "array");
+        assert_eq!(inserted["modifiers"][1]["type"], "subdivision");
+
+        let updated = structured(&tool(
+            &mut server,
+            "update_modifier",
+            json!({
+                "object": id,
+                "index": 0,
+                "modifier": { "type": "array", "count": 3, "offset": [2.0, 0.0, 0.0] }
+            }),
+        ))
+        .clone();
+        assert_eq!(updated["modifiers"][0]["count"], 3);
+
+        let moved = structured(&tool(
+            &mut server,
+            "move_modifier",
+            json!({ "object": id, "from": 0, "to": 1 }),
+        ))
+        .clone();
+        assert_eq!(moved["modifiers"][0]["type"], "subdivision");
+        assert_eq!(moved["modifiers"][1]["type"], "array");
+
+        let removed = structured(&tool(
+            &mut server,
+            "remove_modifier",
+            json!({ "object": id, "index": 1 }),
+        ))
+        .clone();
+        assert_eq!(removed["modifiers"].as_array().unwrap().len(), 1);
+        assert_eq!(removed["removed"]["type"], "array");
+
+        tool(&mut server, "undo", json!({}));
+        let object = structured(&tool(&mut server, "get_object", json!({ "object": id }))).clone();
+        assert_eq!(object["modifiers"].as_array().unwrap().len(), 2);
+        assert_eq!(object["modifiers"][1]["type"], "array");
+        tool(&mut server, "undo", json!({}));
+        tool(&mut server, "undo", json!({}));
+        let object = structured(&tool(&mut server, "get_object", json!({ "object": id }))).clone();
+        assert_eq!(object["modifiers"].as_array().unwrap().len(), 2);
+        assert_eq!(object["modifiers"][0]["count"], 2);
+        tool(&mut server, "undo", json!({}));
+        let object = structured(&tool(&mut server, "get_object", json!({ "object": id }))).clone();
+        assert_eq!(object["modifiers"].as_array().unwrap().len(), 1);
+        tool(&mut server, "redo", json!({}));
+        let object = structured(&tool(&mut server, "get_object", json!({ "object": id }))).clone();
+        assert_eq!(object["modifiers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn modifier_tools_reject_bad_targets_and_indices_without_undo() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let camera = structured(&tool(&mut server, "list_objects", json!({})))["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|object| object["type"] == "Camera")
+            .expect("demo scene has a camera")["id"]
+            .as_u64()
+            .unwrap();
+        let box_id = structured(&tool(
+            &mut server,
+            "create_primitive",
+            json!({ "primitive": "box", "name": "Box" }),
+        ))["id"]
+            .as_u64()
+            .unwrap();
+        let depth = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+
+        let error = tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": camera,
+                "modifier": { "type": "subdivision", "levels": 2 }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": box_id,
+                "index": 3,
+                "modifier": { "type": "subdivision", "levels": 2 }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": box_id,
+                "modifier": { "type": "boolean", "operand": box_id, "operation": "union" }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": box_id,
+                "modifier": { "type": "wrap", "target": box_id, "angle_deg": 90.0 }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": box_id,
+                "modifier": { "type": "wrap", "target": camera, "angle_deg": 90.0 }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": box_id,
+                "modifier": { "type": "formula", "x": "x +", "y": "y", "z": "z" }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let added = structured(&tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": box_id,
+                "modifier": { "type": "laplacian_smooth", "iterations": 2, "strength": 0.5 }
+            }),
+        ))
+        .clone();
+        assert_eq!(added["modifiers"][0]["type"], "laplacian_smooth");
+        tool(&mut server, "undo", json!({}));
+
+        let error = tool(
+            &mut server,
+            "update_modifier",
+            json!({
+                "object": box_id,
+                "index": 0,
+                "modifier": { "type": "subdivision", "levels": 1 }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "remove_modifier",
+            json!({ "object": box_id, "index": 0 }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "move_modifier",
+            json!({ "object": box_id, "from": 0, "to": 0 }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(depth)
+        );
+    }
+    #[test]
+    fn modifier_stack_roundtrips_through_native_save_and_open() {
+        let mut server = server();
+        let id = structured(&tool(
+            &mut server,
+            "create_primitive",
+            json!({ "primitive": "box", "name": "Crate" }),
+        ))["id"]
+            .as_u64()
+            .unwrap();
+        tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": id,
+                "modifier": { "type": "subdivision", "levels": 2, "scheme": "stam_loop" }
+            }),
+        );
+        tool(
+            &mut server,
+            "add_modifier",
+            json!({
+                "object": id,
+                "index": 0,
+                "modifier": { "type": "array", "count": 3, "offset": [1.0, 0.0, 0.0] }
+            }),
+        );
+        let path = temp_dir().join("modifiers.lcscene");
+        tool(
+            &mut server,
+            "save_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        tool(&mut server, "new_scene", json!({ "template": "empty" }));
+        tool(
+            &mut server,
+            "open_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        let object = structured(&tool(&mut server, "get_object", json!({ "object": id }))).clone();
+        assert_eq!(object["modifiers"].as_array().unwrap().len(), 2);
+        assert_eq!(object["modifiers"][0]["type"], "array");
+        assert_eq!(object["modifiers"][0]["count"], 3);
+        assert_eq!(object["modifiers"][1]["scheme"], "stam_loop");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+    #[test]
+    fn material_graph_tools_create_update_and_undo() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let original = structured(&tool(
+            &mut server,
+            "get_material",
+            json!({ "material": "Studio Grey" }),
+        ))
+        .clone();
+        let mut graph = original["graph"].clone();
+        let next = graph["next_id"].as_u64().unwrap();
+        graph["nodes"].as_array_mut().unwrap().push(json!({
+            "id": next,
+            "kind": { "type": "value", "value": 0.25 },
+            "position": [0.0, 180.0],
+            "inputs": []
+        }));
+        graph["next_id"] = json!(next + 1);
+        let depth = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+
+        let updated = structured(&tool(
+            &mut server,
+            "update_material",
+            json!({
+                "material": "Studio Grey",
+                "graph": graph,
+                "double_sided": false
+            }),
+        ))
+        .clone();
+        assert_eq!(updated["double_sided"], false);
+        assert_eq!(
+            updated["graph"]["nodes"].as_array().unwrap().len(),
+            original["graph"]["nodes"].as_array().unwrap().len() + 1
+        );
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(depth + 1)
+        );
+
+        tool(&mut server, "undo", json!({}));
+        let undone = structured(&tool(
+            &mut server,
+            "get_material",
+            json!({ "material": "Studio Grey" }),
+        ))
+        .clone();
+        assert_eq!(undone["double_sided"], true);
+        assert_eq!(
+            undone["graph"]["nodes"].as_array().unwrap().len(),
+            original["graph"]["nodes"].as_array().unwrap().len()
+        );
+        tool(&mut server, "redo", json!({}));
+        assert_eq!(
+            structured(&tool(
+                &mut server,
+                "get_material",
+                json!({ "material": "Studio Grey" })
+            ))["graph"]["nodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            original["graph"]["nodes"].as_array().unwrap().len() + 1
+        );
+
+        let created = structured(&tool(
+            &mut server,
+            "create_material",
+            json!({
+                "name": "Emissive",
+                "base_color": [1.0, 0.2, 0.1],
+                "roughness": 0.3,
+                "metallic": 0.1,
+                "casts_shadow": false
+            }),
+        ))
+        .clone();
+        assert_eq!(created["name"], "Emissive");
+        assert_eq!(created["casts_shadow"], false);
+        let error = tool(
+            &mut server,
+            "create_material",
+            json!({ "name": "emissive" }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let renamed = structured(&tool(
+            &mut server,
+            "update_material",
+            json!({ "material": "Emissive", "name": "Glow" }),
+        ))
+        .clone();
+        assert_eq!(renamed["name"], "Glow");
+        tool(&mut server, "undo", json!({}));
+        assert_eq!(
+            structured(&tool(
+                &mut server,
+                "get_material",
+                json!({ "material": "Emissive" })
+            ))["name"],
+            "Emissive"
+        );
+    }
+
+    #[test]
+    fn material_graph_tools_reject_malformed_graphs_without_undo() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let original = structured(&tool(
+            &mut server,
+            "get_material",
+            json!({ "material": "Studio Grey" }),
+        ))
+        .clone();
+        let depth = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        let count = structured(&tool(&mut server, "list_materials", json!({})))["materials"]
+            .as_array()
+            .unwrap()
+            .len();
+
+        let mut stale = original["graph"].clone();
+        stale["next_id"] = json!(0);
+        let error = tool(
+            &mut server,
+            "update_material",
+            json!({ "material": "Studio Grey", "graph": stale }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let mut dangling = original["graph"].clone();
+        dangling["links"][0]["from"] = json!(99);
+        let error = tool(
+            &mut server,
+            "update_material",
+            json!({ "material": "Studio Grey", "graph": dangling }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        let error = tool(
+            &mut server,
+            "create_material",
+            json!({
+                "name": "Broken",
+                "graph": {
+                    "nodes": [{ "id": 0, "kind": { "type": "material_output" }, "position": [0.0, 0.0], "inputs": [] }],
+                    "links": [{ "from": 9, "to": 0, "to_input": 0 }],
+                    "next_id": 1
+                }
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+
+        assert_eq!(
+            structured(&tool(&mut server, "list_materials", json!({})))["materials"]
+                .as_array()
+                .unwrap()
+                .len(),
+            count
+        );
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(depth)
+        );
+    }
+
+    #[test]
+    fn material_graph_roundtrips_through_native_save_and_open() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let original = structured(&tool(
+            &mut server,
+            "get_material",
+            json!({ "material": "Studio Grey" }),
+        ))
+        .clone();
+        let mut graph = original["graph"].clone();
+        let next = graph["next_id"].as_u64().unwrap();
+        graph["nodes"].as_array_mut().unwrap().push(json!({
+            "id": next,
+            "kind": { "type": "value", "value": 0.5 },
+            "position": [0.0, 90.0],
+            "inputs": []
+        }));
+        graph["next_id"] = json!(next + 1);
+        tool(
+            &mut server,
+            "create_material",
+            json!({ "name": "Roundtrip", "graph": graph }),
+        );
+        let path = temp_dir().join("materials.lcscene");
+        tool(
+            &mut server,
+            "save_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        tool(&mut server, "new_scene", json!({ "template": "empty" }));
+        tool(
+            &mut server,
+            "open_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        let loaded = structured(&tool(
+            &mut server,
+            "get_material",
+            json!({ "material": "Roundtrip" }),
+        ))
+        .clone();
+        assert_eq!(
+            loaded["graph"]["nodes"].as_array().unwrap().len(),
+            original["graph"]["nodes"].as_array().unwrap().len() + 1
+        );
+        assert_eq!(
+            loaded["graph"]["links"].as_array().unwrap().len(),
+            original["graph"]["links"].as_array().unwrap().len()
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+    #[test]
+    fn animation_key_tools_edit_the_clip_and_undo() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let depth = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "translation",
+                "component": 0,
+                "time": 0.0,
+                "value": 0.0,
+                "interpolation": "linear"
+            }),
+        );
+        tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "translation",
+                "component": 0,
+                "time": 1.0,
+                "value": 2.0,
+                "interpolation": "linear"
+            }),
+        );
+        tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "rotation",
+                "time": 0.0,
+                "rotation": [0.0, 0.0, 0.0, 1.0]
+            }),
+        );
+        tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "rotation",
+                "time": 1.0,
+                "rotation": [0.0, 0.70710677, 0.0, 0.70710677],
+                "interpolation": "linear"
+            }),
+        );
+        let clip = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))["clip"]
+            .clone();
+        assert_eq!(
+            clip["tracks"][0]["curve"]["keys"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(clip["rotation"]["keys"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(depth + 4)
+        );
+
+        tool(
+            &mut server,
+            "remove_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "translation",
+                "component": 0,
+                "time": 0.0
+            }),
+        );
+        let clip = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))["clip"]
+            .clone();
+        assert_eq!(
+            clip["tracks"][0]["curve"]["keys"].as_array().unwrap().len(),
+            1
+        );
+        tool(&mut server, "undo", json!({}));
+        let clip = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))["clip"]
+            .clone();
+        assert_eq!(
+            clip["tracks"][0]["curve"]["keys"].as_array().unwrap().len(),
+            2
+        );
+        tool(&mut server, "redo", json!({}));
+        let clip = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))["clip"]
+            .clone();
+        assert_eq!(
+            clip["tracks"][0]["curve"]["keys"].as_array().unwrap().len(),
+            1
+        );
+
+        let after = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        let error = tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "translation",
+                "component": 0,
+                "time": 1.0,
+                "value": 2.0,
+                "interpolation": "linear"
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+        let error = tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "fov",
+                "time": 0.0,
+                "value": 45.0
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+        let error = tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "translation",
+                "component": 4,
+                "time": 0.0,
+                "value": 1.0
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+        let error = tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "translation",
+                "time": -1.0,
+                "value": 1.0
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+        let error = tool(
+            &mut server,
+            "remove_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "scale",
+                "component": 0,
+                "time": 0.0
+            }),
+        );
+        assert_eq!(error["isError"], json!(true));
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(after)
+        );
+    }
+
+    #[test]
+    fn animation_take_tools_create_activate_update_and_delete() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let original_takes = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))["takes"]
+            .as_array()
+            .unwrap()
+            .len();
+        let depth = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+
+        let created =
+            structured(&tool(&mut server, "create_take", json!({ "name": "Walk" }))).clone();
+        assert_eq!(
+            created["takes"].as_array().unwrap().len(),
+            original_takes + 1
+        );
+        assert_eq!(
+            created["takes"].as_array().unwrap().last().unwrap()["name"],
+            "Walk"
+        );
+        assert_eq!(
+            created["takes"].as_array().unwrap().last().unwrap()["active"],
+            true
+        );
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(depth + 1)
+        );
+
+        tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "translation",
+                "component": 1,
+                "time": 0.5,
+                "value": 3.0
+            }),
+        );
+        tool(&mut server, "activate_take", json!({ "index": 0 }));
+        assert_eq!(
+            structured(&tool(
+                &mut server,
+                "get_animation",
+                json!({ "object": "Cube" })
+            ))["clip"]["tracks"]
+                .as_array()
+                .map(|tracks| tracks.len())
+                .unwrap_or(0),
+            0
+        );
+        tool(&mut server, "activate_take", json!({ "index": 1 }));
+        let clip = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))["clip"]
+            .clone();
+        assert_eq!(
+            clip["tracks"][0]["curve"]["keys"].as_array().unwrap().len(),
+            1
+        );
+
+        let updated = structured(&tool(
+            &mut server,
+            "update_take",
+            json!({ "index": 1, "name": "Sprint", "fps": 30.0 }),
+        ))
+        .clone();
+        assert_eq!(updated["takes"][1]["name"], "Sprint");
+        assert_eq!(updated["takes"][1]["fps"], 30.0);
+
+        let deleted = structured(&tool(&mut server, "delete_take", json!({ "index": 1 }))).clone();
+        assert_eq!(deleted["takes"].as_array().unwrap().len(), original_takes);
+        tool(&mut server, "undo", json!({}));
+        let restored = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))
+        .clone();
+        assert_eq!(
+            restored["takes"].as_array().unwrap().len(),
+            original_takes + 1
+        );
+        assert_eq!(restored["takes"][1]["name"], "Sprint");
+
+        let after = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        let error = tool(&mut server, "activate_take", json!({ "index": 9 }));
+        assert_eq!(error["isError"], json!(true));
+        let error = tool(
+            &mut server,
+            "update_take",
+            json!({ "index": 1, "fps": 1000.0 }),
+        );
+        assert_eq!(error["isError"], json!(true));
+        let error = tool(
+            &mut server,
+            "update_take",
+            json!({ "index": 1, "name": " " }),
+        );
+        assert_eq!(error["isError"], json!(true));
+        let error = tool(&mut server, "delete_take", json!({ "index": 9 }));
+        assert_eq!(error["isError"], json!(true));
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(after)
+        );
+    }
+
+    #[test]
+    fn mesh_component_tools_transform_selection_and_undo() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let original =
+            structured(&tool(&mut server, "get_mesh", json!({ "object": "Cube" }))).clone();
+        let original_positions = original["mesh"]["positions"].clone();
+        let depth = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+
+        let one = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({
+                "object": "Cube",
+                "operation": "transform",
+                "points": [0],
+                "translation": [1.0, 0.0, 0.0]
+            }),
+        ))
+        .clone();
+        assert_eq!(one["editable"], json!(true));
+        assert_ne!(one["mesh"]["positions"][0], original_positions[0]);
+        assert_eq!(one["mesh"]["positions"][1], original_positions[1]);
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(depth + 1)
+        );
+
+        tool(&mut server, "undo", json!({}));
+        let undone =
+            structured(&tool(&mut server, "get_mesh", json!({ "object": "Cube" }))).clone();
+        assert_eq!(undone["editable"], json!(false));
+        assert_eq!(undone["mesh"]["positions"], original_positions);
+        tool(&mut server, "redo", json!({}));
+        let redone =
+            structured(&tool(&mut server, "get_mesh", json!({ "object": "Cube" }))).clone();
+        assert_eq!(redone["editable"], json!(true));
+        assert_ne!(redone["mesh"]["positions"][0], original_positions[0]);
+
+        let face_points: Vec<u64> = redone["mesh"]["polygons"][0]["corners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|corner| corner["point"].as_u64().unwrap())
+            .collect();
+        let face = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({
+                "object": "Cube",
+                "operation": "transform",
+                "faces": [0],
+                "scale": [2.0, 2.0, 2.0]
+            }),
+        ))
+        .clone();
+        assert_eq!(face["operation"], "transform");
+        assert!(face_points
+            .iter()
+            .all(|point| face["mesh"]["positions"][*point as usize]
+                != redone["mesh"]["positions"][*point as usize]));
+
+        let after = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        for error_args in [
+            json!({ "object": "Cube", "operation": "transform", "points": [], "translation": [1.0, 0.0, 0.0] }),
+            json!({ "object": "Cube", "operation": "transform", "points": [999], "translation": [1.0, 0.0, 0.0] }),
+            json!({ "object": "Cube", "operation": "transform", "faces": [999], "translation": [1.0, 0.0, 0.0] }),
+            json!({ "object": "Cube", "operation": "transform", "edges": [[0, 1]], "translation": [1.0, 0.0, 0.0] }),
+            json!({ "object": "Cube", "operation": "transform", "points": [0], "scale": [0.0, 1.0, 1.0] }),
+            json!({ "object": "Cube", "operation": "transform", "points": [0] }),
+            json!({ "object": "Cube", "operation": "transform" }),
+        ] {
+            assert_eq!(
+                tool(&mut server, "edit_mesh", error_args)["isError"],
+                json!(true)
+            );
+        }
+        assert_eq!(
+            tool(
+                &mut server,
+                "edit_mesh",
+                json!({ "object": "Cube", "operation": "extrude", "faces": [], "distance": 1.0 })
+            )["isError"],
+            json!(true)
+        );
+        assert_eq!(
+            tool(&mut server, "get_mesh", json!({ "object": "Camera" }))["isError"],
+            json!(true)
+        );
+        assert_eq!(
+            tool(
+                &mut server,
+                "edit_mesh",
+                json!({ "object": "Camera", "operation": "flip" })
+            )["isError"],
+            json!(true)
+        );
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(after)
+        );
+    }
+
+    #[test]
+    fn mesh_edit_tools_cover_face_and_point_operations_and_empty_meshes() {
+        let mut server = McpServer::new(Document::demo(), None);
+        let original =
+            structured(&tool(&mut server, "get_mesh", json!({ "object": "Cube" }))).clone();
+
+        let extruded = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "extrude", "faces": [0], "distance": 0.5 }),
+        ))
+        .clone();
+        assert!(extruded["faces"].as_u64().unwrap() > original["faces"].as_u64().unwrap());
+        tool(&mut server, "undo", json!({}));
+        let inset = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "inset", "faces": [0], "amount": 0.15 }),
+        ))
+        .clone();
+        assert!(inset["faces"].as_u64().unwrap() > original["faces"].as_u64().unwrap());
+        let bevel = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "bevel", "faces": [0], "amount": 0.1, "depth": 0.05 }),
+        ))
+        .clone();
+        assert!(bevel["faces"].as_u64().unwrap() > original["faces"].as_u64().unwrap());
+        let triangulated = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "triangulate", "faces": [0], "mode": "quad_pair" }),
+        ))
+        .clone();
+        assert!(triangulated["faces"].as_u64().unwrap() > original["faces"].as_u64().unwrap());
+        let flipped = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "flip", "faces": [0, 1] }),
+        ))
+        .clone();
+        assert_eq!(flipped["faces"], triangulated["faces"]);
+        tool(&mut server, "undo", json!({}));
+        let slid = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "slide", "points": [0], "fraction": 0.5 }),
+        ))
+        .clone();
+        assert_eq!(slid["operation"], "slide");
+        tool(&mut server, "undo", json!({}));
+        let optimized = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "optimize", "points": [0, 1], "tolerance": 100.0 }),
+        ))
+        .clone();
+        assert_eq!(optimized["operation"], "optimize");
+        tool(&mut server, "undo", json!({}));
+        let collapsed = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "collapse", "points": [0, 1] }),
+        ))
+        .clone();
+        assert_eq!(collapsed["operation"], "collapse");
+        tool(&mut server, "undo", json!({}));
+        let disconnected = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "disconnect", "faces": [0] }),
+        ))
+        .clone();
+        assert_eq!(disconnected["operation"], "disconnect");
+        tool(&mut server, "undo", json!({}));
+        tool(&mut server, "undo", json!({}));
+        tool(&mut server, "undo", json!({}));
+        tool(&mut server, "undo", json!({}));
+        let after = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        for error_args in [
+            json!({ "object": "Cube", "operation": "extrude", "faces": [999], "distance": 1.0 }),
+            json!({ "object": "Cube", "operation": "triangulate", "mode": "nope" }),
+            json!({ "object": "Cube", "operation": "optimize", "points": [999], "tolerance": 0.1 }),
+            json!({ "object": "Cube", "operation": "slide", "points": [999], "fraction": 0.5 }),
+            json!({ "object": "Cube", "operation": "bridge", "loops": [[0, 1, 2]] }),
+            json!({ "object": "Cube", "operation": "not_an_operation" }),
+        ] {
+            assert_eq!(
+                tool(&mut server, "edit_mesh", error_args)["isError"],
+                json!(true)
+            );
+        }
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(after)
+        );
+
+        let empty = server.doc.create_node(
+            lc_scene::NodeKind::Mesh {
+                geometry: lc_scene::GeometrySource::editable(lc_geom::Mesh::default()),
+            },
+            "Empty",
+        );
+        let empty_id = empty.id;
+        server
+            .doc
+            .scene
+            .insert_node(empty, None, None)
+            .expect("empty mesh node inserts");
+        let empty_mesh = structured(&tool(
+            &mut server,
+            "get_mesh",
+            json!({ "object": empty_id }),
+        ))
+        .clone();
+        assert_eq!(empty_mesh["faces"], 0);
+        assert_eq!(empty_mesh["uv_sets"], 0);
+        let before_empty = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        for error_args in [
+            json!({ "object": empty_id, "operation": "flip" }),
+            json!({ "object": empty_id, "operation": "extrude", "distance": 1.0 }),
+            json!({ "object": empty_id, "operation": "slide", "fraction": 1.0 }),
+            json!({ "object": empty_id, "operation": "transform", "points": [0], "translation": [1.0, 0.0, 0.0] }),
+        ] {
+            assert_eq!(
+                tool(&mut server, "edit_mesh", error_args)["isError"],
+                json!(true)
+            );
+        }
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(before_empty)
+        );
+    }
+
+    #[test]
+    fn uv_edit_tools_project_sets_seams_charts_pins_and_undo() {
+        let mut server = McpServer::new(Document::demo(), None);
+
+        let projected = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "project", "mode": "planar", "axis": 2, "scale": 2.0 }),
+        ))
+        .clone();
+        assert_eq!(projected["uv_sets"], 1);
+        let slots = projected["uv_slots"].as_u64().unwrap();
+        assert!(slots >= 4);
+
+        let added = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "add_set" }),
+        ))
+        .clone();
+        assert_eq!(added["uv_sets"], 2);
+        let set = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_uv", "uv_set": 1, "slot": 0, "u": 0.25, "v": 0.75 }),
+        ))
+        .clone();
+        assert_eq!(set["mesh"]["extra_uvs"][0][0], json!([0.25, 0.75]));
+
+        let mut groups: std::collections::BTreeMap<u64, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for polygon in set["mesh"]["polygons"].as_array().unwrap() {
+            for corner in polygon["corners"].as_array().unwrap() {
+                groups
+                    .entry(corner["point"].as_u64().unwrap())
+                    .or_default()
+                    .push(corner["uv"].as_u64().unwrap());
+            }
+        }
+        let duplicate: Vec<u64> = groups
+            .values()
+            .find(|slots| slots.len() >= 2)
+            .cloned()
+            .expect("projected cube shares UV slots at a point");
+        let welded = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "weld", "slots": duplicate }),
+        ))
+        .clone();
+        assert_eq!(welded["operation"], "weld");
+        let survivor = *duplicate.iter().min().unwrap();
+        let split = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "split", "slots": [survivor] }),
+        ))
+        .clone();
+        assert_eq!(split["operation"], "split");
+        for (slot, u, v) in [(0, 0.0, 0.1), (1, 0.2, 0.3), (2, 0.9, 0.7)] {
+            tool(
+                &mut server,
+                "edit_uv",
+                json!({ "object": "Cube", "operation": "set_uv", "slot": slot, "u": u, "v": v }),
+            );
+        }
+        for operation in [
+            json!({ "object": "Cube", "operation": "align", "slots": [0, 1], "axis": 0 }),
+            json!({ "object": "Cube", "operation": "distribute", "slots": [0, 1, 2], "axis": 0 }),
+            json!({ "object": "Cube", "operation": "flip", "slots": [0, 1], "axis": 1 }),
+        ] {
+            let ran = tool(&mut server, "edit_uv", operation.clone());
+            assert_eq!(ran["isError"], json!(false), "{operation}");
+        }
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_uv", "slot": 0, "u": 0.0, "v": 0.0 }),
+        );
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_uv", "slot": 1, "u": 1.0, "v": 0.0 }),
+        );
+        let rotated = tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "rotate", "slots": [0, 1], "quarter_turns": 1 }),
+        );
+        assert_eq!(rotated["isError"], json!(false));
+
+        let seam = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_seam", "a": 0, "b": 1 }),
+        ))
+        .clone();
+        assert_eq!(seam["seams"], json!([[0, 1]]));
+        let cleared = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "clear_seams" }),
+        ))
+        .clone();
+        assert_eq!(cleared["seams"], json!([]));
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_seam", "a": 0, "b": 1 }),
+        );
+        let unwrapped = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "unwrap", "max_angle_deg": 66.0, "padding": 0.01 }),
+        ))
+        .clone();
+        assert!(unwrapped["uv_charts"].as_u64().unwrap() >= 1);
+        let relaxed = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "relax", "iterations": 2, "strength": 0.5, "pin_boundary": true }),
+        ))
+        .clone();
+        assert_eq!(relaxed["uv_sets"], 2);
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_uv", "slot": 0, "u": 5.0, "v": 5.0 }),
+        );
+        let normalized = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "normalize" }),
+        ))
+        .clone();
+        assert_eq!(normalized["operation"], "normalize");
+        assert!(normalized["mesh"]["uvs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|uv| uv[0].as_f64().unwrap() >= 0.0
+                && uv[0].as_f64().unwrap() <= 1.0
+                && uv[1].as_f64().unwrap() >= 0.0
+                && uv[1].as_f64().unwrap() <= 1.0));
+        let packed = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "pack", "padding": 0.02, "rotate": true, "align": "center" }),
+        ))
+        .clone();
+        assert!(packed["uv_charts"].as_u64().unwrap() >= 1);
+        let transformed = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "transform_charts", "charts": [], "translation": [0.1, 0.1], "rotation_degrees": 15.0, "scale": 0.9 }),
+        ))
+        .clone();
+        assert_eq!(transformed["operation"], "transform_charts");
+        let pinned = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_pinned", "slot": 0 }),
+        ))
+        .clone();
+        assert_eq!(pinned["pinned_uvs"], json!([0]));
+        let unpinned = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_pinned", "slot": 0, "pinned": false }),
+        ))
+        .clone();
+        assert_eq!(unpinned["pinned_uvs"], json!([]));
+        let removed = structured(&tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "remove_set", "uv_set": 1 }),
+        ))
+        .clone();
+        assert_eq!(removed["uv_sets"], 1);
+        tool(&mut server, "undo", json!({}));
+        assert_eq!(
+            structured(&tool(&mut server, "get_mesh", json!({ "object": "Cube" })))["uv_sets"],
+            2
+        );
+
+        let after = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        for error_args in [
+            json!({ "object": "Cube", "operation": "project", "mode": "linear" }),
+            json!({ "object": "Cube", "operation": "project", "mode": "planar", "uv_set": 9 }),
+            json!({ "object": "Cube", "operation": "remove_set", "uv_set": 0 }),
+            json!({ "object": "Cube", "operation": "set_uv", "slot": 999, "u": 0.0, "v": 0.0 }),
+            json!({ "object": "Cube", "operation": "set_seam", "a": 0, "b": 999 }),
+            json!({ "object": "Cube", "operation": "set_seam", "a": 0, "b": 6 }),
+            json!({ "object": "Cube", "operation": "pack", "charts": [999] }),
+            json!({ "object": "Cube", "operation": "weld", "slots": [] }),
+        ] {
+            assert_eq!(
+                tool(&mut server, "edit_uv", error_args)["isError"],
+                json!(true)
+            );
+        }
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(after)
+        );
+
+        let bridge_mesh = lc_geom::Mesh::from_polygons(
+            "bridge",
+            vec![
+                glam::Vec3::new(0.0, 0.0, 0.0),
+                glam::Vec3::new(1.0, 0.0, 0.0),
+                glam::Vec3::new(1.0, 0.0, 1.0),
+                glam::Vec3::new(0.0, 0.0, 1.0),
+                glam::Vec3::new(0.0, 1.0, 0.0),
+                glam::Vec3::new(1.0, 1.0, 0.0),
+                glam::Vec3::new(1.0, 1.0, 1.0),
+                glam::Vec3::new(0.0, 1.0, 1.0),
+            ],
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+        );
+        let bridge = server.doc.create_node(
+            lc_scene::NodeKind::Mesh {
+                geometry: lc_scene::GeometrySource::editable(bridge_mesh),
+            },
+            "Bridge",
+        );
+        let bridge_id = bridge.id;
+        server
+            .doc
+            .scene
+            .insert_node(bridge, None, None)
+            .expect("bridge mesh node inserts");
+        let bridged = structured(&tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": bridge_id, "operation": "bridge", "loops": [[0, 1, 2, 3], [4, 5, 6, 7]] }),
+        ))
+        .clone();
+        assert!(bridged["faces"].as_u64().unwrap() > 2);
+
+        let empty = server.doc.create_node(
+            lc_scene::NodeKind::Mesh {
+                geometry: lc_scene::GeometrySource::editable(lc_geom::Mesh::default()),
+            },
+            "EmptyUV",
+        );
+        let empty_id = empty.id;
+        server
+            .doc
+            .scene
+            .insert_node(empty, None, None)
+            .expect("empty UV mesh node inserts");
+        let before_empty = structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"]
+            .as_u64()
+            .unwrap();
+        for error_args in [
+            json!({ "object": empty_id, "operation": "add_set" }),
+            json!({ "object": empty_id, "operation": "normalize" }),
+            json!({ "object": empty_id, "operation": "set_uv", "slot": 0, "u": 0.0, "v": 0.0 }),
+            json!({ "object": empty_id, "operation": "unwrap" }),
+            json!({ "object": empty_id, "operation": "relax" }),
+            json!({ "object": empty_id, "operation": "pack" }),
+        ] {
+            assert_eq!(
+                tool(&mut server, "edit_uv", error_args)["isError"],
+                json!(true)
+            );
+        }
+        assert_eq!(
+            structured(&tool(&mut server, "get_scene", json!({})))["undo"]["depth"],
+            json!(before_empty)
+        );
+    }
+
+    #[test]
+    fn mesh_and_uv_edits_roundtrip_through_native_save_and_open() {
+        let mut server = McpServer::new(Document::demo(), None);
+        tool(
+            &mut server,
+            "edit_mesh",
+            json!({ "object": "Cube", "operation": "extrude", "faces": [0], "distance": 0.4 }),
+        );
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "project", "mode": "box", "scale": 1.0 }),
+        );
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "add_set" }),
+        );
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_uv", "uv_set": 1, "slot": 0, "u": 0.4, "v": 0.6 }),
+        );
+        tool(
+            &mut server,
+            "edit_uv",
+            json!({ "object": "Cube", "operation": "set_seam", "a": 0, "b": 1 }),
+        );
+        let expected =
+            structured(&tool(&mut server, "get_mesh", json!({ "object": "Cube" }))).clone();
+        let path = temp_dir().join("mesh-uv.lcscene");
+        tool(
+            &mut server,
+            "save_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        tool(&mut server, "new_scene", json!({ "template": "empty" }));
+        tool(
+            &mut server,
+            "open_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        let loaded =
+            structured(&tool(&mut server, "get_mesh", json!({ "object": "Cube" }))).clone();
+        assert_eq!(loaded["faces"], expected["faces"]);
+        assert_eq!(loaded["uv_sets"], expected["uv_sets"]);
+        assert_eq!(loaded["uv_slots"], expected["uv_slots"]);
+        assert_eq!(loaded["seams"], expected["seams"]);
+        assert_eq!(loaded["mesh"]["positions"], expected["mesh"]["positions"]);
+        assert_eq!(loaded["mesh"]["extra_uvs"], expected["mesh"]["extra_uvs"]);
+        let uv = loaded["mesh"]["extra_uvs"][0][0].as_array().unwrap();
+        assert!((uv[0].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert!((uv[1].as_f64().unwrap() - 0.6).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn animation_and_takes_roundtrip_through_native_save_and_open() {
+        let mut server = McpServer::new(Document::demo(), None);
+        tool(&mut server, "create_take", json!({ "name": "Walk" }));
+        tool(
+            &mut server,
+            "set_animation_key",
+            json!({
+                "object": "Cube",
+                "channel": "rotation",
+                "time": 0.5,
+                "rotation": [0.0, 0.0, 0.0, 1.0]
+            }),
+        );
+        let path = temp_dir().join("animation.lcscene");
+        tool(
+            &mut server,
+            "save_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        tool(&mut server, "new_scene", json!({ "template": "empty" }));
+        tool(
+            &mut server,
+            "open_scene",
+            json!({ "path": path.to_string_lossy() }),
+        );
+        let loaded = structured(&tool(
+            &mut server,
+            "get_animation",
+            json!({ "object": "Cube" }),
+        ))
+        .clone();
+        assert_eq!(loaded["active_take"]["name"], "Walk");
+        assert_eq!(loaded["takes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            loaded["clip"]["rotation"]["keys"].as_array().unwrap().len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

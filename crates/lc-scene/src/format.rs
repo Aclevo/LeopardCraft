@@ -70,7 +70,12 @@ fn warn(message: &str) {
 }
 
 pub fn to_json(doc: &Document) -> Result<String, String> {
-    serde_json::to_string_pretty(doc).map_err(|e| format!("failed to serialise scene: {e}"))
+    // Commit live edits into the active take so the saved file and the live
+    // view agree, and mirror the take fps into legacy settings.
+    let mut doc = doc.clone();
+    doc.store_active_clips();
+    doc.settings.fps = doc.active_take_fps();
+    serde_json::to_string_pretty(&doc).map_err(|e| format!("failed to serialise scene: {e}"))
 }
 
 pub fn from_json(text: &str) -> Result<Document, String> {
@@ -93,6 +98,10 @@ pub fn from_json(text: &str) -> Result<Document, String> {
     doc.format = FORMAT_NAME.into();
     doc.version = FORMAT_VERSION;
     doc.sanitize();
+    // Files written before takes existed have no take list; `load_active_take`
+    // migrates their live clips into a default take. Files with takes open on
+    // their stored active take instead of a stale live mirror.
+    doc.load_active_take();
     doc.validate()
         .map_err(|errors| format!("scene validation failed:\n{}", errors.join("\n")))?;
     Ok(doc)
@@ -438,7 +447,11 @@ impl Document {
             for tag in &node.tags {
                 match tag {
                     crate::Tag::LookAt { target, .. }
-                    | crate::Tag::CopyLocation { source: target, .. } => {
+                    | crate::Tag::CopyLocation { source: target, .. }
+                    | crate::Tag::IkPoint { target, .. }
+                    | crate::Tag::IkAngle { target, .. }
+                    | crate::Tag::Orient { target, .. }
+                    | crate::Tag::Parent { target, .. } => {
                         if !nodes.contains_key(target) {
                             push(
                                 &mut errors,
@@ -620,7 +633,11 @@ impl Document {
                 sanitize_tag(&mut tag);
                 let valid = match &tag {
                     crate::Tag::LookAt { target, .. }
-                    | crate::Tag::CopyLocation { source: target, .. } => node_ids.contains(target),
+                    | crate::Tag::CopyLocation { source: target, .. }
+                    | crate::Tag::IkPoint { target, .. }
+                    | crate::Tag::IkAngle { target, .. }
+                    | crate::Tag::Orient { target, .. }
+                    | crate::Tag::Parent { target, .. } => node_ids.contains(target),
                     crate::Tag::MaterialOverride { material } => valid_materials.contains(material),
                     _ => true,
                 };
@@ -837,82 +854,82 @@ fn sanitize_tag(tag: &mut crate::Tag) {
         *min = low;
         *max = high;
     }
+    match tag {
+        crate::Tag::IkPoint { weight, .. }
+        | crate::Tag::Orient { weight, .. }
+        | crate::Tag::Parent { weight, .. } => {
+            *weight = if weight.is_finite() {
+                weight.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+        }
+        crate::Tag::IkAngle { max_degrees, .. } => {
+            *max_degrees = if max_degrees.is_finite() {
+                max_degrees.clamp(0.0, 180.0)
+            } else {
+                45.0
+            };
+        }
+        _ => {}
+    }
 }
 
-fn sanitize_animation(animation: &mut lc_anim::AnimationClip) {
+/// Repair one scalar curve so sampling cannot see a non-finite or unsorted
+/// key. Used for addressed tracks, morph-weight curves and the legacy Euler
+/// rotation curves kept for pre-address files.
+fn sanitize_curve(curve: &mut lc_anim::Curve) {
+    curve
+        .keys
+        .retain(|k| k.time.is_finite() && k.value.is_finite());
+    for key in &mut curve.keys {
+        key.time = key.time.max(0.0);
+        if !key.tangent_in.is_finite() {
+            key.tangent_in = 0.0;
+        }
+        if !key.tangent_out.is_finite() {
+            key.tangent_out = 0.0;
+        }
+        // Pre-tangent-type files deserialize the new fields as Spline. A
+        // non-manual Smooth key used Catmull-Rom before those fields existed,
+        // so restore that automatic rule instead of silently changing an old
+        // scene to Spline's secant fallback.
+        if !key.tangent_manual
+            && key.interpolation == lc_anim::Interpolation::Smooth
+            && key.tangent_in_type == lc_anim::TangentType::Spline
+            && key.tangent_out_type == lc_anim::TangentType::Spline
+        {
+            key.tangent_in_type = lc_anim::TangentType::Smooth;
+            key.tangent_out_type = lc_anim::TangentType::Smooth;
+        }
+    }
+    curve.keys.sort_by(|a, b| {
+        a.time
+            .partial_cmp(&b.time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    curve.keys.dedup_by(|a, b| (a.time - b.time).abs() < 1e-6);
+    if !curve.keys.is_empty() {
+        curve.update_tangents();
+    }
+}
+
+pub(crate) fn sanitize_animation(animation: &mut lc_anim::AnimationClip) {
     for track in &mut animation.tracks {
-        track
-            .curve
-            .keys
-            .retain(|k| k.time.is_finite() && k.value.is_finite());
-        for key in &mut track.curve.keys {
-            key.time = key.time.max(0.0);
-            if !key.tangent_in.is_finite() {
-                key.tangent_in = 0.0;
-            }
-            if !key.tangent_out.is_finite() {
-                key.tangent_out = 0.0;
-            }
-            // Pre-tangent-type files deserialize the new fields as Spline.
-            // A non-manual Smooth key used Catmull-Rom before those fields
-            // existed, so restore that automatic rule instead of silently
-            // changing an old scene to Spline's secant fallback.
-            if !key.tangent_manual
-                && key.interpolation == lc_anim::Interpolation::Smooth
-                && key.tangent_in_type == lc_anim::TangentType::Spline
-                && key.tangent_out_type == lc_anim::TangentType::Spline
-            {
-                key.tangent_in_type = lc_anim::TangentType::Smooth;
-                key.tangent_out_type = lc_anim::TangentType::Smooth;
-            }
-        }
-        track.curve.keys.sort_by(|a, b| {
-            a.time
-                .partial_cmp(&b.time)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        track
-            .curve
-            .keys
-            .dedup_by(|a, b| (a.time - b.time).abs() < 1e-6);
-        if !track.curve.keys.is_empty() {
-            track.curve.update_tangents();
-        }
+        sanitize_curve(&mut track.curve);
     }
     animation.tracks.retain(|t| !t.curve.keys.is_empty());
     for curve in animation.morph_weights.values_mut() {
-        curve
-            .keys
-            .retain(|k| k.time.is_finite() && k.value.is_finite());
-        for key in &mut curve.keys {
-            key.time = key.time.max(0.0);
-            if !key.tangent_in.is_finite() {
-                key.tangent_in = 0.0;
-            }
-            if !key.tangent_out.is_finite() {
-                key.tangent_out = 0.0;
-            }
-            if !key.tangent_manual
-                && key.interpolation == lc_anim::Interpolation::Smooth
-                && key.tangent_in_type == lc_anim::TangentType::Spline
-                && key.tangent_out_type == lc_anim::TangentType::Spline
-            {
-                key.tangent_in_type = lc_anim::TangentType::Smooth;
-                key.tangent_out_type = lc_anim::TangentType::Smooth;
-            }
-        }
-        curve.keys.sort_by(|a, b| {
-            a.time
-                .partial_cmp(&b.time)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        curve.keys.dedup_by(|a, b| (a.time - b.time).abs() < 1e-6);
-        if !curve.keys.is_empty() {
-            curve.update_tangents();
-        }
+        sanitize_curve(curve);
     }
     animation
         .morph_weights
+        .retain(|_, curve| !curve.keys.is_empty());
+    for curve in animation.legacy_euler_rotation.values_mut() {
+        sanitize_curve(curve);
+    }
+    animation
+        .legacy_euler_rotation
         .retain(|_, curve| !curve.keys.is_empty());
     if let Some(rotation) = animation.rotation.as_mut() {
         // Quaternion keys need the same repair as scalar keys: sampling binary
@@ -990,7 +1007,18 @@ fn repair_mesh(mesh: &mut lc_geom::Mesh) {
             *uv = glam::Vec2::ZERO;
         }
     }
+    // Additional sets are parallel to `uvs`: truncate or zero-pad a damaged
+    // set so every corner slot resolves in every set, and repair non-finite
+    // coordinates the same way UV0 is repaired.
     let uv_len = mesh.uvs.len();
+    for set in &mut mesh.extra_uvs {
+        set.resize(uv_len, glam::Vec2::ZERO);
+        for uv in set.iter_mut() {
+            if !uv.is_finite() {
+                *uv = glam::Vec2::ZERO;
+            }
+        }
+    }
     let point_len = mesh.positions.len();
     mesh.polygons.retain_mut(|poly| {
         poly.corners.retain(|c| (c.point as usize) < point_len);
@@ -1021,6 +1049,7 @@ fn repair_mesh(mesh: &mut lc_geom::Mesh) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lc_anim::{AnimChannel, ChannelAddress, ChannelTarget};
 
     #[test]
     fn non_finite_and_degenerate_transforms_are_repaired_on_load() {
@@ -1290,6 +1319,7 @@ mod tests {
         lc_geom::box_projection(&mut mesh, 1.0);
         assert!(mesh.set_crease(0, 1, true));
         assert!(mesh.set_crease(1, 2, true));
+        assert!(mesh.set_crease_weight(2, 3, 0.25));
         assert!(mesh.set_seam(2, 3, true));
         assert!(mesh.set_seam(3, 0, true));
         assert!(mesh.set_uv_pinned(2, true));
@@ -1312,6 +1342,7 @@ mod tests {
             });
         let json = to_json(&doc).unwrap();
         assert!(json.contains("\"creases\""));
+        assert!(json.contains("\"crease_weights\""));
         assert!(json.contains("\"seams\""));
         assert!(json.contains("\"pinned_uvs\""));
         assert!(json.contains("stam_loop"));
@@ -1333,10 +1364,105 @@ mod tests {
         };
         assert!(mesh.is_crease(0, 1));
         assert!(mesh.is_crease(1, 2));
+        assert!((mesh.crease_weight(2, 3) - 0.25).abs() < 1e-6);
         assert!(mesh.is_seam(2, 3));
         assert!(mesh.is_seam(3, 0));
         assert!(mesh.is_uv_pinned(2));
         assert!(mesh.is_uv_pinned(5));
+    }
+
+    #[test]
+    fn additional_uv_sets_roundtrip_and_damaged_sets_are_repaired_on_load() {
+        let mut mesh = lc_geom::box_mesh(2.0, 2.0, 2.0);
+        lc_geom::box_projection(&mut mesh, 1.0);
+        assert_eq!(mesh.add_uv_set(), Some(1));
+        assert!(mesh.set_uv_value(1, 0, glam::Vec2::new(0.25, 0.75)));
+        let slots = mesh.uvs.len();
+        let mut doc = Document::empty();
+        let id = doc.append_node(
+            NodeKind::Mesh {
+                geometry: crate::GeometrySource::Editable { mesh, origin: None },
+            },
+            "Two UV Sets",
+            None,
+        );
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains("extra_uvs"), "additional sets are saved");
+        let back = from_json(&json).unwrap();
+        assert_eq!(doc.signature(), back.signature());
+        let NodeKind::Mesh { geometry } = &back.scene.get(id).unwrap().kind else {
+            panic!("expected a mesh node");
+        };
+        let crate::GeometrySource::Editable { mesh, .. } = geometry else {
+            panic!("expected an editable mesh");
+        };
+        assert_eq!(mesh.uv_set_count(), 2);
+        assert_eq!(mesh.uv_value(1, 0), Some(glam::Vec2::new(0.25, 0.75)));
+        assert_eq!(mesh.extra_uvs[0].len(), slots);
+        assert!(mesh.validate().is_ok());
+
+        // A short, non-parallel set is repaired at the load boundary.
+        let mut damaged: serde_json::Value = serde_json::from_str(&json).unwrap();
+        fn shorten_extra_sets(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Array(sets)) = map.get_mut("extra_uvs") {
+                        if let Some(serde_json::Value::Array(first)) = sets.first_mut() {
+                            first.truncate(2);
+                        }
+                    }
+                    for child in map.values_mut() {
+                        shorten_extra_sets(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        shorten_extra_sets(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        shorten_extra_sets(&mut damaged);
+        let repaired = from_json(&damaged.to_string()).unwrap();
+        let NodeKind::Mesh { geometry } = &repaired.scene.get(id).unwrap().kind else {
+            panic!("expected a mesh node");
+        };
+        let crate::GeometrySource::Editable { mesh, .. } = geometry else {
+            panic!("expected an editable mesh");
+        };
+        assert_eq!(mesh.extra_uvs[0].len(), slots, "sets are re-padded");
+        assert_eq!(mesh.extra_uvs[0][3], glam::Vec2::ZERO);
+        assert!(mesh.validate().is_ok());
+
+        // Old files without the field load as one UV0 set.
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        fn strip_extra_sets(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("extra_uvs");
+                    for child in map.values_mut() {
+                        strip_extra_sets(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        strip_extra_sets(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        strip_extra_sets(&mut legacy);
+        let old = from_json(&legacy.to_string()).unwrap();
+        let NodeKind::Mesh { geometry } = &old.scene.get(id).unwrap().kind else {
+            panic!("expected a mesh node");
+        };
+        let crate::GeometrySource::Editable { mesh, .. } = geometry else {
+            panic!("expected an editable mesh");
+        };
+        assert_eq!(mesh.uv_set_count(), 1);
+        assert!(mesh.extra_uvs.is_empty());
     }
 
     #[test]
@@ -1536,6 +1662,7 @@ mod tests {
         fn strip_new_subdivision_fields(value: &mut serde_json::Value) {
             if let Some(object) = value.as_object_mut() {
                 object.remove("creases");
+                object.remove("crease_weights");
                 object.remove("seams");
                 object.remove("pinned_uvs");
                 object.remove("scheme");
@@ -1584,8 +1711,68 @@ mod tests {
             panic!("expected an editable mesh");
         };
         assert!(mesh.creases.is_empty());
+        assert!(mesh.crease_weights.is_empty());
         assert!(mesh.seams.is_empty());
         assert!(mesh.pinned_uvs.is_empty());
+    }
+
+    #[test]
+    fn legacy_on_disk_fixture_loads_with_documented_defaults_and_evaluates() {
+        // This fixture is checked in as a Wave 1-shaped file: scalar Euler
+        // tracks without tangent metadata, no quaternion rotation, morph or
+        // tag clips, and a Subdivision modifier written before schemes existed.
+        // It must load through the real on-disk entry point, not a clip built
+        // from today's enum.
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy_wave1.lcscene");
+        let doc = load_native(&path).expect("the legacy fixture must load");
+
+        let animated = doc.scene.get(1).expect("legacy animated node");
+        assert!(animated.animation.rotation.is_none());
+        assert!(animated.animation.morph_weights.is_empty());
+        assert_eq!(animated.animation.tracks.len(), 1);
+        assert_eq!(
+            animated.animation.tracks[0].address,
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            "an old property name becomes an owner channel address"
+        );
+        assert!(animated.animation.legacy_euler_rotation.is_empty());
+        let keys = &animated.animation.tracks[0].curve.keys;
+        assert_eq!(keys.len(), 2);
+        assert!(
+            keys.iter().all(|key| !key.tangent_manual),
+            "old keys default to automatic tangents"
+        );
+        assert_eq!(keys[0].tangent_in_type, lc_anim::TangentType::Spline);
+        assert_eq!(keys[0].tangent_out_type, lc_anim::TangentType::Spline);
+        assert!(animated.tag_animations.is_empty());
+        assert!(animated.skin.is_none());
+        assert!(animated.morph.is_empty());
+        assert!(animated.ik.is_none());
+        assert!(animated.rotation_limits.is_none());
+        assert!(animated.material_slots.is_empty());
+        assert!(!animated.locked);
+
+        assert_eq!(doc.settings.units, "metres");
+        assert_eq!(doc.settings.fps, 24.0);
+        assert_eq!(doc.settings.layers.len(), 1);
+        assert_eq!(doc.settings.render, crate::RenderSettings::default());
+        assert!(matches!(
+            doc.scene.get(2).unwrap().modifiers.first(),
+            Some(crate::Modifier::Subdivision {
+                levels: 2,
+                scheme: crate::SubdivisionScheme::CatmullClark
+            })
+        ));
+
+        let evaluated = doc.evaluate(0.5);
+        let moved = evaluated.node(1).expect("the animated node evaluates");
+        assert!(
+            (moved.world.w_axis.x - 0.5).abs() < 1e-4,
+            "legacy Euler keys must still animate: {:?}",
+            moved.world.w_axis
+        );
+        assert!(evaluated.node(2).is_some());
     }
 
     #[test]
@@ -1595,20 +1782,20 @@ mod tests {
         {
             let node = doc.scene.get_mut(id).unwrap();
             node.animation.set_key(
-                lc_anim::AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 0.0,
                 0.0,
                 lc_anim::Interpolation::Smooth,
             );
             node.animation.set_key(
-                lc_anim::AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 1.0,
                 1.0,
                 lc_anim::Interpolation::Smooth,
             );
             let curve = &mut node
                 .animation
-                .track_mut(lc_anim::AnimProperty::TranslationX)
+                .track_mut(ChannelAddress::owner_component(AnimChannel::Translation, 0))
                 .unwrap()
                 .curve;
             assert!(curve.set_manual_tangents(0.0, 0.0, 2.0));
@@ -1622,7 +1809,7 @@ mod tests {
             .get(id)
             .unwrap()
             .animation
-            .track(lc_anim::AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve;
         assert!(curve.keys[0].tangent_manual);
@@ -1654,27 +1841,33 @@ mod tests {
         {
             let animation = &mut doc.scene.get_mut(id).unwrap().animation;
             animation.set_key(
-                lc_anim::AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 1.0,
                 0.0,
                 lc_anim::Interpolation::Smooth,
             );
             animation.set_key(
-                lc_anim::AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 3.0,
                 1.0,
                 lc_anim::Interpolation::Smooth,
             );
             let curve = &mut animation
-                .track_mut(lc_anim::AnimProperty::TranslationX)
+                .track_mut(ChannelAddress::owner_component(AnimChannel::Translation, 0))
                 .unwrap()
                 .curve;
             assert!(curve.set_manual_tangents(1.0, 0.0, 2.0));
             assert!(curve.set_manual_tangents(3.0, 0.0, 0.0));
             animation.set_morph_weight_key(0, 1.0, 0.0, lc_anim::Interpolation::Linear);
             animation.set_morph_weight_key(0, 3.0, 1.0, lc_anim::Interpolation::Linear);
-            animation.set_rotation_key(1.0, glam::Quat::IDENTITY, lc_anim::Interpolation::Linear);
             animation.set_rotation_key(
+                ChannelTarget::Owner,
+                1.0,
+                glam::Quat::IDENTITY,
+                lc_anim::Interpolation::Linear,
+            );
+            animation.set_rotation_key(
+                ChannelTarget::Owner,
                 3.0,
                 glam::Quat::from_rotation_y(1.0),
                 lc_anim::Interpolation::Linear,
@@ -1685,7 +1878,7 @@ mod tests {
         let back = from_json(&json).unwrap();
         let animation = &back.scene.get(id).unwrap().animation;
         let scalar = animation
-            .track(lc_anim::AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap();
         assert!((scalar.curve.keys[0].time - 2.0).abs() < 1e-5);
         assert!((scalar.curve.keys[1].time - 6.0).abs() < 1e-5);
@@ -1726,14 +1919,14 @@ mod tests {
             ];
             for (index, mode) in modes.into_iter().enumerate() {
                 animation.set_key(
-                    lc_anim::AnimProperty::TranslationX,
+                    ChannelAddress::owner_component(AnimChannel::Translation, 0),
                     index as f32,
                     index as f32,
                     mode,
                 );
             }
             let curve = &mut animation
-                .track_mut(lc_anim::AnimProperty::TranslationX)
+                .track_mut(ChannelAddress::owner_component(AnimChannel::Translation, 0))
                 .unwrap()
                 .curve;
             assert!(curve.set_tangent_type(0.0, lc_anim::TangentType::Smooth, true, true));
@@ -1742,8 +1935,14 @@ mod tests {
 
             animation.set_morph_weight_key(0, 0.0, 0.0, lc_anim::Interpolation::Linear);
             animation.set_morph_weight_key(0, 3.0, 1.0, lc_anim::Interpolation::Smooth);
-            animation.set_rotation_key(0.0, glam::Quat::IDENTITY, lc_anim::Interpolation::Constant);
             animation.set_rotation_key(
+                ChannelTarget::Owner,
+                0.0,
+                glam::Quat::IDENTITY,
+                lc_anim::Interpolation::Constant,
+            );
+            animation.set_rotation_key(
+                ChannelTarget::Owner,
                 3.0,
                 glam::Quat::from_rotation_y(1.0),
                 lc_anim::Interpolation::Spline,
@@ -1758,7 +1957,7 @@ mod tests {
 
         let animation = &back.scene.get(id).unwrap().animation;
         let curve = &animation
-            .track(lc_anim::AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve;
         assert_eq!(
@@ -1822,12 +2021,13 @@ mod tests {
             let animation = &mut doc.scene.get_mut(id).unwrap().animation;
             for (time, value) in [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)] {
                 animation.set_key(
-                    lc_anim::AnimProperty::TranslationX,
+                    ChannelAddress::owner_component(AnimChannel::Translation, 0),
                     time,
                     value,
                     lc_anim::Interpolation::Smooth,
                 );
                 animation.set_rotation_key(
+                    ChannelTarget::Owner,
                     time,
                     glam::Quat::from_rotation_y(value * 0.4),
                     lc_anim::Interpolation::Smooth,
@@ -1843,7 +2043,7 @@ mod tests {
             .get(id)
             .unwrap()
             .animation
-            .track(lc_anim::AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve;
         assert!(curve.keys.iter().all(|key| {
@@ -2419,5 +2619,78 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn addressed_tracks_read_legacy_property_names_and_round_trip() {
+        let legacy = r#"{
+            "tracks": [
+                {"property": "scale_z", "curve": {"keys": [{"time": 0.0, "value": 2.0}]}},
+                {"property": "rotation_x", "curve": {"keys": [{"time": 0.0, "value": 30.0}]}}
+            ]
+        }"#;
+        let clip: lc_anim::AnimationClip = serde_json::from_str(legacy).unwrap();
+        assert_eq!(clip.tracks.len(), 1);
+        assert_eq!(
+            clip.tracks[0].address,
+            ChannelAddress::owner_component(AnimChannel::Scale, 2)
+        );
+        assert_eq!(clip.legacy_euler_rotation.len(), 1);
+        assert!(clip.legacy_euler_rotation.contains_key(&0));
+
+        let json = serde_json::to_string(&clip).unwrap();
+        assert!(json.contains("\"address\""), "new files write an address");
+        assert!(
+            !json.contains("scale_z"),
+            "old property names are not written"
+        );
+        let back: lc_anim::AnimationClip = serde_json::from_str(&json).unwrap();
+        assert_eq!(clip, back);
+        assert_eq!(clip.signature(), back.signature());
+        assert!(
+            (back
+                .sample(ChannelAddress::owner_component(AnimChannel::Scale, 2), 0.0)
+                .unwrap()
+                - 2.0)
+                .abs()
+                < 1e-6
+        );
+        let euler = back.apply_transform(lc_core::Transform::IDENTITY, 0.0);
+        assert!((euler.euler_degrees().x - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn addressed_object_tracks_evaluate_and_survive_native_round_trip() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Addressed", None);
+        {
+            let address =
+                ChannelAddress::new(ChannelTarget::Object { id }, AnimChannel::Translation, 1)
+                    .unwrap();
+            let node = doc.scene.get_mut(id).unwrap();
+            node.animation
+                .set_key(address, 0.0, 1.5, lc_anim::Interpolation::Linear);
+            node.animation.set_rotation_key(
+                ChannelTarget::Object { id },
+                0.0,
+                glam::Quat::from_rotation_y(0.5),
+                lc_anim::Interpolation::Linear,
+            );
+        }
+        let json = to_json(&doc).unwrap();
+        let back = from_json(&json).unwrap();
+        assert_eq!(doc.signature(), back.signature());
+        let animation = &back.scene.get(id).unwrap().animation;
+        assert_eq!(
+            animation.tracks[0].address,
+            ChannelAddress::new(ChannelTarget::Object { id }, AnimChannel::Translation, 1).unwrap()
+        );
+        assert_eq!(animation.tracks[0].address.label(), "Location Y");
+        assert_eq!(
+            animation.rotation.as_ref().unwrap().target,
+            ChannelTarget::Object { id }
+        );
+        let evaluated = back.evaluate(0.0);
+        assert!((evaluated.node(id).unwrap().world.w_axis.y - 1.5).abs() < 1e-4);
     }
 }

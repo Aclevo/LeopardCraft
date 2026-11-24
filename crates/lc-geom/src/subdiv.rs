@@ -15,7 +15,35 @@ pub fn catmull_clark(mesh: &Mesh, levels: u32) -> Mesh {
         }
         out = subdivide_once(&out);
     }
+    carry_extra_uv_sets(mesh, levels, &mut out, catmull_clark);
     out
+}
+
+/// Run the same subdivision on each additional UV set.
+///
+/// The UV0 rules are point-based and shared by the topology, so a probe mesh
+/// whose UV0 is the extra set produces that set's coordinates for the new
+/// points. Clearing the probe's extra sets keeps the call non-recursive.
+fn carry_extra_uv_sets(
+    source: &Mesh,
+    levels: u32,
+    out: &mut Mesh,
+    subdivide: fn(&Mesh, u32) -> Mesh,
+) {
+    if source.extra_uvs.is_empty() || out.uvs.is_empty() {
+        return;
+    }
+    let mut extras = Vec::with_capacity(source.extra_uvs.len());
+    for set in &source.extra_uvs {
+        let mut probe = source.clone();
+        probe.uvs = set.clone();
+        probe.extra_uvs.clear();
+        let mut values = subdivide(&probe, levels).uvs;
+        values.resize(out.uvs.len(), Vec2::ZERO);
+        extras.push(values);
+    }
+    out.extra_uvs = extras;
+    out.sync_uv_sets();
 }
 
 fn subdivide_once(mesh: &Mesh) -> Mesh {
@@ -110,14 +138,20 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
         .collect();
     uvs.extend_from_slice(&point_uv);
 
-    // Boundary edges behave as creases. Authored creases use the same sharp
-    // vertex rule: two incident creases follow the crease curve, three or more
-    // pin the point, and a single crease falls back to the smooth rule.
-    let sharp_neighbours = |p: usize| -> Vec<u32> {
-        let mut ns = Vec::new();
+    // Boundary edges behave as full creases. Authored creases use the same
+    // sharp vertex rule, blended toward the smooth rule by the weakest incident
+    // crease weight: two incident creases follow the crease curve, three or
+    // more pin the point, and a single crease falls back to the smooth rule.
+    let sharp_neighbours = |p: usize| -> Vec<(u32, f32)> {
+        let mut ns: Vec<(u32, f32)> = Vec::new();
         for &ei in &point_edges[p] {
             let (a, b, faces) = &edges[ei];
-            if faces.len() > 1 && !mesh.is_crease(*a, *b) {
+            let weight = if faces.len() < 2 {
+                1.0
+            } else {
+                mesh.crease_weight(*a, *b)
+            };
+            if weight <= 0.0 {
                 continue;
             }
             let other = if *a as usize == p {
@@ -127,8 +161,10 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
             } else {
                 continue;
             };
-            if !ns.contains(&other) {
-                ns.push(other);
+            if let Some(existing) = ns.iter_mut().find(|(point, _)| *point == other) {
+                existing.1 = existing.1.max(weight);
+            } else {
+                ns.push((other, weight));
             }
         }
         ns
@@ -142,16 +178,6 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
             new_points.push(pos);
             continue;
         }
-        let sharp = sharp_neighbours(p);
-        if sharp.len() >= 2 {
-            if sharp.len() > 2 {
-                new_points.push(pos);
-            } else {
-                let sum = mesh.positions[sharp[0] as usize] + mesh.positions[sharp[1] as usize];
-                new_points.push(pos * 0.75 + sum * 0.125);
-            }
-            continue;
-        }
         let f = faces.iter().map(|&fi| face_pos[fi]).sum::<Vec3>() / faces.len() as f32;
         let mut r = Vec3::ZERO;
         for &ei in &point_edges[p] {
@@ -160,7 +186,23 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
         }
         r /= point_edges[p].len().max(1) as f32;
         let n = faces.len() as f32;
-        new_points.push((f + r * 2.0 + pos * (n - 3.0)) / n);
+        let smooth = (f + r * 2.0 + pos * (n - 3.0)) / n;
+        let sharp = sharp_neighbours(p);
+        if sharp.len() >= 2 {
+            let sharp_pos = if sharp.len() > 2 {
+                pos
+            } else {
+                let sum = mesh.positions[sharp[0].0 as usize] + mesh.positions[sharp[1].0 as usize];
+                pos * 0.75 + sum * 0.125
+            };
+            let strength = sharp
+                .iter()
+                .map(|(_, weight)| *weight)
+                .fold(1.0_f32, f32::min);
+            new_points.push(smooth.lerp(sharp_pos, strength));
+        } else {
+            new_points.push(smooth);
+        }
     }
     for (i, p) in new_points.into_iter().enumerate() {
         positions[i] = p;
@@ -171,19 +213,25 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
     for (a, b, faces) in &edges {
         let pa = mesh.positions[*a as usize];
         let pb = mesh.positions[*b as usize];
-        let sharp = faces.len() < 2 || mesh.is_crease(*a, *b);
-        let pos = if sharp {
+        let sharpness = if faces.len() < 2 {
+            1.0
+        } else {
+            mesh.crease_weight(*a, *b)
+        };
+        let smooth = if faces.len() < 2 {
             (pa + pb) * 0.5
         } else {
             (pa + pb + face_pos[faces[0]] + face_pos[faces[1]]) * 0.25
         };
+        let pos = smooth.lerp((pa + pb) * 0.5, sharpness);
         let uv_a = point_uv[*a as usize];
         let uv_b = point_uv[*b as usize];
-        let uv = if sharp {
+        let smooth_uv = if faces.len() < 2 {
             (uv_a + uv_b) * 0.5
         } else {
             (uv_a + uv_b + face_uv[faces[0]] + face_uv[faces[1]]) * 0.25
         };
+        let uv = smooth_uv.lerp((uv_a + uv_b) * 0.5, sharpness);
         let idx = positions.len();
         positions.push(pos);
         uvs.push(uv);
@@ -226,16 +274,17 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
         }
     }
 
-    // Split authored creases and seams onto both child edges so sharpness and
-    // UV chart borders survive further subdivision levels.
+    // Split authored creases and seams onto both child edges, preserving each
+    // fractional crease weight, so sharpness and UV chart borders survive
+    // further subdivision levels.
     let mut creases = Vec::new();
+    let mut crease_weights = Vec::new();
     let mut seams = Vec::new();
     for (ei, (a, b, _)) in edges.iter().enumerate() {
         let mid = edge_point_index[ei] as u32;
-        if mesh.is_crease(*a, *b) {
-            creases.push(pair(*a, mid));
-            creases.push(pair(mid, *b));
-        }
+        let weight = mesh.crease_weight(*a, *b);
+        push_crease(&mut creases, &mut crease_weights, *a, mid, weight);
+        push_crease(&mut creases, &mut crease_weights, mid, *b, weight);
         if mesh.is_seam(*a, *b) {
             seams.push(pair(*a, mid));
             seams.push(pair(mid, *b));
@@ -243,6 +292,8 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
     }
     creases.sort_unstable();
     creases.dedup();
+    crease_weights.sort_by_key(|(edge, _)| *edge);
+    crease_weights.dedup_by(|(a, _), (b, _)| a == b);
     seams.sort_unstable();
     seams.dedup();
 
@@ -253,10 +304,12 @@ fn subdivide_once(mesh: &Mesh) -> Mesh {
         uvs,
         polygons: polys,
         creases,
+        crease_weights: Box::new(crease_weights),
         seams,
         // Subdivision re-authors the UV set per point, so slot pins cannot
         // survive it and are cleared instead of pointing at unrelated UVs.
         pinned_uvs: Vec::new(),
+        extra_uvs: Vec::new(),
     };
     out.remove_degenerate_polygons();
     out.normalize_creases();
@@ -275,6 +328,7 @@ pub fn linear(mesh: &Mesh, levels: u32) -> Mesh {
         }
         out = linear_once(&out);
     }
+    carry_extra_uv_sets(mesh, levels, &mut out, linear);
     out
 }
 
@@ -351,11 +405,18 @@ fn linear_once(mesh: &Mesh) -> Mesh {
     }
 
     let mut creases = Vec::new();
+    let mut crease_weights = Vec::new();
     let mut seams = Vec::new();
     for [a, b] in &mesh.creases {
         if let Some(&mid) = edge_mid.get(&key(*a, *b)) {
-            creases.push(pair(*a, mid));
-            creases.push(pair(mid, *b));
+            push_crease(&mut creases, &mut crease_weights, *a, mid, 1.0);
+            push_crease(&mut creases, &mut crease_weights, mid, *b, 1.0);
+        }
+    }
+    for ([a, b], weight) in mesh.crease_weights.iter() {
+        if let Some(&mid) = edge_mid.get(&key(*a, *b)) {
+            push_crease(&mut creases, &mut crease_weights, *a, mid, *weight);
+            push_crease(&mut creases, &mut crease_weights, mid, *b, *weight);
         }
     }
     for [a, b] in &mesh.seams {
@@ -366,6 +427,8 @@ fn linear_once(mesh: &Mesh) -> Mesh {
     }
     creases.sort_unstable();
     creases.dedup();
+    crease_weights.sort_by_key(|(edge, _)| *edge);
+    crease_weights.dedup_by(|(a, _), (b, _)| a == b);
     seams.sort_unstable();
     seams.dedup();
 
@@ -375,10 +438,12 @@ fn linear_once(mesh: &Mesh) -> Mesh {
         uvs,
         polygons: polys,
         creases,
+        crease_weights: Box::new(crease_weights),
         seams,
         // Subdivision re-authors the UV set per point, so slot pins cannot
         // survive it and are cleared instead of pointing at unrelated UVs.
         pinned_uvs: Vec::new(),
+        extra_uvs: Vec::new(),
     };
     out.remove_degenerate_polygons();
     out.normalize_creases();
@@ -398,6 +463,7 @@ pub fn stam_loop(mesh: &Mesh, levels: u32) -> Mesh {
         }
         out = loop_once(&triangulated_for_loop(&out));
     }
+    carry_extra_uv_sets(mesh, levels, &mut out, stam_loop);
     out
 }
 
@@ -406,8 +472,10 @@ fn triangulated_for_loop(mesh: &Mesh) -> Mesh {
         name: mesh.name.clone(),
         positions: mesh.positions.clone(),
         uvs: mesh.uvs.clone(),
+        extra_uvs: mesh.extra_uvs.clone(),
         polygons: Vec::with_capacity(mesh.polygons.len() * 2),
         creases: mesh.creases.clone(),
+        crease_weights: mesh.crease_weights.clone(),
         seams: mesh.seams.clone(),
         pinned_uvs: mesh.pinned_uvs.clone(),
     };
@@ -490,22 +558,19 @@ fn loop_once(mesh: &Mesh) -> Mesh {
     for p in 0..npoints {
         let pos = mesh.positions[p];
         let neighbours = &point_neighbours[p];
-        let mut sharp = Vec::new();
+        let mut sharp: Vec<(u32, f32)> = Vec::new();
         for &other in neighbours {
             let (a, b, adjacent) = &edges[edge_index[&key(p as u32, other)]];
-            if adjacent.len() < 2 || mesh.is_crease(*a, *b) {
-                sharp.push(other);
+            let weight = if adjacent.len() < 2 {
+                1.0
+            } else {
+                mesh.crease_weight(*a, *b)
+            };
+            if weight > 0.0 {
+                sharp.push((other, weight));
             }
         }
-        let next = if sharp.len() >= 2 {
-            if sharp.len() > 2 {
-                pos
-            } else {
-                pos * 0.75
-                    + (mesh.positions[sharp[0] as usize] + mesh.positions[sharp[1] as usize])
-                        * 0.125
-            }
-        } else if neighbours.is_empty() {
+        let smooth = if neighbours.is_empty() {
             pos
         } else {
             let n = neighbours.len() as f32;
@@ -520,6 +585,22 @@ fn loop_once(mesh: &Mesh) -> Mesh {
                 .sum::<Vec3>();
             pos * (1.0 - n * beta) + sum * beta
         };
+        let next = if sharp.len() >= 2 {
+            let sharp_pos = if sharp.len() > 2 {
+                pos
+            } else {
+                pos * 0.75
+                    + (mesh.positions[sharp[0].0 as usize] + mesh.positions[sharp[1].0 as usize])
+                        * 0.125
+            };
+            let strength = sharp
+                .iter()
+                .map(|(_, weight)| *weight)
+                .fold(1.0_f32, f32::min);
+            smooth.lerp(sharp_pos, strength)
+        } else {
+            smooth
+        };
         positions.push(next);
         uvs.push(if point_uv_count[p] > 0 {
             point_uv_sum[p] / point_uv_count[p] as f32
@@ -532,14 +613,19 @@ fn loop_once(mesh: &Mesh) -> Mesh {
     for (a, b, opposite) in &edges {
         let pa = mesh.positions[*a as usize];
         let pb = mesh.positions[*b as usize];
-        let sharp = opposite.len() < 2 || mesh.is_crease(*a, *b);
-        let pos = if sharp {
+        let sharpness = if opposite.len() < 2 {
+            1.0
+        } else {
+            mesh.crease_weight(*a, *b)
+        };
+        let smooth = if opposite.len() < 2 {
             (pa + pb) * 0.5
         } else {
             let c = mesh.positions[opposite[0].1 as usize];
             let d = mesh.positions[opposite[1].1 as usize];
             (pa + pb) * 0.375 + (c + d) * 0.125
         };
+        let pos = smooth.lerp((pa + pb) * 0.5, sharpness);
         let uv = (mesh.uvs.get(*a as usize).copied().unwrap_or(Vec2::ZERO)
             + mesh.uvs.get(*b as usize).copied().unwrap_or(Vec2::ZERO))
             * 0.5;
@@ -578,13 +664,13 @@ fn loop_once(mesh: &Mesh) -> Mesh {
     }
 
     let mut creases = Vec::new();
+    let mut crease_weights = Vec::new();
     let mut seams = Vec::new();
     for (ei, (a, b, _)) in edges.iter().enumerate() {
         let mid = edge_points[ei];
-        if mesh.is_crease(*a, *b) {
-            creases.push(pair(*a, mid));
-            creases.push(pair(mid, *b));
-        }
+        let weight = mesh.crease_weight(*a, *b);
+        push_crease(&mut creases, &mut crease_weights, *a, mid, weight);
+        push_crease(&mut creases, &mut crease_weights, mid, *b, weight);
         if mesh.is_seam(*a, *b) {
             seams.push(pair(*a, mid));
             seams.push(pair(mid, *b));
@@ -592,6 +678,8 @@ fn loop_once(mesh: &Mesh) -> Mesh {
     }
     creases.sort_unstable();
     creases.dedup();
+    crease_weights.sort_by_key(|(edge, _)| *edge);
+    crease_weights.dedup_by(|(a, _), (b, _)| a == b);
     seams.sort_unstable();
     seams.dedup();
 
@@ -601,15 +689,294 @@ fn loop_once(mesh: &Mesh) -> Mesh {
         uvs,
         polygons: polys,
         creases,
+        crease_weights: Box::new(crease_weights),
         seams,
         // Subdivision re-authors the UV set per point, so slot pins cannot
         // survive it and are cleared instead of pointing at unrelated UVs.
         pinned_uvs: Vec::new(),
+        extra_uvs: Vec::new(),
     };
     out.remove_degenerate_polygons();
     out.normalize_creases();
     out.normalize_seams();
     out
+}
+
+/// Subdivision scheme used by the face-selective polygon tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubdivisionKind {
+    #[default]
+    CatmullClark,
+    StamLoop,
+    Linear,
+}
+
+impl SubdivisionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CatmullClark => "Catmull-Clark",
+            Self::StamLoop => "Stam-Loop",
+            Self::Linear => "Linear",
+        }
+    }
+}
+
+/// Subdivide only the selected polygons, leaving the rest of the mesh intact.
+///
+/// The selection is subdivided as a patch. Its boundary is pinned onto the
+/// original boundary segments and every unselected polygon that shares one of
+/// those segments gains the new collinear boundary points. The result is
+/// watertight across the selection border, and unselected vertices keep their
+/// exact positions. Creases, fractional crease weights, seams, UVs and material
+/// slots survive; UV pins are cleared because subdivision re-authors the slots.
+pub fn subdivide_faces(mesh: &Mesh, faces: &[usize], levels: u32, kind: SubdivisionKind) -> Mesh {
+    let mut selected = vec![false; mesh.polygons.len()];
+    for face in faces {
+        if let Some(slot) = selected.get_mut(*face) {
+            *slot = true;
+        }
+    }
+    if levels == 0 || !selected.iter().any(|chosen| *chosen) {
+        return mesh.clone();
+    }
+
+    let submesh = Mesh {
+        name: mesh.name.clone(),
+        positions: mesh.positions.clone(),
+        uvs: mesh.uvs.clone(),
+        extra_uvs: Vec::new(),
+        polygons: mesh
+            .polygons
+            .iter()
+            .zip(&selected)
+            .filter(|(_, chosen)| **chosen)
+            .map(|(poly, _)| poly.clone())
+            .collect(),
+        creases: mesh.creases.clone(),
+        crease_weights: mesh.crease_weights.clone(),
+        seams: mesh.seams.clone(),
+        pinned_uvs: Vec::new(),
+    };
+    let mut patch = match kind {
+        SubdivisionKind::CatmullClark => catmull_clark(&submesh, levels),
+        SubdivisionKind::StamLoop => stam_loop(&submesh, levels),
+        SubdivisionKind::Linear => linear(&submesh, levels),
+    };
+
+    // Original edges used by the selection. Edges on the selection border are
+    // split by the patch, so their marks live in the patch already.
+    let mut selected_edges: Vec<[u32; 2]> = Vec::new();
+    let mut patch_edges: HashMap<(u32, u32), u32> = HashMap::new();
+    for poly in &submesh.polygons {
+        let n = poly.corners.len();
+        for i in 0..n {
+            let a = poly.corners[i].point;
+            let b = poly.corners[(i + 1) % n].point;
+            if a == b {
+                continue;
+            }
+            selected_edges.push(pair(a, b));
+        }
+    }
+    selected_edges.sort_unstable();
+    selected_edges.dedup();
+    let boundary_segments: Vec<[u32; 2]> = selected_edges
+        .iter()
+        .copied()
+        .filter(|[a, b]| {
+            submesh
+                .polygons
+                .iter()
+                .filter(|poly| {
+                    let n = poly.corners.len();
+                    (0..n).any(|i| {
+                        let x = poly.corners[i].point;
+                        let y = poly.corners[(i + 1) % n].point;
+                        pair(x, y) == [*a, *b]
+                    })
+                })
+                .count()
+                == 1
+        })
+        .collect();
+
+    // A patch boundary vertex list: edges used by exactly one patch polygon.
+    for poly in &patch.polygons {
+        let n = poly.corners.len();
+        for i in 0..n {
+            let a = poly.corners[i].point;
+            let b = poly.corners[(i + 1) % n].point;
+            if a != b {
+                *patch_edges.entry(key(a, b)).or_insert(0) += 1;
+            }
+        }
+    }
+    let boundary_points: Vec<u32> = patch_edges
+        .iter()
+        .filter(|(_, count)| **count == 1)
+        .flat_map(|((a, b), _)| [*a, *b])
+        .collect();
+
+    // Pin every point on the patch boundary, plus new boundary points, so the
+    // selection border stays on the original segments and the unselected
+    // region keeps its exact shape.
+    for point in &boundary_points {
+        let index = *point as usize;
+        if index < mesh.positions.len() {
+            patch.positions[index] = mesh.positions[index];
+        }
+    }
+    for (index, poly) in mesh.polygons.iter().enumerate() {
+        if selected[index] {
+            continue;
+        }
+        for corner in &poly.corners {
+            let point = corner.point as usize;
+            if point < patch.positions.len() {
+                patch.positions[point] = mesh.positions[point];
+            }
+        }
+    }
+    for point in &boundary_points {
+        let index = *point as usize;
+        if index < mesh.positions.len() {
+            continue;
+        }
+        let p = patch.positions[index];
+        let mut closest = (f32::INFINITY, 0.0_f32, 0);
+        for (segment, [a, b]) in boundary_segments.iter().enumerate() {
+            let pa = mesh.positions[*a as usize];
+            let pb = mesh.positions[*b as usize];
+            let (t, distance) = segment_parameter(p, pa, pb);
+            if distance < closest.0 {
+                closest = (distance, t, segment);
+            }
+        }
+        if closest.0.is_finite() {
+            let [a, b] = boundary_segments[closest.2];
+            patch.positions[index] =
+                mesh.positions[a as usize].lerp(mesh.positions[b as usize], closest.1);
+        }
+    }
+
+    // Re-add unselected polygons, threading every new boundary point that lies
+    // on one of their edges into the corner list in order. Patch UVs are
+    // authored per point, so unselected corners append their original UV value
+    // to the same slots instead of reusing original slot indices.
+    let mut polygons = patch.polygons.clone();
+    let mut uvs = patch.uvs.clone();
+    for (fi, poly) in mesh.polygons.iter().enumerate() {
+        if selected[fi] {
+            continue;
+        }
+        let mut corners = Vec::with_capacity(poly.corners.len());
+        let n = poly.corners.len();
+        for i in 0..n {
+            let original_corner = poly.corners[i];
+            let original_slot = uvs.len();
+            uvs.push(mesh.uv_of(&original_corner));
+            corners.push(Corner::new(original_corner.point, original_slot as u32));
+            let a = poly.corners[i].point;
+            let b = poly.corners[(i + 1) % n].point;
+            if a == b {
+                continue;
+            }
+            let pa = mesh.positions[a as usize];
+            let pb = mesh.positions[b as usize];
+            let mut inserts: Vec<(f32, u32)> = boundary_points
+                .iter()
+                .copied()
+                .filter(|point| (*point as usize) >= mesh.positions.len())
+                .filter_map(|point| {
+                    let (t, distance) = segment_parameter(patch.positions[point as usize], pa, pb);
+                    if t > 1e-5 && t < 1.0 - 1e-5 && distance <= 1e-4 {
+                        Some((t, point))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            inserts.sort_by(|(ta, pa), (tb, pb)| ta.total_cmp(tb).then_with(|| pa.cmp(pb)));
+            inserts.dedup_by_key(|(_, point)| *point);
+            for (_, point) in inserts {
+                let slot = uvs.len();
+                uvs.push(patch.uvs.get(point as usize).copied().unwrap_or(Vec2::ZERO));
+                corners.push(Corner::new(point, slot as u32));
+            }
+        }
+        polygons.push(Polygon {
+            corners,
+            material_slot: poly.material_slot,
+        });
+    }
+
+    // Marks wholly inside the unselected region keep their original indices;
+    // marks touching the selection were split by the patch.
+    for [a, b] in &mesh.creases {
+        if selected_edges.binary_search(&pair(*a, *b)).is_err() {
+            patch.creases.push(pair(*a, *b));
+        }
+    }
+    for ([a, b], weight) in mesh.crease_weights.iter() {
+        if selected_edges.binary_search(&pair(*a, *b)).is_err() {
+            patch.crease_weights.push((pair(*a, *b), *weight));
+        }
+    }
+    for [a, b] in &mesh.seams {
+        if selected_edges.binary_search(&pair(*a, *b)).is_err() {
+            patch.seams.push(pair(*a, *b));
+        }
+    }
+    patch.polygons = polygons;
+    patch.uvs = uvs;
+    patch.pinned_uvs.clear();
+    patch.remove_degenerate_polygons();
+    patch.normalize_creases();
+    patch.normalize_seams();
+
+    if !mesh.extra_uvs.is_empty() {
+        let mut extras = Vec::with_capacity(mesh.extra_uvs.len());
+        for set in &mesh.extra_uvs {
+            let mut probe = mesh.clone();
+            probe.uvs = set.clone();
+            probe.extra_uvs.clear();
+            let mut values = subdivide_faces(&probe, faces, levels, kind).uvs;
+            values.resize(patch.uvs.len(), Vec2::ZERO);
+            extras.push(values);
+        }
+        patch.extra_uvs = extras;
+        patch.sync_uv_sets();
+    }
+    patch
+}
+
+/// Closest point parameter and distance from `p` to segment `a`-`b`.
+fn segment_parameter(p: Vec3, a: Vec3, b: Vec3) -> (f32, f32) {
+    let edge = b - a;
+    let length_squared = edge.length_squared();
+    if length_squared <= 1e-12 {
+        return (0.0, p.distance(a));
+    }
+    let t = ((p - a).dot(edge) / length_squared).clamp(0.0, 1.0);
+    (t, p.distance(a + edge * t))
+}
+
+fn push_crease(
+    creases: &mut Vec<[u32; 2]>,
+    weights: &mut Vec<([u32; 2], f32)>,
+    a: u32,
+    b: u32,
+    weight: f32,
+) {
+    if weight <= 0.0 {
+        return;
+    }
+    let edge = pair(a, b);
+    if weight >= 1.0 {
+        creases.push(edge);
+    } else {
+        weights.push((edge, weight));
+    }
 }
 
 fn pair(a: u32, b: u32) -> [u32; 2] {
@@ -698,6 +1065,216 @@ mod tests {
         mesh
     }
 
+    fn top_weighted_cube(weight: f32) -> Mesh {
+        let mut mesh = primitives::box_mesh(2.0, 2.0, 2.0);
+        let top = mesh.polygons[4].clone();
+        for i in 0..top.corners.len() {
+            let a = top.corners[i].point;
+            let b = top.corners[(i + 1) % top.corners.len()].point;
+            if weight > 0.0 {
+                assert!(mesh.set_crease_weight(a, b, weight));
+            }
+        }
+        mesh
+    }
+
+    fn face_centre(mesh: &Mesh, face: usize) -> Vec3 {
+        let points = mesh.polygon_points(face);
+        points.iter().copied().sum::<Vec3>() / points.len() as f32
+    }
+
+    /// Independent Catmull-Clark smooth rule for one point, so the weighted
+    /// test does not just repeat the implementation's arithmetic.
+    fn cc_smooth_point(mesh: &Mesh, point: u32) -> Vec3 {
+        let mut faces = Vec::new();
+        for (fi, poly) in mesh.polygons.iter().enumerate() {
+            if poly.corners.iter().any(|c| c.point == point) && !faces.contains(&fi) {
+                faces.push(fi);
+            }
+        }
+        let f = faces.iter().map(|fi| face_centre(mesh, *fi)).sum::<Vec3>() / faces.len() as f32;
+        let incident = mesh
+            .edges()
+            .into_iter()
+            .filter(|edge| edge.a == point || edge.b == point)
+            .collect::<Vec<_>>();
+        let r = incident
+            .iter()
+            .map(|edge| (mesh.positions[edge.a as usize] + mesh.positions[edge.b as usize]) * 0.5)
+            .sum::<Vec3>()
+            / incident.len() as f32;
+        let pos = mesh.positions[point as usize];
+        let n = faces.len() as f32;
+        (f + r * 2.0 + pos * (n - 3.0)) / n
+    }
+
+    #[test]
+    fn catmull_clark_crease_weights_blend_edge_and_vertex_rules_exactly() {
+        let cube = primitives::box_mesh(2.0, 2.0, 2.0);
+        let top = cube.polygons[4].clone();
+        let a = top.corners[0].point;
+        let b = top.corners[1].point;
+        let edge_faces = cube
+            .polygons
+            .iter()
+            .enumerate()
+            .filter(|(_, poly)| {
+                poly.corners.iter().any(|c| c.point == a)
+                    && poly.corners.iter().any(|c| c.point == b)
+            })
+            .map(|(fi, _)| fi)
+            .collect::<Vec<_>>();
+        assert_eq!(edge_faces.len(), 2, "the test edge must be interior");
+        let sharp_edge = (cube.positions[a as usize] + cube.positions[b as usize]) * 0.5;
+        let smooth_edge = (cube.positions[a as usize]
+            + cube.positions[b as usize]
+            + face_centre(&cube, edge_faces[0])
+            + face_centre(&cube, edge_faces[1]))
+            * 0.25;
+
+        let smooth_vertex = cc_smooth_point(&cube, a);
+        let crease_neighbours = cube
+            .edges()
+            .into_iter()
+            .filter(|edge| edge.a == a || edge.b == a)
+            .filter(|edge| {
+                top.corners.iter().any(|c| c.point == edge.a)
+                    && top.corners.iter().any(|c| c.point == edge.b)
+            })
+            .map(|edge| if edge.a == a { edge.b } else { edge.a })
+            .collect::<Vec<_>>();
+        assert_eq!(crease_neighbours.len(), 2);
+        let sharp_vertex = cube.positions[a as usize] * 0.75
+            + (cube.positions[crease_neighbours[0] as usize]
+                + cube.positions[crease_neighbours[1] as usize])
+                * 0.125;
+
+        for weight in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let weighted = top_weighted_cube(weight);
+            let sub = catmull_clark(&weighted, 1);
+            let edge_expected = smooth_edge.lerp(sharp_edge, weight);
+            let vertex_expected = smooth_vertex.lerp(sharp_vertex, weight);
+            assert!(
+                sub.positions
+                    .iter()
+                    .any(|p| p.distance(edge_expected) < 1e-5),
+                "weight {weight} did not produce the blended edge point at {edge_expected}"
+            );
+            assert!(
+                sub.positions[a as usize].distance(vertex_expected) < 1e-5,
+                "weight {weight} did not blend the crease corner: got {}, expected {}",
+                sub.positions[a as usize],
+                vertex_expected
+            );
+        }
+
+        let half = catmull_clark(&top_weighted_cube(0.5), 1);
+        assert!(
+            half.crease_weights
+                .iter()
+                .any(|(_, weight)| (*weight - 0.5).abs() < 1e-6),
+            "fractional child creases must keep their weight"
+        );
+    }
+
+    #[test]
+    fn stam_loop_blends_fractional_crease_corners_between_the_two_rules() {
+        let zero = stam_loop(&top_weighted_cube(0.0), 1);
+        let half = stam_loop(&top_weighted_cube(0.5), 1);
+        let one = stam_loop(&top_weighted_cube(1.0), 1);
+        let corner = primitives::box_mesh(2.0, 2.0, 2.0).polygons[4].corners[0].point as usize;
+        let expected = zero.positions[corner].lerp(one.positions[corner], 0.5);
+        assert!(half.positions[corner].distance(expected) < 1e-5);
+        assert!(half.positions[corner].distance(zero.positions[corner]) > 1e-4);
+        assert!(half.positions[corner].distance(one.positions[corner]) > 1e-4);
+        assert!(half.crease_weights.iter().any(|(_, weight)| *weight == 0.5));
+    }
+
+    #[test]
+    fn partial_subdivision_is_watertight_and_preserves_the_unselected_region() {
+        let plane = primitives::plane_mesh(3.0, 3.0, 3, 3);
+        let original_positions = plane.positions.clone();
+        let selected_face = 0usize;
+        let selected_points = plane.polygons[selected_face]
+            .corners
+            .iter()
+            .map(|corner| corner.point)
+            .collect::<Vec<_>>();
+        for kind in [
+            SubdivisionKind::CatmullClark,
+            SubdivisionKind::StamLoop,
+            SubdivisionKind::Linear,
+        ] {
+            let partial = subdivide_faces(&plane, &[selected_face], 1, kind);
+            if let Err(errors) = partial.validate() {
+                panic!("{kind:?} produced invalid geometry: {errors:?}");
+            }
+            let unselected_points: std::collections::HashSet<u32> = plane
+                .polygons
+                .iter()
+                .enumerate()
+                .filter(|(fi, _)| *fi != selected_face)
+                .flat_map(|(_, poly)| poly.corners.iter().map(|corner| corner.point))
+                .collect();
+            for index in unselected_points {
+                assert_eq!(
+                    partial.positions[index as usize], original_positions[index as usize],
+                    "{kind:?} moved unselected point {index}"
+                );
+            }
+            // Every interior edge is shared by exactly two faces; only the
+            // original outer border may stay open.
+            for edge in partial.edges() {
+                if edge.faces.len() == 1 {
+                    let a = partial.positions[edge.a as usize];
+                    let b = partial.positions[edge.b as usize];
+                    let outer = a.x.abs() > 1.5 - 1e-4
+                        || a.z.abs() > 1.5 - 1e-4
+                        || b.x.abs() > 1.5 - 1e-4
+                        || b.z.abs() > 1.5 - 1e-4;
+                    assert!(outer, "{kind:?} left an interior crack at {:?}", (a, b));
+                }
+            }
+            // The selection boundary gains one midpoint per selected edge, and
+            // each is used by both the patch and its unselected neighbour.
+            for i in 0..selected_points.len() {
+                let a = selected_points[i];
+                let b = selected_points[(i + 1) % selected_points.len()];
+                let midpoint = plane.positions[a as usize].lerp(plane.positions[b as usize], 0.5);
+                let end_a = plane.positions[a as usize];
+                let end_b = plane.positions[b as usize];
+                let uses = partial
+                    .edges()
+                    .into_iter()
+                    .filter(|edge| {
+                        let pa = partial.positions[edge.a as usize];
+                        let pb = partial.positions[edge.b as usize];
+                        let has_mid = pa.distance(midpoint) < 1e-5 || pb.distance(midpoint) < 1e-5;
+                        let has_end = pa.distance(end_a) < 1e-5
+                            || pa.distance(end_b) < 1e-5
+                            || pb.distance(end_a) < 1e-5
+                            || pb.distance(end_b) < 1e-5;
+                        has_mid && has_end
+                    })
+                    .count();
+                assert_eq!(
+                    uses, 2,
+                    "{kind:?} did not split the boundary edge into two shared segments"
+                );
+            }
+            assert!(partial.polygons.iter().any(|poly| poly.corners.len() == 5));
+            // No duplicate watertight-boundary vertex.
+            for i in 0..partial.positions.len() {
+                for j in (i + 1)..partial.positions.len() {
+                    assert!(
+                        partial.positions[i].distance(partial.positions[j]) > 1e-6,
+                        "{kind:?} duplicated a boundary vertex"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn stam_loop_is_distinct_on_a_mixed_quad_triangle_cage() {
         let cage = mixed_quad_triangle_cage();
@@ -759,5 +1336,47 @@ mod tests {
         assert!(b.size().x > 1.0);
         assert!(sub.signed_volume() > 0.0);
         assert!(sub.positions.iter().all(|p| p.is_finite()));
+    }
+
+    #[test]
+    fn every_scheme_subdivides_additional_uv_sets_with_uv0() {
+        for (name, subdivide) in [
+            ("catmull-clark", catmull_clark as fn(&Mesh, u32) -> Mesh),
+            ("linear", linear),
+            ("stam-loop", stam_loop),
+        ] {
+            let mut cube = primitives::box_mesh(2.0, 2.0, 2.0);
+            assert_eq!(cube.add_uv_set(), Some(1));
+            let out = subdivide(&cube, 1);
+            assert_eq!(out.uv_set_count(), 2, "{name} keeps the number of UV sets");
+            assert_eq!(
+                out.extra_uvs[0], out.uvs,
+                "{name} subdivides a cloned set exactly like UV0"
+            );
+            assert!(out.validate().is_ok(), "{name} keeps sets parallel");
+        }
+    }
+
+    #[test]
+    fn partial_subdivision_stays_watertight_at_more_than_one_level() {
+        let plane = primitives::plane_mesh(3.0, 3.0, 3, 3);
+        let partial = subdivide_faces(&plane, &[0], 2, SubdivisionKind::CatmullClark);
+        if let Err(errors) = partial.validate() {
+            panic!("two-level partial subdivision is invalid: {errors:?}");
+        }
+        for edge in partial.edges() {
+            if edge.faces.len() == 1 {
+                let a = partial.positions[edge.a as usize];
+                let b = partial.positions[edge.b as usize];
+                let outer = a.x.abs() > 1.5 - 1e-4
+                    || a.z.abs() > 1.5 - 1e-4
+                    || b.x.abs() > 1.5 - 1e-4
+                    || b.z.abs() > 1.5 - 1e-4;
+                assert!(
+                    outer,
+                    "two-level partial subdivision cracked at {a:?}-{b:?}"
+                );
+            }
+        }
     }
 }

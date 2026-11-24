@@ -7,7 +7,10 @@
 
 use crate::common::preview_surface;
 use glam::{Mat4, Quat, Vec2, Vec3};
-use lc_anim::{AnimProperty, AnimationClip, Curve, Interpolation};
+use lc_anim::{
+    AnimChannel, AnimationClip, AnimationTrack, ChannelAddress, ChannelTarget, Curve,
+    Interpolation, TangentType,
+};
 use lc_geom::Mesh;
 use lc_scene::{
     Camera, Document, GeometrySource, Light, LightKind, MorphSet, MorphTarget, NodeId, NodeKind,
@@ -23,14 +26,12 @@ const CHUNK_JSON: u32 = 0x4E4F_534A;
 const CHUNK_BIN: u32 = 0x004E_4942;
 const EXPORT_CREASE_DEG: f32 = 40.0;
 
-/// Authored glTF data the importer recognised but could not carry across. The
-/// geometry, materials, morph targets, cameras and punctual lights still import,
-/// but the caller must tell the user what was left behind instead of letting a
-/// rigged or animated file look like a complete import.
+/// Authored glTF data the importer recognised but chose not to carry across.
+/// Skins, animation, morph targets, cameras and punctual lights now import; the
+/// one remaining rewrite is camera aspect hints, which LeopardCraft derives
+/// from the render output instead.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportReport {
-    pub skinned_meshes: usize,
-    pub animation_clips: usize,
     /// glTF camera `aspectRatio` hints; LeopardCraft derives aspect from the
     /// render output, not from the camera.
     pub camera_aspect_ratios: usize,
@@ -38,55 +39,23 @@ pub struct ImportReport {
 
 impl ImportReport {
     pub fn is_empty(&self) -> bool {
-        self.skinned_meshes == 0 && self.animation_clips == 0 && self.camera_aspect_ratios == 0
+        self.camera_aspect_ratios == 0
     }
 
-    /// One actionable sentence naming what was skipped and what the user can do
-    /// about it, or `None` when the file lost nothing in import.
+    /// One actionable sentence naming what was rewritten and what the user can
+    /// do about it, or `None` when the file imported exactly as authored.
     pub fn summary(&self) -> Option<String> {
         if self.is_empty() {
             return None;
         }
-        let mut skipped = Vec::new();
-        if self.skinned_meshes > 0 {
-            skipped.push(counted(
-                self.skinned_meshes,
-                "skinned mesh",
-                "skinned meshes",
-            ));
-        }
-        if self.animation_clips > 0 {
-            skipped.push(counted(
-                self.animation_clips,
-                "animation clip",
-                "animation clips",
-            ));
-        }
-        let mut ignored = Vec::new();
-        if self.camera_aspect_ratios > 0 {
-            ignored.push(counted(
+        Some(format!(
+            "Ignored {}: LeopardCraft takes aspect from the render output, so set the output size instead.",
+            counted(
                 self.camera_aspect_ratios,
                 "camera aspect ratio",
-                "camera aspect ratios",
-            ));
-        }
-        let mut message = String::new();
-        if !skipped.is_empty() {
-            message.push_str(&format!(
-                "Skipped {}: LeopardCraft's glTF import reads meshes, materials, morph targets, cameras and punctual lights, but not skinning or animation. Re-export without them, or recreate them in LeopardCraft.",
-                joined(&skipped)
-            ));
-        }
-        if !ignored.is_empty() {
-            if !message.is_empty() {
-                message.push(' ');
-            }
-            message.push_str(&format!(
-                "Ignored {}: LeopardCraft takes aspect from the render output, so set the output size instead.",
-                joined(&ignored)
-            ));
-        }
-        Some(message)
+                "camera aspect ratios"
+            )
+        ))
     }
 }
 
@@ -253,16 +222,62 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
-fn joined(parts: &[String]) -> String {
-    match parts {
-        [] => String::new(),
-        [only] => only.clone(),
-        [first, second] => format!("{first} and {second}"),
-        rest => {
-            let (last, head) = rest.split_last().expect("non-empty list");
-            format!("{} and {last}", head.join(", "))
+/// Animation channels an export cannot place. glTF animation targets a node
+/// TRS path, so a node clip that addresses another object, a tag or a material
+/// has no destination. Those channels are skipped and named instead of being
+/// written onto the wrong node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnimationExportReport {
+    pub skipped_channels: Vec<String>,
+}
+
+impl AnimationExportReport {
+    pub fn is_empty(&self) -> bool {
+        self.skipped_channels.is_empty()
+    }
+
+    /// One sentence naming the channels and why they were omitted.
+    pub fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Skipped {} animation channel(s) with no glTF target path: {}.",
+            self.skipped_channels.len(),
+            self.skipped_channels.join(", ")
+        ))
+    }
+}
+
+/// Whether a node's clip can export this address as node TRS animation.
+fn exports_to_node(address: ChannelAddress, owner: ChannelTarget) -> bool {
+    address.scope() == lc_anim::ChannelScope::Object && address.targets(owner)
+}
+
+/// Animation channels `doc` would lose on export.
+pub fn animation_export_report(doc: &Document) -> AnimationExportReport {
+    let mut report = AnimationExportReport::default();
+    for id in doc.scene.depth_first() {
+        let Some(node) = doc.scene.get(id) else {
+            continue;
+        };
+        let owner = ChannelTarget::Object { id };
+        for track in &node.animation.tracks {
+            if !exports_to_node(track.address, owner) {
+                report
+                    .skipped_channels
+                    .push(format!("{}: {}", node.name, track.address.label()));
+            }
+        }
+        if let Some(rotation) = &node.animation.rotation {
+            if !rotation.applies_to(owner) {
+                report
+                    .skipped_channels
+                    .push(format!("{}: Rotation", node.name));
+            }
         }
     }
+    report
 }
 
 pub fn export_glb(path: impl AsRef<Path>, doc: &Document) -> Result<(), String> {
@@ -488,6 +503,11 @@ impl GltfBuild {
 }
 
 fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
+    // Name animation channels the format cannot place instead of silently
+    // writing them onto the wrong node.
+    if let Some(summary) = animation_export_report(doc).summary() {
+        eprintln!("warning: {summary}");
+    }
     let evaluated = doc.evaluate(0.0);
     let order = doc.scene.depth_first();
     let mut index_of_node: HashMap<NodeId, usize> = HashMap::new();
@@ -703,6 +723,9 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
                     let mut positions = Vec::with_capacity(tris.len() * 9);
                     let mut normals = Vec::with_capacity(tris.len() * 9);
                     let mut uvs = Vec::with_capacity(tris.len() * 6);
+                    let mut extra_uvs: Vec<Vec<f32>> = (0..mesh.extra_uvs.len())
+                        .map(|_| Vec::with_capacity(tris.len() * 6))
+                        .collect();
                     let mut indices = Vec::with_capacity(tris.len() * 3);
                     let mut joints = Vec::new();
                     let mut weights = Vec::new();
@@ -725,6 +748,17 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
                             ]);
                             normals.extend_from_slice(&[v.normal.x, v.normal.y, v.normal.z]);
                             uvs.extend_from_slice(&[v.uv.x, v.uv.y]);
+                            let corner_slot = mesh
+                                .polygons
+                                .get(tri.polygon as usize)
+                                .and_then(|poly| poly.corners.get(v.corner as usize))
+                                .map(|corner| corner.uv);
+                            for (set, values) in extra_uvs.iter_mut().enumerate() {
+                                let uv = corner_slot
+                                    .and_then(|slot| mesh.uv_value(set + 1, slot))
+                                    .unwrap_or(Vec2::ZERO);
+                                values.extend_from_slice(&[uv.x, uv.y]);
+                            }
                             if let Some(skin) = &skin_export {
                                 let point = v.point as usize;
                                 joints.push(skin.joints[point]);
@@ -768,6 +802,10 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
                         "NORMAL": normal_accessor,
                         "TEXCOORD_0": uv_accessor,
                     });
+                    for (set, values) in extra_uvs.iter().enumerate() {
+                        let accessor = builder.add_f32(values, "VEC2", 2, 34962, false);
+                        attributes[format!("TEXCOORD_{}", set + 1)] = json!(accessor);
+                    }
                     if skin_export.is_some() && !joints.is_empty() {
                         let joint_accessor = builder.add_u16_vec4(&joints, 34962);
                         let weight_accessor = builder.add_f32(&weights, "VEC4", 4, 34962, false);
@@ -847,6 +885,11 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
 
     let mut animations_json: Vec<Value> = Vec::new();
     let times = take_times(doc);
+    let take_name = doc
+        .active_take()
+        .map(|take| take.name.clone())
+        .unwrap_or_else(|| "Take".into());
+    let take_fps = doc.active_take_fps();
     if !times.is_empty() {
         let mut samplers_json: Vec<Value> = Vec::new();
         let mut channels_json: Vec<Value> = Vec::new();
@@ -863,30 +906,22 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
                 continue;
             };
             let base = export_locals.get(id).copied().unwrap_or(raw.transform);
-            let translation_curves = [
-                clip.track(AnimProperty::TranslationX)
-                    .map(|track| &track.curve),
-                clip.track(AnimProperty::TranslationY)
-                    .map(|track| &track.curve),
-                clip.track(AnimProperty::TranslationZ)
-                    .map(|track| &track.curve),
-            ];
-            let scale_curves = [
-                clip.track(AnimProperty::ScaleX).map(|track| &track.curve),
-                clip.track(AnimProperty::ScaleY).map(|track| &track.curve),
-                clip.track(AnimProperty::ScaleZ).map(|track| &track.curve),
-            ];
+            // Address the node explicitly, falling back to the clip's owner,
+            // so tracks recorded against an explicit object target export too.
+            let owner = ChannelTarget::Object { id: *id };
+            let translation_curves = [0u8, 1, 2].map(|component| {
+                clip.track_for(owner, AnimChannel::Translation, component)
+                    .map(|track| &track.curve)
+            });
+            let scale_curves = [0u8, 1, 2].map(|component| {
+                clip.track_for(owner, AnimChannel::Scale, component)
+                    .map(|track| &track.curve)
+            });
             let has_rotation = clip
                 .rotation
                 .as_ref()
-                .is_some_and(|rotation| !rotation.is_empty())
-                || [
-                    AnimProperty::RotationX,
-                    AnimProperty::RotationY,
-                    AnimProperty::RotationZ,
-                ]
-                .iter()
-                .any(|property| clip.track(*property).is_some());
+                .is_some_and(|rotation| !rotation.is_empty() && rotation.applies_to(owner))
+                || (0..3).any(|axis| clip.legacy_euler_curve(axis).is_some());
             let target_count = morph_target_count.get(id).copied().unwrap_or(0);
             let morph_curves: Vec<Option<&Curve>> = (0..target_count)
                 .map(|target| clip.morph_weights.get(&(target as u32)))
@@ -1012,7 +1047,13 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
         }
         if !channels_json.is_empty() {
             animations_json.push(json!({
-                "name": "Take",
+                "name": take_name.clone(),
+                "extras": {
+                    "leopardcraft": {
+                        "take": take_name.clone(),
+                        "fps": take_fps,
+                    }
+                },
                 "samplers": samplers_json,
                 "channels": channels_json,
             }));
@@ -1054,6 +1095,12 @@ fn build(doc: &Document) -> Result<(Value, Vec<u8>), String> {
     }
     if !animations_json.is_empty() {
         root["animations"] = json!(animations_json);
+        root["extras"] = json!({
+            "leopardcraft": {
+                "active_take": take_name,
+                "fps": take_fps,
+            }
+        });
     }
     Ok((root, builder.binary))
 }
@@ -1234,11 +1281,7 @@ fn take_times(doc: &Document) -> Vec<f32> {
     times.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
     let start = times[0].max(0.0);
     let end = *times.last().unwrap_or(&start);
-    let fps = if doc.settings.fps.is_finite() && doc.settings.fps > 0.0 {
-        doc.settings.fps
-    } else {
-        24.0
-    };
+    let fps = doc.active_take_fps();
     let frames = (((end - start) * fps).ceil() as usize).min(100_000);
     for frame in 0..=frames {
         times.push(start + frame as f32 / fps);
@@ -1286,13 +1329,9 @@ fn rotation_interpolation(clip: &AnimationClip) -> &'static str {
             step &= key.interpolation == Interpolation::Constant;
         }
     }
-    for property in [
-        AnimProperty::RotationX,
-        AnimProperty::RotationY,
-        AnimProperty::RotationZ,
-    ] {
-        if let Some(track) = clip.track(property) {
-            for key in &track.curve.keys {
+    for axis in 0..3 {
+        if let Some(curve) = clip.legacy_euler_curve(axis) {
+            for key in &curve.keys {
                 any = true;
                 step &= key.interpolation == Interpolation::Constant;
             }
@@ -1440,6 +1479,11 @@ struct ImportedMesh {
     /// Morph base and targets read from the glTF mesh, with mesh-level default
     /// weights. A node's own `weights` array overrides those per instance.
     morph: MorphSet,
+    /// Per imported point, the four `skin.joints` indices from JOINTS_0. Empty
+    /// when the primitive has no skinning attributes.
+    joint_indices: Vec<[u32; 4]>,
+    /// Per imported point, the four weights from WEIGHTS_0.
+    weights: Vec<[f32; 4]>,
 }
 
 /// Convenience wrapper for tests that only assert on the document.
@@ -1452,14 +1496,28 @@ fn import_value_with_buffers_and_report(
     gltf: Value,
     buffers: Vec<Vec<u8>>,
 ) -> Result<(Document, ImportReport), String> {
-    let mut report = ImportReport {
-        animation_clips: gltf
-            .get("animations")
-            .and_then(|animations| animations.as_array())
-            .map_or(0, Vec::len),
-        ..ImportReport::default()
-    };
+    let mut report = ImportReport::default();
     let mut doc = Document::empty();
+    // LeopardCraft exports the active take's name and fps in `extras`. A file
+    // without them keeps the default take built by `Document::empty`.
+    let take_meta = gltf
+        .get("extras")
+        .and_then(|extras| extras.get("leopardcraft"))
+        .or_else(|| {
+            gltf.get("animations")
+                .and_then(|animations| animations.as_array())
+                .and_then(|animations| animations.first())
+                .and_then(|animation| animation.get("extras"))
+                .and_then(|extras| extras.get("leopardcraft"))
+        });
+    if let Some(meta) = take_meta {
+        if let Some(name) = meta.get("take").and_then(|name| name.as_str()) {
+            doc.rename_take(0, name);
+        }
+        if let Some(fps) = meta.get("fps").and_then(|fps| fps.as_f64()) {
+            doc.set_take_fps(0, fps as f32);
+        }
+    }
     let mut material_map: BTreeMap<usize, MaterialId> = BTreeMap::new();
     if let Some(materials) = gltf.get("materials").and_then(|m| m.as_array()) {
         for (i, value) in materials.iter().enumerate() {
@@ -1532,8 +1590,13 @@ fn import_value_with_buffers_and_report(
                 .and_then(|n| n.as_str())
                 .unwrap_or("Mesh");
             let mut mesh = Mesh::new(mesh_name);
+            // Per-corner coordinates for TEXCOORD_1.., in polygon corner order.
+            let mut extra_uv_values: Vec<Vec<Vec2>> = Vec::new();
+            let mut extra_uv_set_count = 0usize;
             let mut slots: BTreeMap<u16, MaterialId> = BTreeMap::new();
             let mut morph = MorphSet::default();
+            let mut skin_joint_indices: Vec<[u32; 4]> = Vec::new();
+            let mut skin_weights: Vec<[f32; 4]> = Vec::new();
             // Every imported primitive of one glTF mesh shares the target list;
             // a primitive that disagrees cannot be merged into one morph set.
             let mut target_count: Option<usize> = None;
@@ -1555,6 +1618,38 @@ fn import_value_with_buffers_and_report(
                 if positions.len() < 3 {
                     continue;
                 }
+                let vertex_count = positions.len() / 3;
+                let joints_attribute = attrs.get("JOINTS_0").and_then(|p| p.as_u64());
+                let weights_attribute = attrs.get("WEIGHTS_0").and_then(|p| p.as_u64());
+                if joints_attribute.is_some() != weights_attribute.is_some() {
+                    return Err(format!(
+                        "glTF mesh {mesh_name:?} declares JOINTS_0 and WEIGHTS_0 inconsistently; skinned primitives need both"
+                    ));
+                }
+                let primitive_joints = joints_attribute
+                    .map(|index| {
+                        let (values, components) =
+                            read_accessor_f32(&gltf, index as usize, &buffers)?;
+                        if components != 4 || values.len() != vertex_count * 4 {
+                            return Err(format!(
+                                "glTF mesh {mesh_name:?}: JOINTS_0 must hold four indices per vertex"
+                            ));
+                        }
+                        Ok(values)
+                    })
+                    .transpose()?;
+                let primitive_weights = weights_attribute
+                    .map(|index| {
+                        let (values, components) =
+                            read_accessor_f32(&gltf, index as usize, &buffers)?;
+                        if components != 4 || values.len() != vertex_count * 4 {
+                            return Err(format!(
+                                "glTF mesh {mesh_name:?}: WEIGHTS_0 must hold four weights per vertex"
+                            ));
+                        }
+                        Ok(values)
+                    })
+                    .transpose()?;
                 let uvs = attrs
                     .get("TEXCOORD_0")
                     .and_then(|p| p.as_u64())
@@ -1562,6 +1657,17 @@ fn import_value_with_buffers_and_report(
                     .transpose()?
                     .map(|(v, _)| v)
                     .unwrap_or_default();
+                let mut primitive_extra_uvs: Vec<Vec<f32>> = Vec::new();
+                let mut set = 1usize;
+                while let Some(index) = attrs
+                    .get(format!("TEXCOORD_{set}"))
+                    .and_then(|value| value.as_u64())
+                {
+                    let (values, _) = read_accessor_f32(&gltf, index as usize, &buffers)?;
+                    primitive_extra_uvs.push(values);
+                    set += 1;
+                }
+                extra_uv_set_count = extra_uv_set_count.max(primitive_extra_uvs.len());
                 let primitive_targets = primitive
                     .get("targets")
                     .and_then(Value::as_array)
@@ -1628,6 +1734,25 @@ fn import_value_with_buffers_and_report(
                 for chunk in positions.as_chunks::<3>().0 {
                     mesh.positions.push(Vec3::new(chunk[0], chunk[1], chunk[2]));
                 }
+                if let (Some(joints), Some(weights)) =
+                    (primitive_joints.as_ref(), primitive_weights.as_ref())
+                {
+                    for vertex in 0..vertex_count {
+                        let base = vertex * 4;
+                        skin_joint_indices.push([
+                            joints[base] as u32,
+                            joints[base + 1] as u32,
+                            joints[base + 2] as u32,
+                            joints[base + 3] as u32,
+                        ]);
+                        skin_weights.push([
+                            weights[base],
+                            weights[base + 1],
+                            weights[base + 2],
+                            weights[base + 3],
+                        ]);
+                    }
+                }
                 if !primitive_targets.is_empty() {
                     let vertex_count = positions.len() / 3;
                     for (target_index, target) in primitive_targets.iter().enumerate() {
@@ -1683,6 +1808,18 @@ fn import_value_with_buffers_and_report(
                             }
                         }
                         mesh.add_face_with_uvs(&points, &corner_uvs);
+                        extra_uv_values.resize_with(extra_uv_set_count, Vec::new);
+                        for (set_index, values) in extra_uv_values.iter_mut().enumerate() {
+                            for index in tri {
+                                let uv_index = *index as usize * 2;
+                                let uv = primitive_extra_uvs
+                                    .get(set_index)
+                                    .filter(|values| uv_index + 1 < values.len())
+                                    .map(|values| Vec2::new(values[uv_index], values[uv_index + 1]))
+                                    .unwrap_or(Vec2::ZERO);
+                                values.push(uv);
+                            }
+                        }
                     } else {
                         mesh.add_face(&points);
                     }
@@ -1690,6 +1827,10 @@ fn import_value_with_buffers_and_report(
                         poly.material_slot = slot;
                     }
                 }
+            }
+            if !extra_uv_values.is_empty() {
+                mesh.extra_uvs = extra_uv_values;
+                mesh.sync_uv_sets();
             }
             if target_count.unwrap_or(0) > 0 {
                 if let Some(weights) = mesh_value.get("weights").and_then(Value::as_array) {
@@ -1708,7 +1849,13 @@ fn import_value_with_buffers_and_report(
                 morph.sanitize(Some(mesh.positions.len()));
             }
             if !mesh.positions.is_empty() {
-                imported_meshes.push(ImportedMesh { mesh, slots, morph });
+                imported_meshes.push(ImportedMesh {
+                    mesh,
+                    slots,
+                    morph,
+                    joint_indices: skin_joint_indices,
+                    weights: skin_weights,
+                });
             }
         }
     }
@@ -1795,14 +1942,466 @@ fn import_value_with_buffers_and_report(
             &mut doc,
             &mut created,
             &mut visited,
-            &mut report,
         )?;
     }
+    import_skins(
+        &gltf,
+        &nodes,
+        &imported_meshes,
+        &buffers,
+        &created,
+        &mut doc,
+    )?;
+    import_animations(&gltf, &buffers, &created, &mut doc)?;
     doc.settings.ensure_valid_layers();
     doc.sanitize();
     doc.validate()
         .map_err(|errors| format!("imported glTF is invalid:\n{}", errors.join("\n")))?;
     Ok((doc, report))
+}
+
+/// Build a `Skin` for every node that references a glTF skin. This runs after
+/// the node walk so joint indices can be mapped to the created nodes in any
+/// order the file lists them.
+fn import_skins(
+    gltf: &Value,
+    nodes: &[Value],
+    meshes: &[ImportedMesh],
+    buffers: &[Vec<u8>],
+    created: &BTreeMap<usize, NodeId>,
+    doc: &mut Document,
+) -> Result<(), String> {
+    let skins = gltf
+        .get("skins")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (node_index, node_value) in nodes.iter().enumerate() {
+        let Some(skin_index) = node_value.get("skin").and_then(Value::as_u64) else {
+            continue;
+        };
+        // Nodes outside the imported scene were never created, so their skin
+        // cannot be attached to anything.
+        let Some(node_id) = created.get(&node_index).copied() else {
+            continue;
+        };
+        let name = doc
+            .scene
+            .get(node_id)
+            .map(|node| node.name.clone())
+            .unwrap_or_default();
+        let mesh_index = node_value
+            .get("mesh")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("glTF node {name:?} has a skin but no mesh"))?
+            as usize;
+        let imported = meshes
+            .get(mesh_index)
+            .ok_or_else(|| format!("glTF node {name:?} references missing mesh {mesh_index}"))?;
+        let definition = skins.get(skin_index as usize).ok_or_else(|| {
+            format!(
+                "glTF node {name:?} references skin {skin_index}, which the file does not define"
+            )
+        })?;
+        let joint_nodes = definition
+            .get("joints")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("glTF skin {skin_index} has no joints array"))?;
+        if joint_nodes.is_empty() {
+            return Err(format!("glTF skin {skin_index} has no joints"));
+        }
+        let mut joints = Vec::with_capacity(joint_nodes.len());
+        for joint in joint_nodes {
+            let index = joint.as_u64().ok_or_else(|| {
+                format!("glTF skin {skin_index} has a joint index that is not an integer")
+            })? as usize;
+            let id = created.get(&index).ok_or_else(|| {
+                format!(
+                    "glTF node {name:?}: skin {skin_index} joint node {index} is not part of the imported hierarchy"
+                )
+            })?;
+            joints.push(*id);
+        }
+        let inverse_bind = match definition
+            .get("inverseBindMatrices")
+            .and_then(Value::as_u64)
+        {
+            Some(accessor) => {
+                let (values, components) = read_accessor_f32(gltf, accessor as usize, buffers)?;
+                if components != 16 || values.len() != joints.len() * 16 {
+                    return Err(format!(
+                        "glTF skin {skin_index}: inverseBindMatrices must hold one MAT4 per joint"
+                    ));
+                }
+                let matrices: Vec<Mat4> = values
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(Mat4::from_cols_array)
+                    .collect();
+                if !matrices.iter().all(|matrix| matrix.is_finite()) {
+                    return Err(format!(
+                        "glTF skin {skin_index}: inverseBindMatrices contain non-finite values"
+                    ));
+                }
+                matrices
+            }
+            // The glTF default when the accessor is absent is identity.
+            None => vec![Mat4::IDENTITY; joints.len()],
+        };
+        let point_count = imported.mesh.positions.len();
+        if imported.joint_indices.len() != point_count || imported.weights.len() != point_count {
+            return Err(format!(
+                "glTF node {name:?} is skinned but its mesh has no JOINTS_0/WEIGHTS_0 for every vertex"
+            ));
+        }
+        let mut joint_indices = Vec::with_capacity(point_count);
+        let mut weights = Vec::with_capacity(point_count);
+        for point in 0..point_count {
+            let mut point_joints = [0u32; 4];
+            let mut point_weights = [0.0f32; 4];
+            let mut total = 0.0f32;
+            for influence in 0..4 {
+                let index = imported.joint_indices[point][influence];
+                let weight = imported.weights[point][influence];
+                if !weight.is_finite() || weight <= 0.0 {
+                    continue;
+                }
+                if index as usize >= joints.len() {
+                    return Err(format!(
+                        "glTF node {name:?}: JOINT index {index} is outside skin {skin_index}'s {} joints",
+                        joints.len()
+                    ));
+                }
+                point_joints[influence] = index;
+                point_weights[influence] = weight;
+                total += weight;
+            }
+            if total > 0.0 {
+                for weight in &mut point_weights {
+                    *weight /= total;
+                }
+            }
+            joint_indices.push(point_joints);
+            weights.push(point_weights);
+        }
+        if let Some(node) = doc.scene.get_mut(node_id) {
+            node.skin = Some(Skin {
+                joints,
+                inverse_bind,
+                joint_indices,
+                weights,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Insert one imported key. CUBICSPLINE values are the authored glTF tangents
+/// (value units per second), stored as hand-authored Spline slopes so a
+/// re-export samples the same curve.
+fn insert_imported_key(
+    curve: &mut Curve,
+    time: f32,
+    value: f32,
+    interpolation: Interpolation,
+    cubic: bool,
+    tangent_in: f32,
+    tangent_out: f32,
+) {
+    let index = curve.insert(time, value, interpolation);
+    if cubic {
+        if let Some(key) = curve.keys.get_mut(index) {
+            key.tangent_in = tangent_in;
+            key.tangent_out = tangent_out;
+            key.tangent_manual = true;
+            key.tangent_in_type = TangentType::Spline;
+            key.tangent_out_type = TangentType::Spline;
+        }
+    }
+}
+
+fn store_imported_curve(clip: &mut AnimationClip, address: ChannelAddress, curve: Curve) {
+    if let Some(track) = clip.track_mut(address) {
+        track.curve = curve;
+    } else {
+        clip.tracks.push(AnimationTrack { address, curve });
+    }
+}
+
+/// Import glTF animation channels. The first animation fills the document's
+/// default take; further animations become additional takes. Seconds stay
+/// seconds, and each take's frame range is the clip duration at that take's
+/// fps.
+fn import_animations(
+    gltf: &Value,
+    buffers: &[Vec<u8>],
+    created: &BTreeMap<usize, NodeId>,
+    doc: &mut Document,
+) -> Result<(), String> {
+    let animations = gltf
+        .get("animations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if animations.is_empty() {
+        return Ok(());
+    }
+    for (animation_index, animation) in animations.iter().enumerate() {
+        let name = animation
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Take");
+        let fps = animation
+            .get("extras")
+            .and_then(|extras| extras.get("leopardcraft"))
+            .and_then(|meta| meta.get("fps"))
+            .and_then(Value::as_f64)
+            .map(|fps| fps as f32)
+            .filter(|fps| fps.is_finite() && *fps > 0.0)
+            .unwrap_or_else(|| doc.active_take_fps());
+        if animation_index == 0 {
+            let take_name = doc.unique_take_name(name);
+            doc.rename_take(0, &take_name);
+            doc.set_take_fps(0, fps);
+        } else {
+            doc.create_take(name);
+            let index = doc.active_take;
+            doc.set_take_fps(index, fps);
+        }
+        let samplers = animation
+            .get("samplers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("glTF animation {animation_index} has no samplers"))?;
+        let channels = animation
+            .get("channels")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("glTF animation {animation_index} has no channels"))?;
+        let mut duration = 0.0f32;
+        for (channel_index, channel) in channels.iter().enumerate() {
+            let sampler_index = channel
+                .get("sampler")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "glTF animation {animation_index} channel {channel_index} has no sampler"
+                    )
+                })? as usize;
+            let sampler = samplers.get(sampler_index).ok_or_else(|| {
+                format!(
+                    "glTF animation {animation_index} references missing sampler {sampler_index}"
+                )
+            })?;
+            let input = sampler
+                .get("input")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!("glTF animation {animation_index} sampler {sampler_index} has no input")
+                })? as usize;
+            let output = sampler
+                .get("output")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "glTF animation {animation_index} sampler {sampler_index} has no output"
+                    )
+                })? as usize;
+            let (times, time_components) = read_accessor_f32(gltf, input, buffers)?;
+            if time_components != 1 || times.is_empty() {
+                return Err(format!(
+                    "glTF animation {animation_index} sampler {sampler_index} needs a non-empty SCALAR time accessor"
+                ));
+            }
+            if !times.iter().all(|time| time.is_finite()) {
+                return Err(format!(
+                    "glTF animation {animation_index} has non-finite key times"
+                ));
+            }
+            if times.windows(2).any(|pair| pair[1] <= pair[0]) {
+                return Err(format!(
+                    "glTF animation {animation_index} key times must be strictly increasing"
+                ));
+            }
+            let interpolation = sampler
+                .get("interpolation")
+                .and_then(Value::as_str)
+                .unwrap_or("LINEAR");
+            let cubic = interpolation == "CUBICSPLINE";
+            let interpolation_kind = match interpolation {
+                "STEP" => Interpolation::Constant,
+                "LINEAR" => Interpolation::Linear,
+                "CUBICSPLINE" => Interpolation::Spline,
+                other => {
+                    return Err(format!(
+                        "glTF animation {animation_index} uses unsupported interpolation {other:?}"
+                    ))
+                }
+            };
+            let (values, value_components) = read_accessor_f32(gltf, output, buffers)?;
+            let target = channel.get("target").ok_or_else(|| {
+                format!("glTF animation {animation_index} channel {channel_index} has no target")
+            })?;
+            let node_index = target.get("node").and_then(Value::as_u64).ok_or_else(|| {
+                format!(
+                    "glTF animation {animation_index} channel {channel_index} has no target node"
+                )
+            })? as usize;
+            let node_id = created.get(&node_index).copied().ok_or_else(|| {
+                format!(
+                    "glTF animation {animation_index} targets node {node_index}, which the imported hierarchy does not contain"
+                )
+            })?;
+            let path = target.get("path").and_then(Value::as_str).unwrap_or("");
+            let keys = times.len();
+            let multiplier = if cubic { 3 } else { 1 };
+            duration = duration.max(times.last().copied().unwrap_or(0.0));
+            match path {
+                "translation" | "scale" => {
+                    if value_components != 3 || values.len() != keys * 3 * multiplier {
+                        return Err(format!(
+                            "glTF animation {animation_index} {path} channel has the wrong output count"
+                        ));
+                    }
+                    let channel_kind = if path == "translation" {
+                        AnimChannel::Translation
+                    } else {
+                        AnimChannel::Scale
+                    };
+                    let clip = &mut doc
+                        .scene
+                        .get_mut(node_id)
+                        .expect("created node must exist")
+                        .animation;
+                    for component in 0..3u8 {
+                        let mut curve = Curve::new();
+                        for (key, time) in times.iter().enumerate() {
+                            let base = key * 3 * multiplier;
+                            let (value, tangent_in, tangent_out) = if cubic {
+                                (
+                                    values[base + 3 + component as usize],
+                                    values[base + component as usize],
+                                    values[base + 6 + component as usize],
+                                )
+                            } else {
+                                (values[base + component as usize], 0.0, 0.0)
+                            };
+                            insert_imported_key(
+                                &mut curve,
+                                *time,
+                                value,
+                                interpolation_kind,
+                                cubic,
+                                tangent_in,
+                                tangent_out,
+                            );
+                        }
+                        store_imported_curve(
+                            clip,
+                            ChannelAddress {
+                                target: ChannelTarget::Object { id: node_id },
+                                channel: channel_kind,
+                                component,
+                            },
+                            curve,
+                        );
+                    }
+                }
+                "rotation" => {
+                    if value_components != 4 || values.len() != keys * 4 * multiplier {
+                        return Err(format!(
+                            "glTF animation {animation_index} rotation channel has the wrong output count"
+                        ));
+                    }
+                    // Quaternion keys carry no tangent handles; cubic rotation
+                    // imports as Smooth, which re-derives Catmull-Rom slopes.
+                    let rotation_interpolation = if cubic {
+                        Interpolation::Smooth
+                    } else {
+                        interpolation_kind
+                    };
+                    let clip = &mut doc
+                        .scene
+                        .get_mut(node_id)
+                        .expect("created node must exist")
+                        .animation;
+                    for (key, time) in times.iter().enumerate() {
+                        let offset = key * 4 * multiplier + if cubic { 4 } else { 0 };
+                        let rotation = Quat::from_xyzw(
+                            values[offset],
+                            values[offset + 1],
+                            values[offset + 2],
+                            values[offset + 3],
+                        );
+                        clip.set_rotation_key(
+                            ChannelTarget::Object { id: node_id },
+                            *time,
+                            rotation,
+                            rotation_interpolation,
+                        );
+                    }
+                }
+                "weights" => {
+                    let target_count = doc
+                        .scene
+                        .get(node_id)
+                        .map(|node| node.morph.targets.len())
+                        .unwrap_or(0);
+                    if target_count == 0 {
+                        continue;
+                    }
+                    if value_components != 1 || values.len() != keys * target_count * multiplier {
+                        return Err(format!(
+                            "glTF animation {animation_index} weights channel has the wrong output count for {target_count} morph targets"
+                        ));
+                    }
+                    let clip = &mut doc
+                        .scene
+                        .get_mut(node_id)
+                        .expect("created node must exist")
+                        .animation;
+                    for target in 0..target_count {
+                        let mut curve = Curve::new();
+                        for (key, time) in times.iter().enumerate() {
+                            let base = key * target_count * multiplier;
+                            let (value, tangent_in, tangent_out) = if cubic {
+                                (
+                                    values[base + target_count + target],
+                                    values[base + target],
+                                    values[base + 2 * target_count + target],
+                                )
+                            } else {
+                                (values[base + target], 0.0, 0.0)
+                            };
+                            insert_imported_key(
+                                &mut curve,
+                                *time,
+                                value,
+                                interpolation_kind,
+                                cubic,
+                                tangent_in,
+                                tangent_out,
+                            );
+                        }
+                        clip.morph_weights.insert(target as u32, curve);
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "glTF animation {animation_index} targets unsupported path {other:?}"
+                    ))
+                }
+            }
+        }
+        if animation_index == 0 {
+            doc.settings.frame_start = 0.0;
+            doc.settings.frame_end = (duration * fps).ceil().max(1.0);
+        }
+        doc.store_active_clips();
+    }
+    doc.activate_take(0);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1815,7 +2414,6 @@ fn import_node(
     doc: &mut Document,
     created: &mut BTreeMap<usize, NodeId>,
     visited: &mut HashSet<usize>,
-    report: &mut ImportReport,
 ) -> Result<NodeId, String> {
     if let Some(id) = created.get(&index) {
         return Ok(*id);
@@ -1826,9 +2424,6 @@ fn import_node(
     let Some(value) = nodes.get(index) else {
         return Err(format!("glTF references missing node {index}"));
     };
-    if value.get("skin").is_some() {
-        report.skinned_meshes += 1;
-    }
     let name = value
         .get("name")
         .and_then(|n| n.as_str())
@@ -1889,7 +2484,6 @@ fn import_node(
                 doc,
                 created,
                 visited,
-                report,
             )?;
         }
     }
@@ -2135,7 +2729,8 @@ mod animation_export_tests {
 
     fn rigged_document() -> Document {
         let mut doc = Document::empty();
-        doc.settings.fps = 10.0;
+        doc.set_take_fps(0, 10.0);
+        doc.rename_take(0, "Run");
         let root = doc.append_node(
             NodeKind::Joint {
                 length: 0.5,
@@ -2206,13 +2801,13 @@ mod animation_export_tests {
         {
             let node = doc.scene.get_mut(root).unwrap();
             node.animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 0.0,
                 0.0,
                 Interpolation::Constant,
             );
             node.animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 1.0,
                 1.5,
                 Interpolation::Constant,
@@ -2220,14 +2815,30 @@ mod animation_export_tests {
         }
         {
             let node = doc.scene.get_mut(child).unwrap();
-            node.animation
-                .set_rotation_key(0.0, Quat::IDENTITY, Interpolation::Linear);
-            node.animation
-                .set_rotation_key(1.0, Quat::from_rotation_z(0.5), Interpolation::Linear);
-            node.animation
-                .set_key(AnimProperty::ScaleY, 0.0, 1.0, Interpolation::Linear);
-            node.animation
-                .set_key(AnimProperty::ScaleY, 1.0, 1.5, Interpolation::Linear);
+            node.animation.set_rotation_key(
+                ChannelTarget::Owner,
+                0.0,
+                Quat::IDENTITY,
+                Interpolation::Linear,
+            );
+            node.animation.set_rotation_key(
+                ChannelTarget::Owner,
+                1.0,
+                Quat::from_rotation_z(0.5),
+                Interpolation::Linear,
+            );
+            node.animation.set_key(
+                ChannelAddress::owner_component(AnimChannel::Scale, 1),
+                0.0,
+                1.0,
+                Interpolation::Linear,
+            );
+            node.animation.set_key(
+                ChannelAddress::owner_component(AnimChannel::Scale, 1),
+                1.0,
+                1.5,
+                Interpolation::Linear,
+            );
         }
         doc
     }
@@ -2810,7 +3421,11 @@ mod animation_export_tests {
             .any(|x| (*x - 0.25).abs() < 1e-5));
 
         let animation = &gltf["animations"][0];
-        assert_eq!(animation["name"], "Take");
+        assert_eq!(animation["name"], "Run");
+        assert_eq!(animation["extras"]["leopardcraft"]["fps"], 10.0);
+        assert_eq!(animation["extras"]["leopardcraft"]["take"], "Run");
+        assert_eq!(gltf["extras"]["leopardcraft"]["active_take"], "Run");
+        assert_eq!(gltf["extras"]["leopardcraft"]["fps"], 10.0);
         assert_eq!(animation["channels"].as_array().unwrap().len(), 4);
         assert_eq!(animation["samplers"].as_array().unwrap().len(), 4);
         let inputs: std::collections::BTreeSet<u64> = animation["samplers"]
@@ -2889,10 +3504,18 @@ mod animation_export_tests {
         let id = doc.append_node(NodeKind::Null, "Animated Null", None);
         {
             let node = doc.scene.get_mut(id).unwrap();
-            node.animation
-                .set_key(AnimProperty::TranslationZ, 0.0, 0.0, Interpolation::Smooth);
-            node.animation
-                .set_key(AnimProperty::TranslationZ, 2.0, 2.0, Interpolation::Smooth);
+            node.animation.set_key(
+                ChannelAddress::owner_component(AnimChannel::Translation, 2),
+                0.0,
+                0.0,
+                Interpolation::Smooth,
+            );
+            node.animation.set_key(
+                ChannelAddress::owner_component(AnimChannel::Translation, 2),
+                2.0,
+                2.0,
+                Interpolation::Smooth,
+            );
         }
         let (gltf, bin) = export_glb_value(&doc);
         let buffers = vec![bin];
@@ -2921,7 +3544,7 @@ mod animation_export_tests {
         let mut doc = Document::empty();
         let id = doc.append_node(NodeKind::Null, "One Key", None);
         doc.scene.get_mut(id).unwrap().animation.set_key(
-            AnimProperty::TranslationZ,
+            ChannelAddress::owner_component(AnimChannel::Translation, 2),
             0.0,
             1.0,
             Interpolation::Smooth,
@@ -2934,6 +3557,127 @@ mod animation_export_tests {
         assert_eq!(values.len(), 3);
         assert!((values[2] - 1.0).abs() < 1e-5);
         assert_gltf_conformance(&gltf, &buffers, true);
+    }
+
+    #[test]
+    fn skins_and_animation_roundtrip_through_import() {
+        let doc = rigged_document();
+        let (gltf, bin) = export_glb_value(&doc);
+        let imported = import_value_with_buffers(gltf, vec![bin]).unwrap();
+        assert_eq!(imported.active_take().unwrap().name, "Run");
+        assert!((imported.active_take_fps() - 10.0).abs() < 1e-5);
+        let mesh_id = imported.scene.find_by_name("MorphMesh").unwrap();
+        let node = imported.scene.get(mesh_id).unwrap();
+        let skin = node.skin.as_ref().expect("skin was not imported");
+        assert_eq!(skin.joints.len(), 2);
+        assert_eq!(skin.inverse_bind.len(), 2);
+        assert_eq!(skin.joint_indices.len(), skin.weights.len());
+        for (joints, weights) in skin.joint_indices.iter().zip(&skin.weights) {
+            let total: f32 = weights.iter().sum();
+            assert!((total - 1.0).abs() < 1e-4, "weights {weights:?}");
+            assert!(
+                joints
+                    .iter()
+                    .all(|joint| (*joint as usize) < skin.joints.len()),
+                "joint index out of range: {joints:?}"
+            );
+        }
+        assert!(!node.animation.is_empty(), "animation was not imported");
+        assert_eq!(node.morph.targets.len(), 2, "morph targets were lost");
+
+        // The root translation is a Constant channel, so the sampled step keeps
+        // its pre-key value until the second key.
+        let root = imported.scene.find_by_name("Root").unwrap();
+        let root_clip = &imported.scene.get(root).unwrap().animation;
+        let address = ChannelAddress {
+            target: ChannelTarget::Object { id: root },
+            channel: AnimChannel::Translation,
+            component: 0,
+        };
+        let curve = &root_clip.track(address).unwrap().curve;
+        assert!((curve.sample(0.2) - 0.0).abs() < 1e-4);
+        assert!((curve.sample(0.9) - 0.0).abs() < 1e-4);
+
+        // Rotation arrives as a quaternion track: half a second into a one
+        // second turn to 0.5 rad is about a quarter radian.
+        let child = imported.scene.find_by_name("Child").unwrap();
+        let child_clip = &imported.scene.get(child).unwrap().animation;
+        let rotation = child_clip.sample_rotation(0.5).unwrap();
+        assert!(
+            rotation.dot(Quat::from_rotation_z(0.25)).abs() > 0.999,
+            "rotation {rotation:?}"
+        );
+
+        // Morph-weight curves keep their target ordering.
+        assert!((node.animation.sample_morph_weight(0, 0.5).unwrap() - 0.5).abs() < 0.02);
+
+        // Seconds become a frame range at the imported take's fps.
+        assert_eq!(imported.settings.frame_start, 0.0);
+        assert!((imported.settings.frame_end - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cubic_animation_import_keeps_hand_authored_tangents() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Smooth Null", None);
+        {
+            let clip = &mut doc.scene.get_mut(id).unwrap().animation;
+            let address = ChannelAddress::owner_component(AnimChannel::Translation, 0);
+            clip.set_key(address, 0.0, 0.0, Interpolation::Smooth);
+            clip.set_key(address, 2.0, 2.0, Interpolation::Smooth);
+        }
+        let (gltf, bin) = export_glb_value(&doc);
+        let imported = import_value_with_buffers(gltf, vec![bin]).unwrap();
+        let id = imported.scene.find_by_name("Smooth Null").unwrap();
+        let clip = &imported.scene.get(id).unwrap().animation;
+        let address = ChannelAddress {
+            target: ChannelTarget::Object { id },
+            channel: AnimChannel::Translation,
+            component: 0,
+        };
+        let curve = &clip.track(address).unwrap().curve;
+        assert!(curve.keys.len() > 2);
+        assert!(
+            curve
+                .keys
+                .iter()
+                .all(|key| key.interpolation == Interpolation::Spline),
+            "CUBICSPLINE keys should import as Spline"
+        );
+        assert!(curve.keys[0].tangent_manual);
+        assert!(curve.keys.iter().all(|key| key.tangent_in.is_finite()));
+        assert!((curve.sample(1.0) - 1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn skin_import_refuses_a_joint_index_outside_the_skin() {
+        let doc = rigged_document();
+        let (mut gltf, bin) = export_glb_value(&doc);
+        let first_joint = gltf["skins"][0]["joints"][0].clone();
+        gltf["skins"][0]["joints"] = json!([first_joint]);
+        let inverse_bind = gltf["skins"][0]["inverseBindMatrices"].as_u64().unwrap();
+        gltf["accessors"][inverse_bind as usize]["count"] = json!(1);
+        let Err(error) = import_value_with_buffers_and_report(gltf, vec![bin]) else {
+            panic!("a joint index outside the skin was accepted");
+        };
+        assert!(
+            error.contains("JOINT index") && error.contains("outside skin"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn animation_import_refuses_a_missing_accessor() {
+        let doc = rigged_document();
+        let (mut gltf, bin) = export_glb_value(&doc);
+        gltf["animations"][0]["samplers"][0]["input"] = json!(9999);
+        let Err(error) = import_value_with_buffers_and_report(gltf, vec![bin]) else {
+            panic!("an animation with a missing input accessor was accepted");
+        };
+        assert!(
+            error.contains("missing accessor 9999"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2970,19 +3714,12 @@ mod animation_export_tests {
         }
 
         let (imported, report) = import_value_with_buffers_and_report(gltf, vec![bin]).unwrap();
-        assert_eq!(report.skinned_meshes, 1, "skinned mesh not counted");
-        assert_eq!(report.animation_clips, 1, "animation clip not counted");
         assert_eq!(
             report.camera_aspect_ratios, 1,
             "camera aspect ratio not counted"
         );
-        let summary = report.summary().expect("skipped data without a message");
-        for expected in [
-            "1 skinned mesh",
-            "1 animation clip",
-            "1 camera aspect ratio",
-            "Re-export without them, or recreate them in LeopardCraft",
-        ] {
+        let summary = report.summary().expect("rewritten data without a message");
+        for expected in ["1 camera aspect ratio", "set the output size instead"] {
             assert!(
                 summary.contains(expected),
                 "missing {expected:?}: {summary}"
@@ -3072,14 +3809,14 @@ mod animation_export_tests {
             light.color
         );
 
-        // The geometry and morph targets still import: skips are reported, not fatal.
+        // Geometry, morph targets, skinning and animation all arrive now.
         let id = imported.scene.find_by_name("MorphMesh").unwrap();
         let node = imported.scene.get(id).unwrap();
         assert_eq!(node.morph.targets.len(), 2, "morph targets were lost");
-        assert!(
-            node.skin.is_none(),
-            "a skin LeopardCraft cannot read leaked in"
-        );
+        let skin = node.skin.as_ref().expect("skin was not imported");
+        assert_eq!(skin.joints.len(), 2);
+        assert_eq!(skin.joint_indices.len(), skin.weights.len());
+        assert!(!node.animation.is_empty(), "animation was not imported");
     }
 
     #[test]
@@ -3459,5 +4196,91 @@ mod animation_export_tests {
             (Vec3::from_slice(position) - Vec3::new(-1.0, -0.5, -1.5)).length() < 1e-5
         }));
         assert_gltf_conformance(&gltf, &buffers, false);
+    }
+
+    #[test]
+    fn export_reports_and_skips_channels_without_a_gltf_path() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Node", None);
+        let tag_address = ChannelAddress::new(
+            ChannelTarget::Tag { node: id, index: 0 },
+            AnimChannel::CopyLocationWeight,
+            0,
+        )
+        .unwrap();
+        doc.scene.get_mut(id).unwrap().animation.set_key(
+            tag_address,
+            0.0,
+            1.0,
+            Interpolation::Linear,
+        );
+
+        let report = animation_export_report(&doc);
+        assert_eq!(report.skipped_channels.len(), 1);
+        assert!(report.skipped_channels[0].contains("Node"));
+        assert!(report
+            .summary()
+            .expect("skips are named")
+            .contains("Copy Location Weight"));
+
+        // The export still succeeds; a tag channel is not written as node TRS.
+        let (gltf, _) = export_glb_value(&doc);
+        assert!(gltf.get("animations").is_none());
+    }
+
+    #[test]
+    fn glb_roundtrips_additional_uv_sets() {
+        let mut doc = Document::empty();
+        let mut mesh = lc_geom::box_mesh(1.0, 1.0, 1.0);
+        lc_geom::box_projection(&mut mesh, 1.0);
+        assert_eq!(mesh.add_uv_set(), Some(1));
+        for slot in 0..mesh.uvs.len() as u32 {
+            assert!(mesh.set_uv_value(1, slot, Vec2::new(0.125, 0.375)));
+        }
+        doc.append_node(
+            NodeKind::Mesh {
+                geometry: GeometrySource::editable(mesh),
+            },
+            "Two UV Sets",
+            None,
+        );
+        let (gltf, bin) = export_glb_value(&doc);
+        let primitive = &gltf["meshes"][0]["primitives"][0]["attributes"];
+        assert!(primitive["TEXCOORD_0"].as_u64().is_some());
+        assert!(
+            primitive["TEXCOORD_1"].as_u64().is_some(),
+            "a second UV set is written as TEXCOORD_1"
+        );
+        let (imported, _) = import_value_with_buffers_and_report(gltf, vec![bin]).unwrap();
+        let id = imported.scene.find_by_name("Two UV Sets").unwrap();
+        let NodeKind::Mesh { geometry } = &imported.scene.get(id).unwrap().kind else {
+            panic!("expected a mesh");
+        };
+        let mesh = geometry.mesh().unwrap();
+        assert_eq!(mesh.uv_set_count(), 2, "both sets survive the round trip");
+        assert_eq!(mesh.extra_uvs[0].len(), mesh.uvs.len());
+        assert!(mesh.extra_uvs[0]
+            .iter()
+            .all(|uv| (*uv - Vec2::new(0.125, 0.375)).length() < 1e-5));
+        assert!(mesh.validate().is_ok());
+    }
+
+    #[test]
+    fn explicitly_addressed_node_tracks_export_as_trs_channels() {
+        let mut doc = Document::empty();
+        let id = doc.append_node(NodeKind::Null, "Addressed", None);
+        let address =
+            ChannelAddress::new(ChannelTarget::Object { id }, AnimChannel::Translation, 0).unwrap();
+        {
+            let animation = &mut doc.scene.get_mut(id).unwrap().animation;
+            animation.set_key(address, 0.0, 0.0, Interpolation::Linear);
+            animation.set_key(address, 1.0, 1.0, Interpolation::Linear);
+        }
+        assert!(animation_export_report(&doc).is_empty());
+        let (gltf, _) = export_glb_value(&doc);
+        let channels = gltf["animations"][0]["channels"].as_array().unwrap();
+        assert!(channels
+            .iter()
+            .any(|channel| channel["target"]["path"] == "translation"));
     }
 }

@@ -10,27 +10,47 @@ fn curve_key_selection_move_and_delete_share_single_undo_steps() {
     app.doc.scene.get_mut(cube).unwrap().animation = AnimationClip::default();
     {
         let animation = &mut app.doc.scene.get_mut(cube).unwrap().animation;
-        animation.set_key(AnimProperty::TranslationX, 0.0, 0.0, Interpolation::Linear);
-        animation.set_key(AnimProperty::TranslationX, 2.0, 4.0, Interpolation::Linear);
+        animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            0.0,
+            Interpolation::Linear,
+        );
+        animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+            4.0,
+            Interpolation::Linear,
+        );
     }
     app.history.clear();
 
-    assert!(app.select_curve_key(AnimProperty::TranslationX, 0.0));
+    assert!(app.select_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        0.0
+    ));
     assert!(app.selected_curve_key().is_some());
     assert!(
-        !app.select_curve_key(AnimProperty::TranslationX, 1.0),
+        !app.select_curve_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0
+        ),
         "there is no key at that time"
     );
-    assert!(!app.select_curve_key(AnimProperty::ScaleY, 0.0));
+    assert!(!app.select_curve_key(ChannelAddress::owner_component(AnimChannel::Scale, 1), 0.0));
 
-    assert!(app.move_curve_key(AnimProperty::TranslationX, 0.0, 1.0));
+    assert!(app.move_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        0.0,
+        1.0
+    ));
     let key_times = |app: &LeopardApp| -> Vec<f32> {
         app.doc
             .scene
             .get(cube)
             .unwrap()
             .animation
-            .track(AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve
             .keys
@@ -43,11 +63,23 @@ fn curve_key_selection_move_and_delete_share_single_undo_steps() {
     assert_eq!(app.history.depth(), 1);
 
     assert!(
-        !app.move_curve_key(AnimProperty::TranslationX, 1.0, 2.0),
+        !app.move_curve_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            2.0
+        ),
         "moving onto another key would merge two keys"
     );
-    assert!(!app.move_curve_key(AnimProperty::TranslationX, 1.0, 1.0));
-    assert!(!app.move_curve_key(AnimProperty::TranslationX, 1.0, f32::NAN));
+    assert!(!app.move_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        1.0,
+        1.0
+    ));
+    assert!(!app.move_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        1.0,
+        f32::NAN
+    ));
     assert_eq!(app.history.depth(), 1);
 
     app.history.undo(&mut app.doc);
@@ -55,7 +87,10 @@ fn curve_key_selection_move_and_delete_share_single_undo_steps() {
     app.history.redo(&mut app.doc);
     assert!((key_times(&app)[0] - 1.0).abs() < 1e-4);
 
-    assert!(app.delete_curve_key(AnimProperty::TranslationX, 1.0));
+    assert!(app.delete_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        1.0
+    ));
     assert_eq!(key_times(&app), vec![2.0]);
     app.history.undo(&mut app.doc);
     assert_eq!(key_times(&app), vec![1.0, 2.0]);
@@ -68,14 +103,17 @@ fn deleting_a_tracks_last_key_drops_the_track_and_undo_restores_it() {
     app.selection.select_one(cube);
     app.doc.scene.get_mut(cube).unwrap().animation = AnimationClip::default();
     app.doc.scene.get_mut(cube).unwrap().animation.set_key(
-        AnimProperty::TranslationY,
+        ChannelAddress::owner_component(AnimChannel::Translation, 1),
         0.5,
         1.0,
         Interpolation::Linear,
     );
     app.history.clear();
 
-    assert!(app.delete_curve_key(AnimProperty::TranslationY, 0.5));
+    assert!(app.delete_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 1),
+        0.5
+    ));
     assert!(app.doc.scene.get(cube).unwrap().animation.is_empty());
     assert_eq!(app.history.depth(), 1);
 
@@ -86,7 +124,7 @@ fn deleting_a_tracks_last_key_drops_the_track_and_undo_restores_it() {
         .get(cube)
         .unwrap()
         .animation
-        .track(AnimProperty::TranslationY)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 1))
         .is_some());
 }
 
@@ -99,25 +137,45 @@ fn fcurve_manual_tangents_survive_edits_and_undo_redo() {
     {
         let node = app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 0.0, Interpolation::Smooth);
-        node.animation
-            .set_key(AnimProperty::TranslationX, 1.0, 1.0, Interpolation::Smooth);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            0.0,
+            Interpolation::Smooth,
+        );
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            1.0,
+            Interpolation::Smooth,
+        );
     }
     assert!(app.set_anim_target(target));
-    assert!(app.select_curve_key(AnimProperty::TranslationX, 0.0));
+    assert!(app.select_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        0.0
+    ));
     assert!(app.set_target_curve_tangent(
         target,
-        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0)),
         0.0,
         false,
         2.0
     ));
     let clip = app.target_clip(target).unwrap();
-    let key = clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0];
+    let key = clip
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+        .unwrap()
+        .curve
+        .keys[0];
     assert!(key.tangent_manual);
     assert!((key.tangent_out - 2.0).abs() < 1e-5);
-    let sampled = clip.sample(AnimProperty::TranslationX, 0.5).unwrap();
+    let sampled = clip
+        .sample(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.5,
+        )
+        .unwrap();
     assert!(
         (sampled - 0.625).abs() < 1e-4,
         "manual tangent sampled {sampled}"
@@ -126,16 +184,26 @@ fn fcurve_manual_tangents_survive_edits_and_undo_redo() {
     app.undo();
     let restored = app.target_clip(target).unwrap();
     let key = restored
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys[0];
     assert!(!key.tangent_manual);
-    assert!((restored.sample(AnimProperty::TranslationX, 0.5).unwrap() - 0.5).abs() < 1e-4);
+    assert!(
+        (restored
+            .sample(
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
+                0.5
+            )
+            .unwrap()
+            - 0.5)
+            .abs()
+            < 1e-4
+    );
     app.redo();
     let restored = app.target_clip(target).unwrap();
     let key = restored
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys[0];
@@ -144,7 +212,7 @@ fn fcurve_manual_tangents_survive_edits_and_undo_redo() {
 
     // A later key insertion must not overwrite the hand-authored slope.
     app.doc.scene.get_mut(cube).unwrap().animation.set_key(
-        AnimProperty::TranslationX,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
         2.0,
         0.0,
         Interpolation::Smooth,
@@ -152,7 +220,7 @@ fn fcurve_manual_tangents_survive_edits_and_undo_redo() {
     let key = app
         .target_clip(target)
         .unwrap()
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys[0];
@@ -170,7 +238,7 @@ fn fcurve_retime_selected_channels_is_one_undo_and_rescales_manual_tangents() {
         node.animation = AnimationClip::default();
         for (time, value) in [(1.0, 0.0), (3.0, 1.0)] {
             node.animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 time,
                 value,
                 Interpolation::Smooth,
@@ -178,13 +246,21 @@ fn fcurve_retime_selected_channels_is_one_undo_and_rescales_manual_tangents() {
             node.animation
                 .set_morph_weight_key(0, time, value, Interpolation::Smooth);
         }
-        node.animation
-            .set_rotation_key(1.0, Quat::IDENTITY, Interpolation::Linear);
-        node.animation
-            .set_rotation_key(3.0, Quat::from_rotation_y(1.0), Interpolation::Linear);
+        node.animation.set_rotation_key(
+            ChannelTarget::Owner,
+            1.0,
+            Quat::IDENTITY,
+            Interpolation::Linear,
+        );
+        node.animation.set_rotation_key(
+            ChannelTarget::Owner,
+            3.0,
+            Quat::from_rotation_y(1.0),
+            Interpolation::Linear,
+        );
         let curve = &mut node
             .animation
-            .track_mut(AnimProperty::TranslationX)
+            .track_mut(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve;
         assert!(curve.set_manual_tangents(1.0, 0.0, 2.0));
@@ -195,10 +271,13 @@ fn fcurve_retime_selected_channels_is_one_undo_and_rescales_manual_tangents() {
     let old_mid = app
         .target_clip(target)
         .unwrap()
-        .sample(AnimProperty::TranslationX, 2.0)
+        .sample(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+        )
         .unwrap();
     for track in [
-        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0)),
         CurveTrackId::MorphWeight(0),
         CurveTrackId::Rotation,
     ] {
@@ -211,7 +290,12 @@ fn fcurve_retime_selected_channels_is_one_undo_and_rescales_manual_tangents() {
     assert!(app.retime_selected_curve_keys(2.0));
     assert_eq!(app.history.depth(), 1, "retime is one undo step");
     let clip = app.target_clip(target).unwrap();
-    assert_property_curve_times(&app, target, AnimProperty::TranslationX, &[1.0, 5.0]);
+    assert_property_curve_times(
+        &app,
+        target,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        &[1.0, 5.0],
+    );
     assert_eq!(
         clip.morph_weights.get(&0).unwrap().keys[1].time,
         5.0,
@@ -222,28 +306,69 @@ fn fcurve_retime_selected_channels_is_one_undo_and_rescales_manual_tangents() {
         5.0,
         "rotation keys move in the same pass"
     );
-    let key = clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0];
+    let key = clip
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+        .unwrap()
+        .curve
+        .keys[0];
     assert!(key.tangent_manual);
     assert!((key.tangent_out - 1.0).abs() < 1e-5);
-    assert!((clip.sample(AnimProperty::TranslationX, 3.0).unwrap() - old_mid).abs() < 1e-4);
+    assert!(
+        (clip
+            .sample(
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
+                3.0
+            )
+            .unwrap()
+            - old_mid)
+            .abs()
+            < 1e-4
+    );
 
     app.undo();
     let restored = app.target_clip(target).unwrap();
-    assert_property_curve_times(&app, target, AnimProperty::TranslationX, &[1.0, 3.0]);
+    assert_property_curve_times(
+        &app,
+        target,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        &[1.0, 3.0],
+    );
     let key = restored
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys[0];
     assert!((key.tangent_out - 2.0).abs() < 1e-5);
     assert!(key.tangent_manual);
-    assert!((restored.sample(AnimProperty::TranslationX, 2.0).unwrap() - old_mid).abs() < 1e-4);
+    assert!(
+        (restored
+            .sample(
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
+                2.0
+            )
+            .unwrap()
+            - old_mid)
+            .abs()
+            < 1e-4
+    );
 
     app.redo();
     let redone = app.target_clip(target).unwrap();
-    assert_property_curve_times(&app, target, AnimProperty::TranslationX, &[1.0, 5.0]);
+    assert_property_curve_times(
+        &app,
+        target,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        &[1.0, 5.0],
+    );
     assert!(
-        (redone.track(AnimProperty::TranslationX).unwrap().curve.keys[0].tangent_out - 1.0).abs()
+        (redone
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+            .unwrap()
+            .curve
+            .keys[0]
+            .tangent_out
+            - 1.0)
+            .abs()
             < 1e-5
     );
 }
@@ -256,16 +381,24 @@ fn fcurve_retime_keeps_tracks_that_are_anchored_at_the_pivot_consistent() {
     {
         let node = app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 1.0, 0.0, Interpolation::Linear);
-        node.animation
-            .set_rotation_key(2.0, Quat::from_rotation_y(0.5), Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            0.0,
+            Interpolation::Linear,
+        );
+        node.animation.set_rotation_key(
+            ChannelTarget::Owner,
+            2.0,
+            Quat::from_rotation_y(0.5),
+            Interpolation::Linear,
+        );
     }
     let target = AnimTarget::Object(cube);
     assert!(app.set_anim_target(target));
     assert!(app.select_target_track_key_additive(
         target,
-        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0)),
         1.0,
         true
     ));
@@ -276,7 +409,11 @@ fn fcurve_retime_keeps_tracks_that_are_anchored_at_the_pivot_consistent() {
     assert_eq!(app.history.depth(), 1);
     let clip = app.target_clip(target).unwrap();
     assert_eq!(
-        clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0].time,
+        clip.track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+            .unwrap()
+            .curve
+            .keys[0]
+            .time,
         1.0,
         "the scalar track is anchored at the pivot"
     );
@@ -292,38 +429,31 @@ fn per_key_interpolation_changes_only_the_targeted_key() {
     let (mut app, _root) = test_app("curve-key-interpolation");
     let cube = named(&app, "Cube");
     app.selection.select_one(cube);
+    let address = ChannelAddress::owner_component(AnimChannel::Translation, 1);
     {
         let animation = &mut app.doc.scene.get_mut(cube).unwrap().animation;
         *animation = AnimationClip::default();
-        animation.set_key(AnimProperty::RotationY, 0.0, 0.0, Interpolation::Linear);
-        animation.set_key(AnimProperty::RotationY, 1.0, 90.0, Interpolation::Linear);
+        animation.set_key(address, 0.0, 0.0, Interpolation::Linear);
+        animation.set_key(address, 1.0, 90.0, Interpolation::Linear);
     }
     app.history.clear();
 
-    assert!(app.set_curve_key_interpolation(AnimProperty::RotationY, 0.0, Interpolation::Constant));
+    assert!(app.set_curve_key_interpolation(address, 0.0, Interpolation::Constant));
     let track = app
         .doc
         .scene
         .get(cube)
         .unwrap()
         .animation
-        .track(AnimProperty::RotationY)
+        .track(address)
         .unwrap();
     assert_eq!(track.curve.keys[0].interpolation, Interpolation::Constant);
     assert_eq!(track.curve.keys[1].interpolation, Interpolation::Linear);
     assert_eq!(app.history.depth(), 1);
 
     let before = app.doc.signature();
-    assert!(!app.set_curve_key_interpolation(
-        AnimProperty::RotationY,
-        0.0,
-        Interpolation::Constant
-    ));
-    assert!(!app.set_curve_key_interpolation(
-        AnimProperty::RotationY,
-        4.0,
-        Interpolation::Constant
-    ));
+    assert!(!app.set_curve_key_interpolation(address, 0.0, Interpolation::Constant));
+    assert!(!app.set_curve_key_interpolation(address, 4.0, Interpolation::Constant));
     assert_eq!(app.doc.signature(), before);
     assert_eq!(app.history.depth(), 1);
 }
@@ -338,16 +468,21 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
         *animation = AnimationClip::default();
         for (time, value) in [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)] {
             animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 time,
                 value,
                 Interpolation::Spline,
             );
             animation.set_morph_weight_key(0, time, value, Interpolation::Spline);
-            animation.set_rotation_key(time, Quat::from_rotation_y(value), Interpolation::Spline);
+            animation.set_rotation_key(
+                ChannelTarget::Owner,
+                time,
+                Quat::from_rotation_y(value),
+                Interpolation::Spline,
+            );
         }
         let curve = &mut animation
-            .track_mut(AnimProperty::TranslationX)
+            .track_mut(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve;
         assert!(curve.set_manual_tangents(0.0, 0.0, 2.0));
@@ -355,7 +490,7 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     let target = AnimTarget::Object(cube);
     assert!(app.set_anim_target(target));
     for track in [
-        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0)),
         CurveTrackId::MorphWeight(0),
         CurveTrackId::Rotation,
     ] {
@@ -377,7 +512,11 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     );
     let clip = app.target_clip(target).unwrap();
     assert_eq!(
-        clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0].interpolation,
+        clip.track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+            .unwrap()
+            .curve
+            .keys[0]
+            .interpolation,
         Interpolation::Smooth
     );
     assert_eq!(
@@ -389,7 +528,12 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
         Interpolation::Smooth
     );
     assert!(
-        !clip.track(AnimProperty::TranslationX).unwrap().curve.keys[0].tangent_manual,
+        !clip
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+            .unwrap()
+            .curve
+            .keys[0]
+            .tangent_manual,
         "Smooth redefines the hand-authored tangent"
     );
 
@@ -397,7 +541,7 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     let restored = app.target_clip(target).unwrap();
     assert_eq!(
         restored
-            .track(AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve
             .keys[0]
@@ -406,7 +550,7 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     );
     assert!(
         restored
-            .track(AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve
             .keys[0]
@@ -414,7 +558,7 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     );
     assert!(
         (restored
-            .track(AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve
             .keys[0]
@@ -442,7 +586,7 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     assert_eq!(app.history.depth(), 1, "tangent type edit is one undo step");
     let changed = app.target_clip(target).unwrap();
     let scalar = changed
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys[0];
@@ -462,7 +606,7 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     app.undo();
     let restored = app.target_clip(target).unwrap();
     let scalar = restored
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys[0];
@@ -473,7 +617,7 @@ fn fcurve_interpolation_and_tangent_type_cover_mixed_selection_with_undo() {
     assert_eq!(
         app.target_clip(target)
             .unwrap()
-            .track(AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve
             .keys[0]
@@ -496,7 +640,7 @@ fn recorded_rotation_round_trips_through_registry_and_key_editing() {
     app.key_transform_channels();
     let clip = &app.doc.scene.get(cube).unwrap().animation;
     assert!(
-        clip.track(AnimProperty::RotationX).is_none(),
+        clip.legacy_euler_rotation.is_empty(),
         "rotation must be recorded as one quaternion channel, not Euler curves"
     );
     let track = clip.rotation.as_ref().expect("quaternion rotation track");
@@ -586,12 +730,35 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         node.tags.len() - 1
     };
     let target = AnimTarget::Tag(cube, tag_index);
+    let tag_address = ChannelAddress::new(
+        ChannelTarget::Tag {
+            node: cube,
+            index: tag_index as u32,
+        },
+        AnimChannel::CopyLocationWeight,
+        0,
+    )
+    .unwrap();
     assert!(app.set_anim_target(target));
     let rows = app.curve_rows(target);
     assert_eq!(rows.len(), 1, "tag scope declares one registry channel");
     assert_eq!(rows[0].channel, AnimChannel::CopyLocationWeight);
     assert_eq!(rows[0].channel.component_count(), 1);
-    assert_eq!(rows[0].property, Some(AnimProperty::CopyLocationWeight));
+    assert_eq!(
+        rows[0].address,
+        Some(
+            ChannelAddress::new(
+                ChannelTarget::Tag {
+                    node: cube,
+                    index: tag_index as u32,
+                },
+                AnimChannel::CopyLocationWeight,
+                0,
+            )
+            .unwrap()
+        ),
+        "a tag row addresses its node and tag index"
+    );
 
     app.history.clear();
     app.playback.time = 0.0;
@@ -612,15 +779,8 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         .get(&(tag_index as u32))
         .cloned()
         .expect("recording wrote the per-tag clip");
-    assert_eq!(
-        clip.track(AnimProperty::CopyLocationWeight)
-            .unwrap()
-            .curve
-            .keys
-            .len(),
-        2
-    );
-    assert!((clip.sample_or(AnimProperty::CopyLocationWeight, 1.0, -1.0) - 1.0).abs() < 1e-4);
+    assert_eq!(clip.track(tag_address).unwrap().curve.keys.len(), 2);
+    assert!((clip.sample_or(tag_address, 1.0, -1.0) - 1.0).abs() < 1e-4);
 
     let world_at_one = app.doc.evaluate(1.0);
     let cube_pos = world_at_one.node(cube).unwrap().world.w_axis.truncate();
@@ -631,11 +791,7 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
     );
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
-        1.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(tag_address), 1.0));
     assert!(app.move_selected_curve_key(2.0));
     assert_eq!(app.history.depth(), depth + 1);
     let clip = app
@@ -647,7 +803,7 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         .get(&(tag_index as u32))
         .unwrap()
         .clone();
-    assert!((clip.sample_or(AnimProperty::CopyLocationWeight, 2.0, -1.0) - 1.0).abs() < 1e-4);
+    assert!((clip.sample_or(tag_address, 2.0, -1.0) - 1.0).abs() < 1e-4);
     app.history.undo(&mut app.doc);
     let restored = app
         .doc
@@ -658,14 +814,10 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         .get(&(tag_index as u32))
         .unwrap()
         .clone();
-    assert!((restored.sample_or(AnimProperty::CopyLocationWeight, 1.0, -1.0) - 1.0).abs() < 1e-4);
+    assert!((restored.sample_or(tag_address, 1.0, -1.0) - 1.0).abs() < 1e-4);
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
-        0.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(tag_address), 0.0));
     assert!(app.set_selected_curve_key_interpolation(Interpolation::Constant));
     assert_eq!(app.history.depth(), depth + 1);
     let stepped = app
@@ -677,20 +829,11 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         .get(&(tag_index as u32))
         .unwrap()
         .clone();
-    assert!(
-        stepped
-            .sample_or(AnimProperty::CopyLocationWeight, 0.5, -1.0)
-            .abs()
-            < 1e-4
-    );
+    assert!(stepped.sample_or(tag_address, 0.5, -1.0).abs() < 1e-4);
     app.history.undo(&mut app.doc);
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
-        0.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(tag_address), 0.0));
     assert!(app.set_selected_curve_tangent_type(TangentType::Linear, true, true));
     assert_eq!(app.history.depth(), depth + 1);
     let typed = app
@@ -703,22 +846,13 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         .unwrap()
         .clone();
     assert_eq!(
-        typed
-            .track(AnimProperty::CopyLocationWeight)
-            .unwrap()
-            .curve
-            .keys[0]
-            .tangent_out_type,
+        typed.track(tag_address).unwrap().curve.keys[0].tangent_out_type,
         TangentType::Linear
     );
     app.history.undo(&mut app.doc);
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
-        0.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(tag_address), 0.0));
     assert!(app.delete_selected_curve_key());
     assert_eq!(app.history.depth(), depth + 1);
     let one_key = app
@@ -730,16 +864,8 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
         .get(&(tag_index as u32))
         .unwrap()
         .clone();
-    assert_eq!(
-        one_key
-            .track(AnimProperty::CopyLocationWeight)
-            .unwrap()
-            .curve
-            .keys
-            .len(),
-        1
-    );
-    assert!((one_key.sample_or(AnimProperty::CopyLocationWeight, 0.5, -1.0) - 1.0).abs() < 1e-4);
+    assert_eq!(one_key.track(tag_address).unwrap().curve.keys.len(), 1);
+    assert!((one_key.sample_or(tag_address, 0.5, -1.0) - 1.0).abs() < 1e-4);
     app.history.undo(&mut app.doc);
     assert_eq!(
         app.doc
@@ -749,7 +875,7 @@ fn recorded_tag_channel_round_trips_through_registry_and_key_editing() {
             .tag_animations
             .get(&(tag_index as u32))
             .unwrap()
-            .track(AnimProperty::CopyLocationWeight)
+            .track(tag_address)
             .unwrap()
             .curve
             .keys
@@ -770,6 +896,12 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
         material.animation = AnimationClip::default();
     }
     let target = AnimTarget::Material(material_id);
+    let material_address = ChannelAddress::new(
+        ChannelTarget::Material { id: material_id },
+        AnimChannel::MaterialRoughness,
+        0,
+    )
+    .unwrap();
     assert!(app.set_anim_target(target));
     let rows = app.curve_rows(target);
     assert_eq!(
@@ -786,7 +918,7 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
     assert!(app
         .curve_rows(AnimTarget::Object(named(&app, "Cube")))
         .iter()
-        .any(|row| row.channel == AnimChannel::Translation && row.property.is_some()));
+        .any(|row| row.channel == AnimChannel::Translation && row.address.is_some()));
     assert!(
         !app.curve_rows(AnimTarget::Object(named(&app, "Cube")))
             .iter()
@@ -814,31 +946,27 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
         .unwrap()
         .animation
         .clone();
+    // Editor recordings address the material explicitly, not the clip owner.
+    let address = ChannelAddress::new(
+        ChannelTarget::Material { id: material_id },
+        AnimChannel::MaterialRoughness,
+        0,
+    )
+    .unwrap();
     assert_eq!(
-        clip.track(AnimProperty::MaterialRoughness)
-            .unwrap()
-            .curve
-            .keys
-            .len(),
-        2
+        clip.track(address).unwrap().curve.keys.len(),
+        2,
+        "two roughness keys were recorded"
     );
-    let sampled = clip.sample_or(AnimProperty::MaterialRoughness, 1.0, -1.0);
-    let keys = &clip
-        .track(AnimProperty::MaterialRoughness)
-        .unwrap()
-        .curve
-        .keys;
+    let sampled = clip.sample_or(address, 1.0, -1.0);
+    let keys = &clip.track(address).unwrap().curve.keys;
     assert!(
         (sampled - 0.8).abs() < 1e-4,
         "keys {keys:?} sampled {sampled}"
     );
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
-        1.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(material_address), 1.0));
     assert!(app.move_selected_curve_key(2.0));
     assert_eq!(app.history.depth(), depth + 1);
     let moved = app
@@ -848,15 +976,11 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
         .unwrap()
         .animation
         .clone();
-    assert!((moved.sample_or(AnimProperty::MaterialRoughness, 2.0, -1.0) - 0.8).abs() < 1e-4);
+    assert!((moved.sample_or(material_address, 2.0, -1.0) - 0.8).abs() < 1e-4);
     app.history.undo(&mut app.doc);
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
-        0.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(material_address), 0.0));
     assert!(app.set_selected_curve_key_interpolation(Interpolation::Constant));
     assert_eq!(app.history.depth(), depth + 1);
     let ctx = lc_shading::ShadingContext::new(&app.texture_cache);
@@ -874,11 +998,7 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
     app.history.undo(&mut app.doc);
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
-        0.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(material_address), 0.0));
     assert!(app.set_selected_curve_tangent_type(TangentType::Linear, true, true));
     assert_eq!(app.history.depth(), depth + 1);
     let typed = app
@@ -889,22 +1009,13 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
         .animation
         .clone();
     assert_eq!(
-        typed
-            .track(AnimProperty::MaterialRoughness)
-            .unwrap()
-            .curve
-            .keys[0]
-            .tangent_out_type,
+        typed.track(material_address).unwrap().curve.keys[0].tangent_out_type,
         TangentType::Linear
     );
     app.history.undo(&mut app.doc);
 
     let depth = app.history.depth();
-    assert!(app.select_target_track_key(
-        target,
-        CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
-        0.0
-    ));
+    assert!(app.select_target_track_key(target, CurveTrackId::Scalar(material_address), 0.0));
     assert!(app.delete_selected_curve_key());
     assert_eq!(app.history.depth(), depth + 1);
     let ctx = lc_shading::ShadingContext::new(&app.texture_cache);
@@ -923,7 +1034,7 @@ fn recorded_material_channel_round_trips_through_registry_and_key_editing() {
             .get(material_id)
             .unwrap()
             .animation
-            .track(AnimProperty::MaterialRoughness)
+            .track(material_address)
             .unwrap()
             .curve
             .keys
@@ -942,16 +1053,32 @@ fn fcurve_box_selection_and_copy_paste_cover_object_scalar_and_rotation_keys() {
     {
         let node = app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            1.0,
+            Interpolation::Linear,
+        );
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            2.0,
+            Interpolation::Linear,
+        );
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.5,
+            50.0,
+            Interpolation::Linear,
+        );
         node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 1.0, Interpolation::Linear);
-        node.animation
-            .set_key(AnimProperty::TranslationX, 1.0, 2.0, Interpolation::Linear);
-        node.animation
-            .set_key(AnimProperty::TranslationX, 2.5, 50.0, Interpolation::Linear);
-        node.animation
-            .set_rotation_key(1.0, rotation, Interpolation::Linear);
-        node.animation
-            .set_rotation_key(2.5, Quat::from_rotation_y(1.0), Interpolation::Linear);
+            .set_rotation_key(ChannelTarget::Owner, 1.0, rotation, Interpolation::Linear);
+        node.animation.set_rotation_key(
+            ChannelTarget::Owner,
+            2.5,
+            Quat::from_rotation_y(1.0),
+            Interpolation::Linear,
+        );
     }
     let target = AnimTarget::Object(cube);
     assert!(app.set_anim_target(target));
@@ -961,7 +1088,8 @@ fn fcurve_box_selection_and_copy_paste_cover_object_scalar_and_rotation_keys() {
     let selected = app.selected_curve_keys();
     assert_eq!(selected.len(), 3, "two scalar keys and one rotation key");
     assert!(selected.iter().any(|key| {
-        key.track == CurveTrackId::Scalar(AnimProperty::TranslationX)
+        key.track
+            == CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             && (key.time - 1.0).abs() < 1e-4
     }));
     assert!(selected
@@ -971,7 +1099,7 @@ fn fcurve_box_selection_and_copy_paste_cover_object_scalar_and_rotation_keys() {
 
     assert!(app.select_target_track_key(
         target,
-        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0)),
         2.5
     ));
     assert!(app.select_keys_in_box(target, &clip, (0.0, 1.0), (-10.0, 10.0), true));
@@ -985,14 +1113,35 @@ fn fcurve_box_selection_and_copy_paste_cover_object_scalar_and_rotation_keys() {
     assert!(app.paste_curve_keys());
     assert_eq!(app.history.depth(), 1, "paste is one undo step");
     let pasted = app.target_clip(target).unwrap();
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 5.0, -1.0) - 1.0).abs() < 1e-4);
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 6.0, -1.0) - 2.0).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            5.0,
+            -1.0
+        ) - 1.0)
+            .abs()
+            < 1e-4
+    );
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            6.0,
+            -1.0
+        ) - 2.0)
+            .abs()
+            < 1e-4
+    );
     assert!(pasted.sample_rotation(6.0).is_some());
-    assert!(pasted.sample(AnimProperty::TranslationX, 6.0).is_some());
+    assert!(pasted
+        .sample(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            6.0
+        )
+        .is_some());
     app.history.undo(&mut app.doc);
     let restored = app.target_clip(target).unwrap();
     assert!(restored
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys
@@ -1014,34 +1163,56 @@ fn fcurve_box_selection_and_copy_paste_cover_object_scalar_and_rotation_keys() {
     {
         let node = app.doc.scene.get_mut(sphere).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 3.0, 99.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            3.0,
+            99.0,
+            Interpolation::Linear,
+        );
     }
     app.playback.time = 3.0;
     let depth = app.history.depth();
     assert!(app.paste_curve_keys());
     assert_eq!(app.history.depth(), depth + 1);
     let other_clip = app.target_clip(other).unwrap();
-    let overwritten = other_clip.sample_or(AnimProperty::TranslationX, 3.0, -1.0);
+    let overwritten = other_clip.sample_or(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        3.0,
+        -1.0,
+    );
     assert!(
         (overwritten - 1.0).abs() < 1e-4,
         "paste overwrites an existing key: sampled {overwritten}, keys {:?}",
         other_clip
-            .track(AnimProperty::TranslationX)
+            .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
             .unwrap()
             .curve
             .keys
     );
     assert!(other_clip.sample_rotation(4.0).is_some());
-    assert!((other_clip.sample_or(AnimProperty::TranslationX, 4.0, -1.0) - 2.0).abs() < 1e-4);
+    assert!(
+        (other_clip.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            4.0,
+            -1.0
+        ) - 2.0)
+            .abs()
+            < 1e-4
+    );
     app.history.undo(&mut app.doc);
     let other_clip = app.target_clip(other).unwrap();
     assert!(
-        (other_clip.sample_or(AnimProperty::TranslationX, 3.0, -1.0) - 99.0).abs() < 1e-4,
+        (other_clip.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            3.0,
+            -1.0
+        ) - 99.0)
+            .abs()
+            < 1e-4,
         "one undo restores the overwritten key"
     );
     assert!(other_clip
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys
@@ -1075,19 +1246,19 @@ fn fcurve_box_selection_and_copy_paste_cover_tag_and_material_scopes() {
         });
         let mut clip = AnimationClip::default();
         clip.set_key(
-            AnimProperty::CopyLocationWeight,
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
             0.0,
             0.0,
             Interpolation::Linear,
         );
         clip.set_key(
-            AnimProperty::CopyLocationWeight,
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
             1.0,
             1.0,
             Interpolation::Linear,
         );
         clip.set_key(
-            AnimProperty::CopyLocationWeight,
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
             2.5,
             0.9,
             Interpolation::Linear,
@@ -1117,13 +1288,32 @@ fn fcurve_box_selection_and_copy_paste_cover_tag_and_material_scopes() {
     assert!(app.paste_curve_keys());
     assert_eq!(app.history.depth(), depth + 1);
     let pasted = app.target_clip(other_tag).unwrap();
-    assert!((pasted.sample_or(AnimProperty::CopyLocationWeight, 4.0, -1.0) - 0.0).abs() < 1e-4);
-    assert!((pasted.sample_or(AnimProperty::CopyLocationWeight, 5.0, -1.0) - 1.0).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
+            4.0,
+            -1.0
+        ) - 0.0)
+            .abs()
+            < 1e-4
+    );
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
+            5.0,
+            -1.0
+        ) - 1.0)
+            .abs()
+            < 1e-4
+    );
     app.history.undo(&mut app.doc);
     assert!(app
         .target_clip(other_tag)
         .unwrap()
-        .track(AnimProperty::CopyLocationWeight)
+        .track(ChannelAddress::owner_component(
+            AnimChannel::CopyLocationWeight,
+            0
+        ))
         .unwrap()
         .curve
         .keys
@@ -1134,31 +1324,31 @@ fn fcurve_box_selection_and_copy_paste_cover_tag_and_material_scopes() {
         let material = app.doc.materials.get_mut(material_id).unwrap();
         let mut clip = AnimationClip::default();
         clip.set_key(
-            AnimProperty::MaterialRoughness,
+            ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
             0.0,
             0.2,
             Interpolation::Linear,
         );
         clip.set_key(
-            AnimProperty::MaterialRoughness,
+            ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
             1.0,
             0.8,
             Interpolation::Linear,
         );
         clip.set_key(
-            AnimProperty::MaterialRoughness,
+            ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
             2.5,
             0.4,
             Interpolation::Linear,
         );
         clip.set_key(
-            AnimProperty::MaterialMetallic,
+            ChannelAddress::owner_component(AnimChannel::MaterialMetallic, 0),
             0.0,
             0.1,
             Interpolation::Linear,
         );
         clip.set_key(
-            AnimProperty::MaterialMetallic,
+            ChannelAddress::owner_component(AnimChannel::MaterialMetallic, 0),
             1.0,
             0.9,
             Interpolation::Linear,
@@ -1183,20 +1373,50 @@ fn fcurve_box_selection_and_copy_paste_cover_tag_and_material_scopes() {
     assert!(app.paste_curve_keys());
     assert_eq!(app.history.depth(), depth + 1);
     let pasted = app.target_clip(other_material).unwrap();
-    assert!((pasted.sample_or(AnimProperty::MaterialRoughness, 3.0, -1.0) - 0.2).abs() < 1e-4);
-    assert!((pasted.sample_or(AnimProperty::MaterialRoughness, 4.0, -1.0) - 0.8).abs() < 1e-4);
-    assert!((pasted.sample_or(AnimProperty::MaterialMetallic, 4.0, -1.0) - 0.9).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
+            3.0,
+            -1.0
+        ) - 0.2)
+            .abs()
+            < 1e-4
+    );
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
+            4.0,
+            -1.0
+        ) - 0.8)
+            .abs()
+            < 1e-4
+    );
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::MaterialMetallic, 0),
+            4.0,
+            -1.0
+        ) - 0.9)
+            .abs()
+            < 1e-4
+    );
     app.history.undo(&mut app.doc);
     let restored = app.target_clip(other_material).unwrap();
     assert!(restored
-        .track(AnimProperty::MaterialRoughness)
+        .track(ChannelAddress::owner_component(
+            AnimChannel::MaterialRoughness,
+            0
+        ))
         .unwrap()
         .curve
         .keys
         .iter()
         .all(|key| (key.time - 3.0).abs() > KEY_TIME_EPSILON));
     assert!(restored
-        .track(AnimProperty::MaterialMetallic)
+        .track(ChannelAddress::owner_component(
+            AnimChannel::MaterialMetallic,
+            0
+        ))
         .unwrap()
         .curve
         .keys
@@ -1218,16 +1438,28 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
     {
         let node = harness.app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 4.0, Interpolation::Linear);
-        node.animation
-            .set_key(AnimProperty::TranslationX, 1.0, 5.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            4.0,
+            Interpolation::Linear,
+        );
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            5.0,
+            Interpolation::Linear,
+        );
     }
     {
         let node = harness.app.doc.scene.get_mut(sphere).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 2.0, 99.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+            99.0,
+            Interpolation::Linear,
+        );
     }
     let source_object = AnimTarget::Object(cube);
     assert!(activate_curve_target(&mut harness.app, source_object));
@@ -1309,20 +1541,20 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
         let mut clip = AnimationClip::default();
         if node_id == cube {
             clip.set_key(
-                AnimProperty::CopyLocationWeight,
+                ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
                 0.0,
                 0.0,
                 Interpolation::Linear,
             );
             clip.set_key(
-                AnimProperty::CopyLocationWeight,
+                ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
                 1.0,
                 1.0,
                 Interpolation::Linear,
             );
         } else {
             clip.set_key(
-                AnimProperty::CopyLocationWeight,
+                ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
                 2.0,
                 0.5,
                 Interpolation::Linear,
@@ -1364,7 +1596,7 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
     assert_property_curve_times(
         &harness.app,
         destination_tag,
-        AnimProperty::CopyLocationWeight,
+        ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
         &[2.0, 4.0, 5.0],
     );
     let tag_pasted_selection = harness.app.selected_curve_keys();
@@ -1378,7 +1610,7 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
     assert_property_curve_times(
         &harness.app,
         destination_tag,
-        AnimProperty::CopyLocationWeight,
+        ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
         &[2.0],
     );
     assert_eq!(
@@ -1401,7 +1633,7 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
     assert_property_curve_times(
         &harness.app,
         destination_tag,
-        AnimProperty::CopyLocationWeight,
+        ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
         &[2.0, 4.0, 5.0],
     );
     assert_eq!(
@@ -1417,20 +1649,20 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
         let mut clip = AnimationClip::default();
         if material_id == 0 {
             clip.set_key(
-                AnimProperty::MaterialRoughness,
+                ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
                 0.0,
                 0.2,
                 Interpolation::Linear,
             );
             clip.set_key(
-                AnimProperty::MaterialRoughness,
+                ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
                 1.0,
                 0.8,
                 Interpolation::Linear,
             );
         } else {
             clip.set_key(
-                AnimProperty::MaterialRoughness,
+                ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
                 2.0,
                 0.5,
                 Interpolation::Linear,
@@ -1474,7 +1706,7 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
     assert_property_curve_times(
         &harness.app,
         destination_material,
-        AnimProperty::MaterialRoughness,
+        ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
         &[2.0, 4.0, 5.0],
     );
     let material_pasted_selection = harness.app.selected_curve_keys();
@@ -1488,7 +1720,7 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
     assert_property_curve_times(
         &harness.app,
         destination_material,
-        AnimProperty::MaterialRoughness,
+        ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
         &[2.0],
     );
     assert_eq!(
@@ -1510,7 +1742,7 @@ fn fcurve_paste_undo_redo_reactivates_targets_for_all_scopes() {
     assert_property_curve_times(
         &harness.app,
         destination_material,
-        AnimProperty::MaterialRoughness,
+        ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
         &[2.0, 4.0, 5.0],
     );
     assert_eq!(
@@ -1543,7 +1775,7 @@ fn fcurve_paste_undo_with_missing_target_restores_edit_and_preserves_history() {
     let mut cube_clip = AnimationClip::default();
     for time in [0.0, 1.0] {
         cube_clip.set_key(
-            AnimProperty::CopyLocationWeight,
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
             time,
             0.5,
             Interpolation::Linear,
@@ -1559,7 +1791,7 @@ fn fcurve_paste_undo_with_missing_target_restores_edit_and_preserves_history() {
         .insert(0, cube_clip);
     let mut sphere_clip = AnimationClip::default();
     sphere_clip.set_key(
-        AnimProperty::CopyLocationWeight,
+        ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
         2.0,
         0.5,
         Interpolation::Linear,
@@ -1613,7 +1845,10 @@ fn fcurve_paste_undo_with_missing_target_restores_edit_and_preserves_history() {
         .get(&0)
         .unwrap();
     let restored_times: Vec<f32> = restored
-        .track(AnimProperty::CopyLocationWeight)
+        .track(ChannelAddress::owner_component(
+            AnimChannel::CopyLocationWeight,
+            0,
+        ))
         .unwrap()
         .curve
         .keys
@@ -1643,7 +1878,10 @@ fn fcurve_paste_undo_with_missing_target_restores_edit_and_preserves_history() {
         .get(&0)
         .unwrap();
     let reapplied_times: Vec<f32> = reapplied
-        .track(AnimProperty::CopyLocationWeight)
+        .track(ChannelAddress::owner_component(
+            AnimChannel::CopyLocationWeight,
+            0,
+        ))
         .unwrap()
         .curve
         .keys
@@ -1666,8 +1904,12 @@ fn fcurve_paste_undo_with_deleted_object_target_keeps_history_sound() {
     {
         let node = harness.app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 1.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            1.0,
+            Interpolation::Linear,
+        );
     }
     let source = AnimTarget::Object(cube);
     assert!(activate_curve_target(&mut harness.app, source));
@@ -1716,7 +1958,7 @@ fn fcurve_multi_key_drag_preserves_spacing_as_one_undo_step() {
         node.animation = AnimationClip::default();
         for (time, value) in [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)] {
             node.animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 time,
                 value,
                 Interpolation::Linear,
@@ -1732,7 +1974,11 @@ fn fcurve_multi_key_drag_preserves_spacing_as_one_undo_step() {
     assert!(app.move_selected_curve_key(5.0));
     assert_eq!(app.history.depth(), 1, "multi-key drag is one undo step");
     let moved = app.target_clip(target).unwrap();
-    let keys = &moved.track(AnimProperty::TranslationX).unwrap().curve.keys;
+    let keys = &moved
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+        .unwrap()
+        .curve
+        .keys;
     assert_eq!(keys.len(), 3);
     assert!((keys[0].time - 3.0).abs() < 1e-4);
     assert!((keys[1].time - 4.0).abs() < 1e-4);
@@ -1741,7 +1987,7 @@ fn fcurve_multi_key_drag_preserves_spacing_as_one_undo_step() {
     app.history.undo(&mut app.doc);
     let restored = app.target_clip(target).unwrap();
     let keys = &restored
-        .track(AnimProperty::TranslationX)
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
         .unwrap()
         .curve
         .keys;
@@ -1760,7 +2006,7 @@ fn fcurve_multi_key_drag_clamps_at_zero_without_collapsing_spacing() {
         node.animation = AnimationClip::default();
         for time in [1.0, 2.0, 3.0] {
             node.animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 time,
                 time,
                 Interpolation::Linear,
@@ -1773,7 +2019,11 @@ fn fcurve_multi_key_drag_clamps_at_zero_without_collapsing_spacing() {
     assert!(app.select_keys_in_box(target, &clip, (1.0, 3.0), (1.0, 3.0), false));
     assert!(app.move_selected_curve_key(-1.0));
     let moved = app.target_clip(target).unwrap();
-    let keys = &moved.track(AnimProperty::TranslationX).unwrap().curve.keys;
+    let keys = &moved
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+        .unwrap()
+        .curve
+        .keys;
     assert_eq!(keys.len(), 3);
     assert!((keys[0].time - 0.0).abs() < 1e-4);
     assert!((keys[1].time - 1.0).abs() < 1e-4);
@@ -1790,7 +2040,7 @@ fn fcurve_paste_uses_playhead_not_source_anchor_for_relative_offsets() {
         node.animation = AnimationClip::default();
         for (time, value) in [(5.0, 1.0), (6.0, 2.0)] {
             node.animation.set_key(
-                AnimProperty::TranslationX,
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
                 time,
                 value,
                 Interpolation::Linear,
@@ -1805,7 +2055,11 @@ fn fcurve_paste_uses_playhead_not_source_anchor_for_relative_offsets() {
     app.playback.time = 1.0;
     assert!(app.paste_curve_keys());
     let pasted = app.target_clip(target).unwrap();
-    let keys = &pasted.track(AnimProperty::TranslationX).unwrap().curve.keys;
+    let keys = &pasted
+        .track(ChannelAddress::owner_component(AnimChannel::Translation, 0))
+        .unwrap()
+        .curve
+        .keys;
     assert!(keys.iter().any(|key| (key.time - 1.0).abs() < 1e-4));
     assert!(keys.iter().any(|key| (key.time - 2.0).abs() < 1e-4));
 }
@@ -1819,22 +2073,30 @@ fn fcurve_copy_paste_round_trips_selected_keys_as_one_undo() {
     {
         let node = app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 1.0, Interpolation::Linear);
-        node.animation
-            .set_key(AnimProperty::TranslationX, 1.0, 2.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            1.0,
+            Interpolation::Linear,
+        );
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            2.0,
+            Interpolation::Linear,
+        );
     }
     let source = AnimTarget::Object(cube);
     assert!(app.set_anim_target(source));
     assert!(app.select_target_track_key_additive(
         source,
-        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0)),
         0.0,
         false
     ));
     assert!(app.select_target_track_key_additive(
         source,
-        CurveTrackId::Scalar(AnimProperty::TranslationX),
+        CurveTrackId::Scalar(ChannelAddress::owner_component(AnimChannel::Translation, 0)),
         1.0,
         true
     ));
@@ -1847,20 +2109,24 @@ fn fcurve_copy_paste_round_trips_selected_keys_as_one_undo() {
     assert!(app.paste_curve_keys());
     assert_eq!(app.history.depth(), 1, "paste is one undo step");
     let pasted = app.target_clip(destination).unwrap();
-    let keys = &pasted.track(AnimProperty::TranslationX).unwrap().curve.keys;
+    let pasted_address = ChannelAddress::new(
+        ChannelTarget::Object { id: sphere },
+        AnimChannel::Translation,
+        0,
+    )
+    .unwrap();
+    let keys = &pasted.track(pasted_address).unwrap().curve.keys;
     assert!(keys.iter().any(|key| (key.time - 3.0).abs() < 1e-4));
     assert!(keys.iter().any(|key| (key.time - 4.0).abs() < 1e-4));
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 3.0, -1.0) - 1.0).abs() < 1e-4);
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 4.0, -1.0) - 2.0).abs() < 1e-4);
+    assert!((pasted.sample_or(pasted_address, 3.0, -1.0) - 1.0).abs() < 1e-4);
+    assert!((pasted.sample_or(pasted_address, 4.0, -1.0) - 2.0).abs() < 1e-4);
     app.history.undo(&mut app.doc);
     let restored = app.target_clip(destination).unwrap();
-    assert!(!restored
-        .track(AnimProperty::TranslationX)
-        .is_some_and(|track| track
-            .curve
-            .keys
-            .iter()
-            .any(|key| (key.time - 3.0).abs() < 1e-4)));
+    assert!(!restored.track(pasted_address).is_some_and(|track| track
+        .curve
+        .keys
+        .iter()
+        .any(|key| (key.time - 3.0).abs() < 1e-4)));
 }
 
 #[test]
@@ -1876,8 +2142,12 @@ fn fcurve_keyboard_copy_paste_uses_the_playhead() {
     {
         let node = harness.app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 4.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            4.0,
+            Interpolation::Linear,
+        );
     }
     let target = AnimTarget::Object(cube);
     assert!(harness.app.set_anim_target(target));
@@ -1890,7 +2160,15 @@ fn fcurve_keyboard_copy_paste_uses_the_playhead() {
     harness.app.playback.time = 2.0;
     harness.press_key(egui::Key::V, egui::Modifiers::COMMAND);
     let pasted = harness.app.target_clip(target).unwrap();
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 2.0, -1.0) - 4.0).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+            -1.0
+        ) - 4.0)
+            .abs()
+            < 1e-4
+    );
     assert_eq!(harness.app.history.depth(), 1);
 }
 
@@ -1907,8 +2185,12 @@ fn fcurve_copy_paste_handle_native_clipboard_events() {
     {
         let node = harness.app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 4.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            4.0,
+            Interpolation::Linear,
+        );
     }
     let target = AnimTarget::Object(cube);
     assert!(harness.app.set_anim_target(target));
@@ -1929,7 +2211,15 @@ fn fcurve_copy_paste_handle_native_clipboard_events() {
         egui::Modifiers::COMMAND,
     );
     let pasted = harness.app.target_clip(target).unwrap();
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 2.0, -1.0) - 4.0).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+            -1.0
+        ) - 4.0)
+            .abs()
+            < 1e-4
+    );
     // The V release after a real clipboard paste must not paste a second time.
     let depth = harness.app.history.depth();
     harness.frame(
@@ -1959,8 +2249,12 @@ fn fcurve_paste_works_when_native_clipboard_is_empty() {
     {
         let node = harness.app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 4.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            4.0,
+            Interpolation::Linear,
+        );
     }
     let target = AnimTarget::Object(cube);
     assert!(harness.app.set_anim_target(target));
@@ -1986,7 +2280,15 @@ fn fcurve_paste_works_when_native_clipboard_is_empty() {
     );
     assert_eq!(harness.app.history.depth(), depth + 1);
     let pasted = harness.app.target_clip(target).unwrap();
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 2.0, -1.0) - 4.0).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+            -1.0
+        ) - 4.0)
+            .abs()
+            < 1e-4
+    );
 }
 
 #[test]
@@ -2054,6 +2356,67 @@ fn baking_an_ik_take_is_one_undo_step_and_writes_every_frame() {
 }
 
 #[test]
+fn fcurve_key_filter_shows_all_selected_and_transform_rows() {
+    let (mut app, _root) = test_app("curve-key-filter");
+    let camera = named(&app, "Camera");
+    app.selection.select_one(camera);
+    app.doc.scene.get_mut(camera).unwrap().animation = AnimationClip::default();
+    let target = AnimTarget::Object(camera);
+    assert!(app.set_anim_target(target));
+
+    app.set_curve_filter(CurveFilter::All);
+    let all = app.visible_curve_rows(target);
+    assert_eq!(all.len(), 8, "camera registry rows: {all:?}");
+    assert!(all.iter().any(|row| row.channel == AnimChannel::Fov));
+
+    app.set_curve_filter(CurveFilter::Transform);
+    let transforms = app.visible_curve_rows(target);
+    assert_eq!(transforms.len(), 7);
+    assert!(transforms
+        .iter()
+        .all(|row| AnimChannel::TRANSFORMS.contains(&row.channel)));
+    assert!(transforms.iter().all(|row| row.channel != AnimChannel::Fov));
+
+    app.set_curve_filter(CurveFilter::Selected);
+    assert!(
+        app.visible_curve_rows(target).is_empty(),
+        "no keys are selected yet"
+    );
+    app.doc.scene.get_mut(camera).unwrap().animation.set_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        0.0,
+        1.0,
+        Interpolation::Linear,
+    );
+    assert!(app.select_curve_key(
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
+        0.0
+    ));
+    let selected = app.visible_curve_rows(target);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0].address,
+        Some(
+            ChannelAddress::new(
+                ChannelTarget::Object { id: camera },
+                AnimChannel::Translation,
+                0,
+            )
+            .unwrap()
+        ),
+        "a row is addressed to the object it belongs to"
+    );
+
+    app.set_curve_filter(CurveFilter::All);
+    assert_eq!(app.visible_curve_rows(target).len(), all.len());
+    assert_eq!(
+        app.history.depth(),
+        0,
+        "filtering is view state, not an edit"
+    );
+}
+
+#[test]
 fn morph_weight_fcurve_row_keys_and_undo_redo() {
     let (mut app, _root) = test_app("morph-fcurve");
     let id = app.selection.primary().expect("selected cube");
@@ -2076,7 +2439,7 @@ fn morph_weight_fcurve_row_keys_and_undo_redo() {
         .iter()
         .find(|row| row.channel == AnimChannel::MorphWeight && row.morph_target == Some(0))
         .expect("morph target contributes an F-curve row");
-    assert_eq!(row.property, None);
+    assert_eq!(row.address, None);
     assert_eq!(app.curve_row_label(target, row), "Lift Weight");
 
     app.history.clear();
@@ -2185,13 +2548,13 @@ fn fcurve_retime_covers_tag_and_material_targets() {
     {
         let mut clip = AnimationClip::default();
         clip.set_key(
-            AnimProperty::CopyLocationWeight,
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
             0.0,
             0.0,
             Interpolation::Linear,
         );
         clip.set_key(
-            AnimProperty::CopyLocationWeight,
+            ChannelAddress::owner_component(AnimChannel::CopyLocationWeight, 0),
             1.0,
             1.0,
             Interpolation::Linear,
@@ -2207,7 +2570,10 @@ fn fcurve_retime_covers_tag_and_material_targets() {
     for time in [0.0, 1.0] {
         assert!(app.select_target_track_key_additive(
             tag_target,
-            CurveTrackId::Scalar(AnimProperty::CopyLocationWeight),
+            CurveTrackId::Scalar(ChannelAddress::owner_component(
+                AnimChannel::CopyLocationWeight,
+                0
+            )),
             time,
             true
         ));
@@ -2218,7 +2584,10 @@ fn fcurve_retime_covers_tag_and_material_targets() {
     let tag_clip = app.target_clip(tag_target).unwrap();
     assert_eq!(
         tag_clip
-            .track(AnimProperty::CopyLocationWeight)
+            .track(ChannelAddress::owner_component(
+                AnimChannel::CopyLocationWeight,
+                0
+            ))
             .unwrap()
             .curve
             .keys
@@ -2231,7 +2600,10 @@ fn fcurve_retime_covers_tag_and_material_targets() {
     let tag_clip = app.target_clip(tag_target).unwrap();
     assert_eq!(
         tag_clip
-            .track(AnimProperty::CopyLocationWeight)
+            .track(ChannelAddress::owner_component(
+                AnimChannel::CopyLocationWeight,
+                0
+            ))
             .unwrap()
             .curve
             .keys[1]
@@ -2244,13 +2616,13 @@ fn fcurve_retime_covers_tag_and_material_targets() {
         let material = app.doc.materials.get_mut(material_id).unwrap();
         material.animation = AnimationClip::default();
         material.animation.set_key(
-            AnimProperty::MaterialRoughness,
+            ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
             0.0,
             0.2,
             Interpolation::Linear,
         );
         material.animation.set_key(
-            AnimProperty::MaterialRoughness,
+            ChannelAddress::owner_component(AnimChannel::MaterialRoughness, 0),
             1.0,
             0.8,
             Interpolation::Linear,
@@ -2261,7 +2633,10 @@ fn fcurve_retime_covers_tag_and_material_targets() {
     for time in [0.0, 1.0] {
         assert!(app.select_target_track_key_additive(
             material_target,
-            CurveTrackId::Scalar(AnimProperty::MaterialRoughness),
+            CurveTrackId::Scalar(ChannelAddress::owner_component(
+                AnimChannel::MaterialRoughness,
+                0
+            )),
             time,
             true
         ));
@@ -2272,7 +2647,10 @@ fn fcurve_retime_covers_tag_and_material_targets() {
     let material_clip = app.target_clip(material_target).unwrap();
     assert_eq!(
         material_clip
-            .track(AnimProperty::MaterialRoughness)
+            .track(ChannelAddress::owner_component(
+                AnimChannel::MaterialRoughness,
+                0
+            ))
             .unwrap()
             .curve
             .keys[1]
@@ -2283,7 +2661,10 @@ fn fcurve_retime_covers_tag_and_material_targets() {
     assert_eq!(
         app.target_clip(material_target)
             .unwrap()
-            .track(AnimProperty::MaterialRoughness)
+            .track(ChannelAddress::owner_component(
+                AnimChannel::MaterialRoughness,
+                0
+            ))
             .unwrap()
             .curve
             .keys[1]
@@ -2300,18 +2681,34 @@ fn take_retime_scales_every_channel_in_one_undo_step() {
     {
         let node = app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 1.0, 0.0, Interpolation::Smooth);
-        node.animation
-            .set_key(AnimProperty::TranslationX, 3.0, 1.0, Interpolation::Smooth);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            1.0,
+            0.0,
+            Interpolation::Smooth,
+        );
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            3.0,
+            1.0,
+            Interpolation::Smooth,
+        );
         node.animation
             .set_morph_weight_key(0, 1.0, 0.0, Interpolation::Linear);
         node.animation
             .set_morph_weight_key(0, 3.0, 1.0, Interpolation::Linear);
-        node.animation
-            .set_rotation_key(1.0, Quat::IDENTITY, Interpolation::Linear);
-        node.animation
-            .set_rotation_key(3.0, Quat::from_rotation_y(1.0), Interpolation::Linear);
+        node.animation.set_rotation_key(
+            ChannelTarget::Owner,
+            1.0,
+            Quat::IDENTITY,
+            Interpolation::Linear,
+        );
+        node.animation.set_rotation_key(
+            ChannelTarget::Owner,
+            3.0,
+            Quat::from_rotation_y(1.0),
+            Interpolation::Linear,
+        );
     }
     app.history.clear();
     assert!(app.retime_animation_take(cube, 2.0));
@@ -2320,7 +2717,7 @@ fn take_retime_scales_every_channel_in_one_undo_step() {
     assert_property_curve_times(
         &app,
         AnimTarget::Object(cube),
-        AnimProperty::TranslationX,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
         &[2.0, 6.0],
     );
     assert_eq!(clip.morph_weights.get(&0).unwrap().keys[1].time, 6.0);
@@ -2331,16 +2728,121 @@ fn take_retime_scales_every_channel_in_one_undo_step() {
     assert_property_curve_times(
         &app,
         AnimTarget::Object(cube),
-        AnimProperty::TranslationX,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
         &[1.0, 3.0],
     );
     app.redo();
     assert_property_curve_times(
         &app,
         AnimTarget::Object(cube),
-        AnimProperty::TranslationX,
+        ChannelAddress::owner_component(AnimChannel::Translation, 0),
         &[2.0, 6.0],
     );
+}
+
+#[test]
+fn document_takes_switch_clips_and_retime_playback_in_one_undo_step() {
+    let (mut app, _root) = test_app("document-takes");
+    let cube = named(&app, "Cube");
+    app.selection.select_one(cube);
+    {
+        let node = app.doc.scene.get_mut(cube).unwrap();
+        node.animation = AnimationClip::default();
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            1.0,
+            Interpolation::Linear,
+        );
+    }
+    app.doc.store_active_clips();
+    app.history.clear();
+    let original = app.doc.signature();
+
+    assert!(app.create_take());
+    assert_eq!(app.history.depth(), 1, "creating a take is one undo step");
+    assert_eq!(app.doc.takes.len(), 2);
+    assert_eq!(app.doc.active_take, 1);
+    assert!(app.doc.scene.get(cube).unwrap().animation.is_empty());
+    assert_eq!(app.playback.fps, 24.0);
+
+    assert!(app.set_active_take_fps(12.0));
+    assert_eq!(app.history.depth(), 2, "fps edit is one undo step");
+    assert_eq!(app.playback.fps, 12.0);
+    assert!(
+        (app.playback.end - app.doc.settings.frame_end / 12.0).abs() < 1e-4,
+        "the playback range is retimed from the active take"
+    );
+    assert!(!app.set_active_take_fps(f32::NAN));
+    assert_eq!(
+        app.history.depth(),
+        2,
+        "refused values do not enter history"
+    );
+
+    assert!(app.activate_take(0));
+    assert_eq!(app.history.depth(), 3, "activation is one undo step");
+    assert_eq!(app.playback.fps, 24.0);
+    assert!(
+        (app.doc
+            .scene
+            .get(cube)
+            .unwrap()
+            .animation
+            .sample(
+                ChannelAddress::owner_component(AnimChannel::Translation, 0),
+                0.0
+            )
+            .unwrap()
+            - 1.0)
+            .abs()
+            < 1e-6
+    );
+
+    app.undo();
+    assert_eq!(app.doc.active_take, 1);
+    assert_eq!(app.playback.fps, 12.0);
+    assert!(app.doc.scene.get(cube).unwrap().animation.is_empty());
+    app.undo();
+    assert_eq!(app.playback.fps, 24.0);
+    app.undo();
+    assert_eq!(app.doc.active_take, 0);
+    assert_eq!(app.doc.signature(), original);
+    assert_eq!(app.playback.fps, 24.0);
+    app.redo();
+    assert_eq!(app.doc.active_take, 1);
+
+    assert!(app.rename_active_take("Run".into()));
+    assert_eq!(app.doc.takes[1].name, "Run");
+    assert!(!app.rename_active_take("  ".into()));
+    assert!(!app.rename_active_take("Take 1".into()));
+    assert_eq!(app.history.depth(), 2, "refused names do not enter history");
+    assert!(app.duplicate_take());
+    assert_eq!(app.doc.takes.len(), 3);
+    assert_eq!(app.doc.takes[2].name, "Run Copy");
+    assert!(app.delete_active_take());
+    assert_eq!(app.doc.takes.len(), 2);
+    assert_eq!(app.doc.active_take, 1);
+    assert_eq!(app.history.depth(), 4);
+}
+
+#[test]
+fn take_rows_activate_a_document_take() {
+    let (mut harness, _root) =
+        InputHarness::new("take-rows", Surface::Browser, Vec2::new(320.0, 700.0));
+    harness.app.browser_tab = BrowserTab::Takes;
+    assert!(harness.app.create_take());
+    harness.frame(Surface::Browser, Vec::new(), egui::Modifiers::default());
+    let row = harness
+        .app
+        .take_row_rects
+        .iter()
+        .find(|(index, _)| *index == 0)
+        .map(|(_, rect)| *rect)
+        .expect("Takes tab shows the first take");
+    harness.click(Surface::Browser, row.center(), egui::Modifiers::default());
+    assert_eq!(harness.app.doc.active_take, 0);
+    assert_eq!(harness.app.playback.fps, 24.0);
 }
 
 #[test]
@@ -2356,8 +2858,12 @@ fn fcurve_empty_clipboard_paste_accepts_ctrl_release_before_v() {
     {
         let node = harness.app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 4.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            4.0,
+            Interpolation::Linear,
+        );
     }
     let target = AnimTarget::Object(cube);
     assert!(harness.app.set_anim_target(target));
@@ -2382,7 +2888,15 @@ fn fcurve_empty_clipboard_paste_accepts_ctrl_release_before_v() {
     );
     assert_eq!(harness.app.history.depth(), depth + 1);
     let pasted = harness.app.target_clip(target).unwrap();
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 2.0, -1.0) - 4.0).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+            -1.0
+        ) - 4.0)
+            .abs()
+            < 1e-4
+    );
 }
 
 #[test]
@@ -2564,8 +3078,12 @@ fn fcurve_keyboard_shortcuts_survive_non_text_widget_focus() {
     {
         let node = harness.app.doc.scene.get_mut(cube).unwrap();
         node.animation = AnimationClip::default();
-        node.animation
-            .set_key(AnimProperty::TranslationX, 0.0, 4.0, Interpolation::Linear);
+        node.animation.set_key(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            0.0,
+            4.0,
+            Interpolation::Linear,
+        );
     }
     let target = AnimTarget::Object(cube);
     assert!(harness.app.set_anim_target(target));
@@ -2582,5 +3100,110 @@ fn fcurve_keyboard_shortcuts_survive_non_text_widget_focus() {
     harness.app.playback.time = 2.0;
     harness.press_key(egui::Key::V, egui::Modifiers::COMMAND);
     let pasted = harness.app.target_clip(target).unwrap();
-    assert!((pasted.sample_or(AnimProperty::TranslationX, 2.0, -1.0) - 4.0).abs() < 1e-4);
+    assert!(
+        (pasted.sample_or(
+            ChannelAddress::owner_component(AnimChannel::Translation, 0),
+            2.0,
+            -1.0
+        ) - 4.0)
+            .abs()
+            < 1e-4
+    );
+}
+
+#[test]
+fn curve_groups_group_channels_under_object_tag_and_material_targets() {
+    let (mut app, _root) = test_app("curve-groups");
+    let cube = named(&app, "Cube");
+    let source = named(&app, "Sphere");
+    let material_id = app.selected_material.expect("demo material selection");
+    app.selection.select_one(cube);
+    let tag_index = {
+        let node = app.doc.scene.get_mut(cube).unwrap();
+        node.tags
+            .retain(|tag| !matches!(tag, Tag::CopyLocation { .. }));
+        node.tags.push(Tag::CopyLocation {
+            source,
+            offset: Vec3::ZERO,
+            weight: 0.0,
+        });
+        node.tag_animations.clear();
+        node.tags.len() - 1
+    };
+    let tag_target = AnimTarget::Tag(cube, tag_index);
+    assert!(app.set_anim_target(tag_target));
+    app.playback.time = 0.25;
+    assert!(app.record_channel_key(tag_target, AnimChannel::CopyLocationWeight));
+    let material_target = AnimTarget::Material(material_id);
+    assert!(app.set_anim_target(material_target));
+    assert!(app.record_channel_key(material_target, AnimChannel::MaterialRoughness));
+    assert!(app.set_anim_target(AnimTarget::Object(cube)));
+
+    let groups = app.curve_groups();
+    let object_group = groups
+        .iter()
+        .find(|group| group.target == AnimTarget::Object(cube))
+        .expect("the current object is a group");
+    assert!(
+        object_group
+            .rows
+            .iter()
+            .any(|row| row.channel == AnimChannel::Translation),
+        "the current target lists every registry row"
+    );
+    let tag_group = groups
+        .iter()
+        .find(|group| group.target == tag_target)
+        .expect("the keyed tag is a group");
+    assert_eq!(tag_group.rows.len(), 1, "other groups list keyed rows only");
+    assert_eq!(tag_group.rows[0].channel, AnimChannel::CopyLocationWeight);
+    assert!(tag_group.label.starts_with("Tag:"));
+    let material_group = groups
+        .iter()
+        .find(|group| group.target == material_target)
+        .expect("the keyed material is a group");
+    assert_eq!(material_group.rows.len(), 1);
+    assert_eq!(
+        material_group.rows[0].channel,
+        AnimChannel::MaterialRoughness
+    );
+    assert!(material_group.label.starts_with("Material:"));
+
+    // Every channel in every group remains selectable and keyable.
+    assert!(app.curve_row_has_keys(tag_target, tag_group.rows[0]));
+    assert!(app.curve_row_has_keys(material_target, material_group.rows[0]));
+}
+
+#[test]
+fn curve_groups_follow_filters_without_editing_history() {
+    let (mut app, _root) = test_app("curve-group-filters");
+    let cube = named(&app, "Cube");
+    app.selection.select_one(cube);
+    let target = AnimTarget::Object(cube);
+    assert!(app.set_anim_target(target));
+    app.playback.time = 1.0;
+    assert!(app.record_channel_key(target, AnimChannel::Translation));
+    let before = app.doc.signature();
+    let depth = app.history.depth();
+
+    app.set_curve_filter(CurveFilter::Transform);
+    for group in app.curve_groups() {
+        assert!(
+            group
+                .rows
+                .iter()
+                .all(|row| AnimChannel::TRANSFORMS.contains(&row.channel)),
+            "the transform filter keeps only object, rotation and scale rows"
+        );
+    }
+
+    app.set_curve_filter(CurveFilter::Selected);
+    assert!(
+        app.curve_groups().iter().all(|group| group.rows.is_empty()),
+        "nothing is selected yet"
+    );
+
+    app.set_curve_filter(CurveFilter::All);
+    assert_eq!(app.doc.signature(), before);
+    assert_eq!(app.history.depth(), depth, "filters are view state");
 }

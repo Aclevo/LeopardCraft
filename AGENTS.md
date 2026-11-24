@@ -9,6 +9,19 @@ This is the instruction file for AI coding agents. Read it before changing code.
 `README.md` is the user-facing manual, `docs/cheetah3d-parity.md` records the
 researched Cheetah3D feature matrix, and `TODO.md` tracks feature work.
 
+## Current goal
+
+The remaining `TODO.md` backlog is planned as missions G30–G39 in
+[`docs/agents/goals/ROADMAP.md`](docs/agents/goals/ROADMAP.md). G30–G35 are
+complete, as is [`G38.md`](docs/agents/goals/G38.md); G36, G37 and G39 are
+partially complete with their remaining items recorded in `TODO.md` (G36 is down
+to the Stam-Loop hybrid masks and G39 to attaching the server to a running
+editor, and the research decisions for both are recorded there); the one item
+still needing the user's own approval is the interactive Claude Code session. A
+new
+session should read the roadmap before dispatching, and update the mission
+status when it lands.
+
 ## Ground rules
 
 - Do not commit, push, tag, deploy or publish unless the current request asks.
@@ -55,6 +68,10 @@ scripts/check.sh
 # Fast per-lane check for one agent lane (see "Multi-agent lanes")
 scripts/check-lane.sh geometry
 
+# Dispatch one lane task packet: host spawn_agents bridge, else the Codebuff CLI
+# (`--print-packet` composes the prompt for an interactive session instead)
+scripts/spawn-lane.sh geometry "<task packet>"
+
 # MCP smoke test alone: real binary, initialize + tools/list + tool calls
 cargo test -p leopardcraft --test mcp_smoke
 
@@ -62,6 +79,10 @@ cargo test -p leopardcraft --test mcp_smoke
 # (`mcp-server.sh` also works from any directory when called by absolute path)
 scripts/mcp-server.sh --scene scene.lcscene
 cargo run -p leopardcraft -- --mcp --scene scene.lcscene
+
+# Opt-in MCP Streamable HTTP transport on a loopback endpoint
+# (POST/GET /mcp; prints the endpoint URL, refuses non-loopback addresses)
+cargo run -p leopardcraft -- --mcp-http --addr 127.0.0.1:8765 --scene scene.lcscene
 ```
 
 The `scripts/check.sh` clippy step is stricter than CI (`-D warnings`). CI also
@@ -85,11 +106,11 @@ xkbcommon and Vulkan development packages listed in
 | `crates/lc-mcp` | Model Context Protocol stdio server and its scene tools |
 | `crates/lc-ui` | eframe editor: viewport, panels, timeline, material graph, lifecycle |
 | `app/tests/mcp_smoke.rs` | Real-process MCP handshake, config launch and tool-inventory checks |
-| `scripts` | Full-gate and per-lane checkers and the cwd-independent MCP launcher |
+| `scripts` | Full-gate and per-lane checkers, the cwd-independent MCP launcher and the lane dispatcher |
 | `packaging` | Distribution packaging inputs |
 | `docs/cheetah3d-parity.md` | Researched Cheetah3D parity matrix, sources and gaps |
 | `docs/agents` | Multi-agent lane briefs and the orchestration playbook |
-| `.agents` | Freebuff/Codebuff CLI lane agents and coordinator |
+| `.agents` | Codebuff CLI lane agents and coordinator |
 | `TODO.md` | Planned and completed feature work by workstream |
 
 ## Architecture
@@ -126,10 +147,12 @@ EvaluatedScene -> wgpu viewport overlay      crates/lc-ui
 - UI state lives in `LeopardApp` (`crates/lc-ui/src/app.rs`), with panels in
   `panels.rs`/`panels_more.rs`, toolbar/menu code in `shell.rs`, the wgpu
   viewport in `viewport.rs`, and selection/action tests in `selection_tests.rs`.
-- The MCP server (`crates/lc-mcp/src/server.rs` and `tools.rs`) speaks
-  newline-delimited JSON-RPC over stdio. It supports the `2025-06-18`
-  `initialize` handshake and the `2026-07-28` handshake-free revision. It owns
-  a separate document; it is not attached to a running editor window.
+- The MCP server (`crates/lc-mcp/src/server.rs`, `tools.rs` and `http.rs`)
+  speaks newline-delimited JSON-RPC over stdio by default and over the opt-in
+  Streamable HTTP transport (`--mcp-http`, loopback only). It supports the
+  `2025-06-18` `initialize` handshake and the `2026-07-28` handshake-free
+  revision, publishes resource subscriptions and prompt templates, and owns a
+  separate document; it is not attached to a running editor window.
 
 ## Where to change what
 
@@ -137,7 +160,7 @@ EvaluatedScene -> wgpu viewport overlay      crates/lc-ui
 | --- | --- | --- |
 | New primitive | `lc-geom/src/primitives.rs`, `Primitive` in `lc-scene/src/geometry.rs` | `build`/`label`, toolbar defaults in `lc-ui/src/shell.rs`, primitive validity and native round-trip tests |
 | New modifier | `Modifier` variants/defaults/apply in `lc-scene/src/geometry.rs`, geometry in `lc-geom/src/ops.rs` | modifier stack UI in `lc-ui/src/panels.rs`, serde/default tests |
-| New animatable property | `AnimProperty`/`AnimChannel` in `lc-anim/src/lib.rs` | sampling in `lc-scene/src/eval.rs`, F-curve registry UI, recording and undo tests |
+| New animatable property | `AnimChannel` and `ChannelAddress` in `lc-anim/src/lib.rs` | sampling in `lc-scene/src/eval.rs`, F-curve registry UI, recording and undo tests |
 | New tag or constraint | `Tag` in `lc-scene/src/scene.rs` | evaluation in `lc-scene/src/eval.rs`, tags panel, native round-trip/default test |
 | New file format field | owning type plus `lc-scene/src/format.rs` | `lc-io` if interchange, README, legacy-default and round-trip tests |
 | UI workflow or panel | `lc-ui/src/app.rs` plus `panels.rs`/`panels_more.rs` | `selection.rs` predicates, `selection_tests.rs`, README controls |
@@ -152,7 +175,15 @@ is the orchestration playbook: lane dependencies, shared contracts, task packets
 handoffs, merge order and integration checks. Each lane has a brief with its
 entry points, invariants and tests. `.claude/agents/lc-*.md` exposes the same
 lanes as Claude Code project subagents; `.agents/lc-*.ts` and
-`.agents/lc-coordinator.ts` expose them to the Freebuff/Codebuff CLI.
+`.agents/lc-coordinator.ts` expose them to the Codebuff CLI. Freebuff loads the
+same files but refuses their turns, which is the case that
+[`docs/agents/spawning.md`](docs/agents/spawning.md) explains.
+
+`spawn_agents` belongs to the agent host, not to this repository, so a host that
+does not load those directories cannot spawn a lane however correct the
+definitions are. Per-host dispatch commands, the failures that happen when a
+host ignores or refuses them, and the bridge that connects the two are in
+[`docs/agents/spawning.md`](docs/agents/spawning.md).
 
 | Lane | Write scope | Brief | Check |
 | --- | --- | --- | --- |
@@ -257,8 +288,12 @@ The server advertises exactly these tools. The real-process smoke test compares
 this section with `tools/list`:
 
 `get_scene`, `list_objects`, `get_object`, `create_primitive`, `set_transform`,
-`rename_object`, `delete_object`, `set_object_properties`, `list_materials`,
-`undo`, `redo`, `save_scene`, `open_scene`, `new_scene`, `export_scene`,
+`rename_object`, `delete_object`, `set_object_properties`, `add_modifier`,
+`update_modifier`, `remove_modifier`, `move_modifier`, `get_material`,
+`create_material`, `update_material`, `get_animation`, `set_animation_key`,
+`remove_animation_key`, `create_take`, `activate_take`, `update_take`,
+`delete_take`, `get_mesh`, `edit_mesh`, `edit_uv`, `list_materials`, `undo`,
+`redo`, `save_scene`, `open_scene`, `new_scene`, `export_scene`,
 `render_image`.
 
 See `README.md` for their parameters and grouping.

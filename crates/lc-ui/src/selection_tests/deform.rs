@@ -3,6 +3,75 @@
 use super::*;
 
 #[test]
+fn new_modifier_predicates_gate_formula_and_wrap() {
+    let (mut app, _root) = test_app("modifier-new-types");
+    let cube = named(&app, "Cube");
+    let panel = named(&app, "Checker Panel");
+    app.selection.select_one(cube);
+
+    assert!(app.modifier_ready(&Modifier::Wrap {
+        target: panel,
+        angle_deg: 45.0,
+        axis: 1,
+    }));
+    assert!(!app.modifier_ready(&Modifier::Wrap {
+        target: cube,
+        angle_deg: 45.0,
+        axis: 1,
+    }));
+    assert!(!app.modifier_ready(&Modifier::Wrap {
+        target: 9_999,
+        angle_deg: 45.0,
+        axis: 1,
+    }));
+
+    let formula = Modifier::Formula {
+        x: "x".into(),
+        y: "y + sin(z)".into(),
+        z: String::new(),
+    };
+    let broken = Modifier::Formula {
+        x: "x +".into(),
+        y: "y".into(),
+        z: "z".into(),
+    };
+    assert!(app.modifier_ready(&formula));
+    assert!(!app.modifier_ready(&broken));
+    let depth = app.history.depth();
+    assert!(!app.add_modifier_to_primary(broken));
+    assert_eq!(app.history.depth(), depth);
+
+    assert!(app.add_modifier_to_primary(formula.clone()));
+    assert_eq!(app.history.depth(), depth + 1);
+    assert!(app
+        .doc
+        .scene
+        .get(cube)
+        .unwrap()
+        .modifiers
+        .contains(&formula));
+    app.undo();
+    assert!(!app
+        .doc
+        .scene
+        .get(cube)
+        .unwrap()
+        .modifiers
+        .contains(&formula));
+
+    let smooth = Modifier::LaplacianSmooth {
+        iterations: 2,
+        strength: 0.5,
+        preserve_boundary: true,
+    };
+    assert!(app.add_modifier_to_primary(smooth.clone()));
+    assert!(app.doc.scene.get(cube).unwrap().modifiers.contains(&smooth));
+    assert_eq!(app.history.depth(), depth + 1);
+    app.undo();
+    assert_eq!(app.history.depth(), depth);
+}
+
+#[test]
 fn modifier_add_and_remove_validate_through_the_same_predicates() {
     let (mut app, _root) = test_app("modifier-parity");
     let cube = named(&app, "Cube");
@@ -739,4 +808,260 @@ fn morph_targets_capture_weight_and_undo() {
             geometry: GeometrySource::Primitive { .. }
         }
     ));
+}
+
+#[test]
+fn morph_base_update_rebases_targets_and_undoes_in_one_step() {
+    let (mut app, _root) = test_app("morph-update-base");
+    let id = app.selection.primary().expect("selected cube");
+    app.make_selected_editable();
+    app.doc.scene.get_mut(id).unwrap().modifiers.clear();
+    assert!(app.record_morph_base());
+    let original_base = app.doc.scene.get(id).unwrap().morph.base.clone();
+
+    let moved = {
+        let NodeKind::Mesh {
+            geometry: GeometrySource::Editable { mesh, .. },
+        } = &mut app.doc.scene.get_mut(id).unwrap().kind
+        else {
+            panic!("expected an editable mesh");
+        };
+        mesh.positions[0] += Vec3::Y * 0.5;
+        mesh.positions[1] += Vec3::Y * 0.25;
+        mesh.positions.clone()
+    };
+    assert_ne!(moved, original_base);
+    assert!(app.capture_morph_target());
+    let target_before = app.doc.scene.get(id).unwrap().morph.targets[0].clone();
+    let posed_before: Vec<Vec3> = original_base
+        .iter()
+        .zip(&target_before.deltas)
+        .map(|(base, delta)| *base + *delta)
+        .collect();
+
+    let new_base = {
+        let NodeKind::Mesh {
+            geometry: GeometrySource::Editable { mesh, .. },
+        } = &mut app.doc.scene.get_mut(id).unwrap().kind
+        else {
+            panic!("expected an editable mesh");
+        };
+        mesh.positions[2] += Vec3::X * 0.75;
+        mesh.positions.clone()
+    };
+    let depth = app.history.depth();
+    assert!(app.update_morph_base());
+    assert_eq!(app.history.depth(), depth + 1);
+    assert_eq!(app.history.undo_label().as_deref(), Some("Edit Morph"));
+    let morph = app.doc.scene.get(id).unwrap().morph.clone();
+    assert_eq!(morph.base, new_base);
+    let posed_after: Vec<Vec3> = morph
+        .base
+        .iter()
+        .zip(&morph.targets[0].deltas)
+        .map(|(base, delta)| *base + *delta)
+        .collect();
+    for (index, (before, after)) in posed_before.iter().zip(&posed_after).enumerate() {
+        assert!(
+            (*before - *after).length() < 1e-4,
+            "target pose moved at vertex {index}: {before:?} -> {after:?}"
+        );
+    }
+
+    let depth = app.history.depth();
+    assert!(!app.update_morph_base());
+    assert_eq!(app.history.depth(), depth);
+    assert!(app.status.contains("already matches"));
+
+    app.undo();
+    let restored = &app.doc.scene.get(id).unwrap().morph;
+    assert_eq!(restored.base, original_base);
+    assert_eq!(restored.targets[0].deltas, target_before.deltas);
+}
+
+#[test]
+fn morph_base_update_refuses_without_a_base_or_matching_topology() {
+    let (mut app, _root) = test_app("morph-update-base-refusals");
+    let id = app.selection.primary().expect("selected cube");
+    app.make_selected_editable();
+    app.doc.scene.get_mut(id).unwrap().modifiers.clear();
+
+    assert!(!app.update_morph_base());
+    assert!(app.status.contains("Record a morph base"));
+    assert!(app.record_morph_base());
+
+    if let NodeKind::Mesh {
+        geometry: GeometrySource::Editable { mesh, .. },
+    } = &mut app.doc.scene.get_mut(id).unwrap().kind
+    {
+        mesh.positions.push(Vec3::ZERO);
+    }
+    let depth = app.history.depth();
+    assert!(!app.update_morph_base());
+    assert!(app.status.contains("topology"));
+    assert_eq!(app.history.depth(), depth);
+}
+
+#[test]
+fn viewport_joint_click_selects_the_active_skinning_joint_and_refuses_others() {
+    let (mut harness, _root) = InputHarness::new(
+        "viewport-joint-pick",
+        Surface::Viewport,
+        Vec2::new(800.0, 600.0),
+    );
+    let app = &mut harness.app;
+    let id = app.doc.append_node(
+        NodeKind::Mesh {
+            geometry: GeometrySource::editable(lc_geom::box_mesh(1.0, 1.0, 1.0)),
+        },
+        "Joint Pick Mesh",
+        None,
+    );
+    let mut joints = Vec::new();
+    for (index, x) in [-0.8f32, 0.8].into_iter().enumerate() {
+        let joint = app.doc.append_node(
+            NodeKind::Joint {
+                length: 0.6,
+                width: 0.08,
+            },
+            &format!("Pick Joint {index}"),
+            None,
+        );
+        app.doc.scene.get_mut(joint).unwrap().transform.translation = Vec3::new(x, 0.6, 0.0);
+        joints.push(joint);
+    }
+    let spare = app.doc.append_node(
+        NodeKind::Joint {
+            length: 0.6,
+            width: 0.08,
+        },
+        "Spare Joint",
+        None,
+    );
+    app.doc.scene.get_mut(spare).unwrap().transform.translation = Vec3::new(0.0, 0.0, 1.3);
+    app.selection.select_one(id);
+    app.bind_auto_weights = false;
+    app.set_all_bind_joints(false);
+    for joint in &joints {
+        app.set_bind_joint(*joint, true);
+    }
+    assert!(app.bind_skin_to_joints());
+    app.weight_joint = Some(0);
+
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+    let (pixel_w, pixel_h) = harness.viewport_dims();
+    let rect = harness.app.last_viewport_rect;
+    let evaluated = harness.app.evaluate();
+    let target = joints[1];
+    let handle = harness
+        .app
+        .project(
+            evaluated.node(target).unwrap().world.w_axis.truncate(),
+            rect,
+            pixel_w,
+            pixel_h,
+        )
+        .expect("the bound joint must project into the viewport");
+    let depth = harness.app.history.depth();
+    let signature = harness.app.doc.signature();
+    harness.click(Surface::Viewport, handle, egui::Modifiers::default());
+    assert_eq!(harness.app.active_weight_joint(), Some(1));
+    assert_eq!(
+        harness.app.selection.primary(),
+        Some(id),
+        "picking a joint must not change the mesh selection"
+    );
+    assert_eq!(
+        harness.app.history.depth(),
+        depth,
+        "joint picking is view state"
+    );
+    assert_eq!(harness.app.doc.signature(), signature);
+
+    // A joint outside the skin has no handle and cannot be made active.
+    let spare_handle = harness
+        .app
+        .project(
+            evaluated.node(spare).unwrap().world.w_axis.truncate(),
+            rect,
+            pixel_w,
+            pixel_h,
+        )
+        .expect("the spare joint must project");
+    assert!(harness
+        .app
+        .pick_joint_handle(&evaluated, rect, pixel_w, pixel_h, spare_handle)
+        .is_none());
+    assert!(!harness.app.set_active_weight_joint_node(spare));
+    assert_eq!(harness.app.weight_joint, Some(1));
+
+    // Clicking empty space preserves the chosen active joint.
+    harness.app.weight_joint = Some(0);
+    harness.app.selection.select_one(id);
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+    let empty = harness.empty_point();
+    let (pixel_w, pixel_h) = harness.viewport_dims();
+    let rect = harness.app.last_viewport_rect;
+    let evaluated = harness.app.evaluate();
+    assert!(harness
+        .app
+        .pick_joint_handle(&evaluated, rect, pixel_w, pixel_h, empty)
+        .is_none());
+    harness.click(Surface::Viewport, empty, egui::Modifiers::default());
+    assert_eq!(harness.app.weight_joint, Some(0));
+}
+
+#[test]
+fn morph_browser_lists_targets_and_selects_the_owner() {
+    let (mut harness, _root) =
+        InputHarness::new("morph-browser", Surface::Browser, Vec2::new(280.0, 500.0));
+    let cube = named(&harness.app, "Cube");
+    harness.app.selection.select_one(cube);
+    harness.app.make_selected_editable();
+    harness
+        .app
+        .doc
+        .scene
+        .get_mut(cube)
+        .unwrap()
+        .modifiers
+        .clear();
+    assert!(harness.app.record_morph_base());
+    if let NodeKind::Mesh {
+        geometry: GeometrySource::Editable { mesh, .. },
+    } = &mut harness.app.doc.scene.get_mut(cube).unwrap().kind
+    {
+        mesh.positions[0] += Vec3::Y;
+    }
+    assert!(harness.app.capture_morph_target());
+    harness.app.doc.scene.get_mut(cube).unwrap().morph.targets[0].weight = 0.35;
+    harness.app.browser_tab = BrowserTab::Morphs;
+    let signature = harness.app.doc.signature();
+    let depth = harness.app.history.depth();
+
+    harness.frame(Surface::Browser, Vec::new(), egui::Modifiers::default());
+    let rows = harness.app.morph_browser_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].object, cube);
+    assert_eq!(rows[0].target_name, "Morph 1");
+    assert!((rows[0].weight - 0.35).abs() < 1e-6);
+    assert!(rows[0].active);
+
+    let camera = named(&harness.app, "Camera");
+    harness.app.selection.select_one(camera);
+    harness.frame(Surface::Browser, Vec::new(), egui::Modifiers::default());
+    let row = harness.morph_row(cube, 0);
+    harness.click(Surface::Browser, row.center(), egui::Modifiers::default());
+    assert_eq!(harness.app.selection.primary(), Some(cube));
+    assert_eq!(harness.app.inspector_tab, InspectorTab::Object);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth,
+        "row selection is view state"
+    );
+    assert_eq!(harness.app.doc.signature(), signature);
+
+    harness.app.doc.scene.get_mut(cube).unwrap().morph.targets[0].weight = 0.0;
+    harness.frame(Surface::Browser, Vec::new(), egui::Modifiers::default());
+    assert!(!harness.app.morph_browser_rows()[0].active);
 }

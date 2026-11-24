@@ -47,6 +47,18 @@ second source of scene truth.
   geometry so disabled UI and actual behavior cannot diverge.
 - Keep `LeopardApp` the only UI state owner. Do not scatter document or
   selection state into panels.
+- The UV view's multi-point selection, active UV set, checker/distortion
+  toggles, chart move/rotate/scale values and numeric UV entry live in
+  `UvEditorState` as view state. Document edits (seams, pins, projections, chart
+  transforms, packing, slot operations, add/remove set) go through
+  `commit_uv_edit`, which is exactly one `SetShapesCmd`; selection, overlays and
+  the active set must never dirty the document or history. Projections author
+  the active set; Unwrap, Relax and Normalize are UV0-only and refuse otherwise.
+- F-curve rows carry a `ChannelAddress` for their target. Editor recordings use
+  explicit object/tag/material addresses and row lookups resolve an existing
+  owner-relative track before treating a row as unkeyed, so old and new clips
+  edit consistently. The row list groups channels by target; grouping, target
+  focus and filters are view state and never touch the document or history.
 - File writes use the existing atomic save/export helpers and recovery paths.
   A failed write keeps the document dirty and reports the error; it leaves no
   partial target or temporary file.

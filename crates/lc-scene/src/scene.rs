@@ -37,6 +37,32 @@ pub enum Tag {
         #[serde(default = "one")]
         weight: f32,
     },
+    /// IK point constraint: pull the owner's world origin toward `target`.
+    IkPoint {
+        target: NodeId,
+        #[serde(default = "one")]
+        weight: f32,
+    },
+    /// IK angle constraint: keep the owner's world aim axis inside a cone of
+    /// `max_degrees` around the direction toward `target`.
+    IkAngle {
+        target: NodeId,
+        #[serde(default = "default_ik_angle")]
+        max_degrees: f32,
+    },
+    /// Orient constraint: blend the owner's world rotation toward the target's.
+    Orient {
+        target: NodeId,
+        #[serde(default = "one")]
+        weight: f32,
+    },
+    /// Parent constraint: blend the owner's world position and rotation toward
+    /// the target's.
+    Parent {
+        target: NodeId,
+        #[serde(default = "one")]
+        weight: f32,
+    },
     RenderOverride {
         visible: bool,
         casts_shadow: bool,
@@ -54,12 +80,21 @@ fn default_up() -> Vec3 {
     Vec3::Y
 }
 
+/// Default cone for the clean-room IK angle constraint.
+fn default_ik_angle() -> f32 {
+    45.0
+}
+
 impl Tag {
     pub fn label(&self) -> &'static str {
         match self {
             Self::LookAt { .. } => "Look At",
             Self::ClampRotation { .. } => "Clamp Rotation",
             Self::CopyLocation { .. } => "Copy Location",
+            Self::IkPoint { .. } => "IK Point",
+            Self::IkAngle { .. } => "IK Angle",
+            Self::Orient { .. } => "Orient",
+            Self::Parent { .. } => "Parent",
             Self::RenderOverride { .. } => "Render Override",
             Self::MaterialOverride { .. } => "Material Override",
             Self::Custom { .. } => "Custom Data",
@@ -71,6 +106,16 @@ impl Tag {
             target,
             up: Vec3::Y,
         }
+    }
+
+    /// True for the clean-room IK constraint tags. Their owner is driven by the
+    /// constraint pass even when it carries no `IkChain`, so a bake has to key
+    /// those joints too.
+    pub fn is_ik_constraint(&self) -> bool {
+        matches!(
+            self,
+            Self::IkPoint { .. } | Self::IkAngle { .. } | Self::Orient { .. } | Self::Parent { .. }
+        )
     }
 
     pub fn defaults_for(node: NodeId) -> Vec<Tag> {
@@ -86,6 +131,22 @@ impl Tag {
             Tag::CopyLocation {
                 source: node,
                 offset: Vec3::ZERO,
+                weight: 1.0,
+            },
+            Tag::IkPoint {
+                target: node,
+                weight: 1.0,
+            },
+            Tag::IkAngle {
+                target: node,
+                max_degrees: default_ik_angle(),
+            },
+            Tag::Orient {
+                target: node,
+                weight: 1.0,
+            },
+            Tag::Parent {
+                target: node,
                 weight: 1.0,
             },
             Tag::RenderOverride {

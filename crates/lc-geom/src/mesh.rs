@@ -63,9 +63,16 @@ pub struct Mesh {
     pub name: String,
     #[serde(default)]
     pub positions: Vec<Vec3>,
-    /// Per-corner texture coordinates. May be empty when the mesh has no UVs.
+    /// Per-corner texture coordinates (UV set 0). May be empty when the mesh
+    /// has no UVs.
     #[serde(default)]
     pub uvs: Vec<Vec2>,
+    /// Additional UV sets (UV1, UV2, …) for lightmaps and secondary textures.
+    /// Every set is parallel to `uvs`: slot `n` names the same polygon corner
+    /// in every set, so splitting, welding and topology changes keep the sets
+    /// in step. Old files have no extra sets and load as one UV0 set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_uvs: Vec<Vec<Vec2>>,
     #[serde(default)]
     pub polygons: Vec<Polygon>,
     /// Authored sharp edges as canonical undirected point pairs. Creases are
@@ -73,6 +80,13 @@ pub struct Mesh {
     /// linear subdivision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub creases: Vec<[u32; 2]>,
+    /// Fractional crease strengths in `(0, 1)`, as canonical undirected point
+    /// pairs sorted by pair. Full-strength creases live in `creases`; an edge
+    /// has one representation or the other, never both. Subdivision blends the
+    /// smooth and sharp rules by this weight, so `0.5` is exactly halfway
+    /// between an uncreased and a fully creased edge.
+    #[serde(default, skip_serializing_if = "crease_weights_empty")]
+    pub crease_weights: Box<Vec<([u32; 2], f32)>>,
     /// Authored UV seams as canonical undirected point pairs. Automatic unwrap
     /// cuts the mesh along these edges, so a seam is a chart border even where
     /// the neighbouring faces point the same way.
@@ -161,7 +175,87 @@ impl Mesh {
     pub fn add_uv(&mut self, uv: Vec2) -> u32 {
         let idx = self.uvs.len() as u32;
         self.uvs.push(uv);
+        // Every set shares the slot index, so a new slot exists in all of them.
+        for set in &mut self.extra_uvs {
+            set.push(Vec2::ZERO);
+        }
         idx
+    }
+
+    /// Number of UV sets: one for `uvs` plus every additional set, or zero
+    /// when the mesh has no UV slots.
+    pub fn uv_set_count(&self) -> usize {
+        if self.uvs.is_empty() {
+            0
+        } else {
+            1 + self.extra_uvs.len()
+        }
+    }
+
+    /// Coordinates of one UV set. Set 0 is `uvs`.
+    pub fn uv_set(&self, set: usize) -> Option<&[Vec2]> {
+        match set {
+            0 if !self.uvs.is_empty() => Some(&self.uvs),
+            index => self.extra_uvs.get(index.wrapping_sub(1)).map(Vec::as_slice),
+        }
+    }
+
+    pub fn uv_set_mut(&mut self, set: usize) -> Option<&mut [Vec2]> {
+        match set {
+            0 if !self.uvs.is_empty() => Some(&mut self.uvs),
+            index => self
+                .extra_uvs
+                .get_mut(index.wrapping_sub(1))
+                .map(Vec::as_mut_slice),
+        }
+    }
+
+    pub fn uv_value(&self, set: usize, slot: u32) -> Option<Vec2> {
+        self.uv_set(set)?.get(slot as usize).copied()
+    }
+
+    /// Write one coordinate in one set. Returns whether the slot existed.
+    pub fn set_uv_value(&mut self, set: usize, slot: u32, uv: Vec2) -> bool {
+        let Some(values) = self.uv_set_mut(set) else {
+            return false;
+        };
+        let Some(target) = values.get_mut(slot as usize) else {
+            return false;
+        };
+        *target = uv;
+        true
+    }
+
+    pub fn uv_of_set(&self, corner: &Corner, set: usize) -> Vec2 {
+        self.uv_value(set, corner.uv).unwrap_or(Vec2::ZERO)
+    }
+
+    /// Add a UV set cloned from UV0, so a new lightmap set starts from the
+    /// authored layout instead of an empty one. Returns its index.
+    pub fn add_uv_set(&mut self) -> Option<usize> {
+        if self.uvs.is_empty() {
+            return None;
+        }
+        self.extra_uvs.push(self.uvs.clone());
+        Some(self.extra_uvs.len())
+    }
+
+    /// Remove an additional UV set. UV0 cannot be removed.
+    pub fn remove_uv_set(&mut self, set: usize) -> bool {
+        if set == 0 || set > self.extra_uvs.len() {
+            return false;
+        }
+        self.extra_uvs.remove(set - 1);
+        true
+    }
+
+    /// Restore the parallel-array invariant after a topology rebuild: every
+    /// extra set has exactly one coordinate per UV slot.
+    pub fn sync_uv_sets(&mut self) {
+        let len = self.uvs.len();
+        for set in &mut self.extra_uvs {
+            set.resize(len, Vec2::ZERO);
+        }
     }
 
     /// Add a polygon referencing existing points, with UV index 0 (or 0 if
@@ -533,6 +627,21 @@ impl Mesh {
         self.positions
             .extend(other.positions.iter().map(|p| matrix.transform_point3(*p)));
         self.uvs.extend_from_slice(&other.uvs);
+        let sets = self.extra_uvs.len().max(other.extra_uvs.len());
+        self.extra_uvs.resize(sets, Vec::new());
+        for index in 0..sets {
+            let values = other.extra_uvs.get(index);
+            let target = &mut self.extra_uvs[index];
+            for slot in 0..other.uvs.len() {
+                target.push(
+                    values
+                        .and_then(|set| set.get(slot))
+                        .copied()
+                        .unwrap_or(Vec2::ZERO),
+                );
+            }
+            target.resize(self.uvs.len(), Vec2::ZERO);
+        }
         self.polygons.extend(other.polygons.iter().map(|p| {
             Polygon {
                 corners: p
@@ -548,6 +657,12 @@ impl Mesh {
                 .creases
                 .iter()
                 .map(|[a, b]| [a + point_offset, b + point_offset]),
+        );
+        self.crease_weights.extend(
+            other
+                .crease_weights
+                .iter()
+                .map(|([a, b], weight)| ([a + point_offset, b + point_offset], *weight)),
         );
         self.seams.extend(
             other
@@ -846,17 +961,63 @@ impl Mesh {
         }
     }
 
-    /// Whether the edge between two points is marked as a crease.
+    /// Whether the edge between two points has any crease strength.
     pub fn is_crease(&self, a: u32, b: u32) -> bool {
-        edge_marked(&self.creases, a, b)
+        self.crease_weight(a, b) > 0.0
     }
 
-    /// Add or remove a crease. Returns whether the mesh changed.
+    /// Crease strength in `0.0..=1.0`; zero means a smooth edge.
+    pub fn crease_weight(&self, a: u32, b: u32) -> f32 {
+        let key = canonical_edge(a, b);
+        if edge_marked(&self.creases, a, b) {
+            return 1.0;
+        }
+        self.crease_weights
+            .binary_search_by_key(&key, |(edge, _)| *edge)
+            .ok()
+            .map(|index| self.crease_weights[index].1)
+            .unwrap_or(0.0)
+    }
+
+    /// Add or remove a full-strength crease. Returns whether the mesh changed.
     pub fn set_crease(&mut self, a: u32, b: u32, creased: bool) -> bool {
-        set_edge_marked(&mut self.creases, a, b, creased)
+        self.set_crease_weight(a, b, if creased { 1.0 } else { 0.0 })
     }
 
-    /// Toggle one edge's crease state and return the new state.
+    /// Set an edge's crease strength, clamped to `0.0..=1.0`. Zero removes the
+    /// crease; one stores a full crease; values in between are preserved so
+    /// subdivision can blend the smooth and sharp rules. Returns whether the
+    /// mesh changed.
+    pub fn set_crease_weight(&mut self, a: u32, b: u32, weight: f32) -> bool {
+        if a == b || !weight.is_finite() {
+            return false;
+        }
+        let weight = weight.clamp(0.0, 1.0);
+        let current = self.crease_weight(a, b);
+        if (current - weight).abs() <= f32::EPSILON {
+            return false;
+        }
+        let key = canonical_edge(a, b);
+        if weight <= 0.0 {
+            set_edge_marked(&mut self.creases, a, b, false);
+            self.crease_weights.retain(|(edge, _)| *edge != key);
+        } else if weight >= 1.0 {
+            set_edge_marked(&mut self.creases, a, b, true);
+            self.crease_weights.retain(|(edge, _)| *edge != key);
+        } else {
+            set_edge_marked(&mut self.creases, a, b, false);
+            match self
+                .crease_weights
+                .binary_search_by_key(&key, |(edge, _)| *edge)
+            {
+                Ok(index) => self.crease_weights[index].1 = weight,
+                Err(index) => self.crease_weights.insert(index, (key, weight)),
+            }
+        }
+        true
+    }
+
+    /// Toggle one edge between creased and smooth and return the new state.
     pub fn toggle_crease(&mut self, a: u32, b: u32) -> bool {
         let creased = !self.is_crease(a, b);
         self.set_crease(a, b, creased);
@@ -880,10 +1041,16 @@ impl Mesh {
         seam
     }
 
-    /// Remove duplicate, degenerate and out-of-range crease entries and keep
-    /// the list sorted so `is_crease` can use a binary search.
+    /// Remove duplicate, degenerate and out-of-range crease entries, merge
+    /// full-strength fractional entries into `creases`, and keep both lists
+    /// sorted so `crease_weight` can use a binary search.
     pub fn normalize_creases(&mut self) {
         normalize_edge_marks(&mut self.creases, self.positions.len());
+        normalize_crease_weights(
+            &mut self.crease_weights,
+            &mut self.creases,
+            self.positions.len(),
+        );
     }
 
     /// Same repair for seams, so `is_seam` can use a binary search.
@@ -931,6 +1098,7 @@ impl Mesh {
     fn remap_edge_marks(&mut self, remap: &[u32]) {
         remap_marks(&mut self.creases, remap);
         remap_marks(&mut self.seams, remap);
+        remap_crease_weights(&mut self.crease_weights, remap);
         self.normalize_creases();
         self.normalize_seams();
     }
@@ -952,6 +1120,16 @@ impl Mesh {
                 if !self.uvs.is_empty() && c.uv as usize >= self.uvs.len() {
                     errors.push(format!("polygon {pi} references missing uv {}", c.uv));
                 }
+            }
+        }
+        for (set, values) in self.extra_uvs.iter().enumerate() {
+            if values.len() != self.uvs.len() {
+                errors.push(format!(
+                    "UV set {} has {} coordinates for {} slots",
+                    set + 1,
+                    values.len(),
+                    self.uvs.len()
+                ));
             }
         }
         for (i, p) in self.positions.iter().enumerate() {
@@ -989,6 +1167,13 @@ impl Mesh {
         for uv in &self.uvs {
             h.write_vec2(*uv);
         }
+        h.write_u64(self.extra_uvs.len() as u64);
+        for set in &self.extra_uvs {
+            h.write_u64(set.len() as u64);
+            for uv in set {
+                h.write_vec2(*uv);
+            }
+        }
         h.write_u64(self.polygons.len() as u64);
         for poly in &self.polygons {
             h.write_u64(poly.corners.len() as u64);
@@ -1002,6 +1187,12 @@ impl Mesh {
         for [a, b] in &self.creases {
             h.write_u32(*a);
             h.write_u32(*b);
+        }
+        h.write_u64(self.crease_weights.len() as u64);
+        for ([a, b], weight) in self.crease_weights.iter() {
+            h.write_u32(*a);
+            h.write_u32(*b);
+            h.write_u32(weight.to_bits());
         }
         h.write_u64(self.seams.len() as u64);
         for [a, b] in &self.seams {
@@ -1054,6 +1245,55 @@ fn normalize_edge_marks(list: &mut Vec<[u32; 2]>, point_count: usize) {
     }
     list.sort_unstable();
     list.dedup();
+}
+
+fn crease_weights_empty(weights: &[([u32; 2], f32)]) -> bool {
+    weights.is_empty()
+}
+
+fn normalize_crease_weights(
+    weights: &mut Vec<([u32; 2], f32)>,
+    creases: &mut Vec<[u32; 2]>,
+    point_count: usize,
+) {
+    let n = point_count as u32;
+    weights.retain(|([a, b], weight)| {
+        *a != *b && *a < n && *b < n && weight.is_finite() && *weight > 0.0
+    });
+    for (edge, weight) in weights.iter_mut() {
+        *edge = canonical_edge(edge[0], edge[1]);
+        *weight = weight.clamp(0.0, 1.0);
+    }
+    weights.sort_by(|(a, wa), (b, wb)| a.cmp(b).then_with(|| wb.total_cmp(wa)));
+    weights.dedup_by(|(a, _), (b, _)| a == b);
+    let mut promoted = Vec::new();
+    weights.retain(|(edge, weight)| {
+        if *weight >= 1.0 {
+            promoted.push(*edge);
+            false
+        } else {
+            true
+        }
+    });
+    creases.extend(promoted);
+    normalize_edge_marks(creases, point_count);
+    weights.retain(|(edge, _)| creases.binary_search(edge).is_err());
+}
+
+fn remap_crease_weights(weights: &mut Vec<([u32; 2], f32)>, remap: &[u32]) {
+    let mut next = Vec::with_capacity(weights.len());
+    for ([a, b], weight) in weights.iter() {
+        let mapped = remap
+            .get(*a as usize)
+            .zip(remap.get(*b as usize))
+            .map(|(&a, &b)| canonical_edge(a, b));
+        if let Some(edge) = mapped {
+            if edge[0] != edge[1] {
+                next.push((edge, *weight));
+            }
+        }
+    }
+    *weights = next;
 }
 
 fn remap_marks(list: &mut Vec<[u32; 2]>, remap: &[u32]) {
@@ -1318,5 +1558,61 @@ mod tests {
         let b = mesh.bounds();
         assert!((b.min - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5);
         assert!(mesh.validate().is_ok());
+    }
+
+    #[test]
+    fn additional_uv_sets_are_parallel_and_survive_merge_and_serde() {
+        let mut mesh = crate::primitives::box_mesh(1.0, 1.0, 1.0);
+        assert_eq!(mesh.uv_set_count(), 1);
+        assert_eq!(mesh.add_uv_set(), Some(1));
+        assert_eq!(mesh.uv_set_count(), 2);
+        assert_eq!(mesh.uv_set(1).unwrap().len(), mesh.uvs.len());
+        assert!(mesh.set_uv_value(1, 0, Vec2::new(0.25, 0.75)));
+        assert_ne!(mesh.uv_value(0, 0), mesh.uv_value(1, 0));
+        assert!(!mesh.set_uv_value(1, u32::MAX, Vec2::ZERO));
+        assert_eq!(mesh.uv_of_set(&Corner::new(0, 0), 1), Vec2::new(0.25, 0.75));
+
+        let before = mesh.signature();
+        assert!(mesh.set_uv_value(1, 1, Vec2::new(0.5, 0.5)));
+        assert_ne!(
+            before,
+            mesh.signature(),
+            "additional UV sets are part of the signature"
+        );
+
+        let mut other = crate::primitives::box_mesh(1.0, 1.0, 1.0);
+        assert_eq!(other.add_uv_set(), Some(1));
+        let offset = mesh.uvs.len();
+        mesh.merge(&other, Mat4::IDENTITY);
+        assert_eq!(mesh.uv_set_count(), 2);
+        assert_eq!(mesh.extra_uvs[0].len(), mesh.uvs.len());
+        assert_eq!(mesh.extra_uvs[0][offset], other.uvs[0]);
+        assert!(mesh.validate().is_ok());
+
+        let json = serde_json::to_string(&mesh).unwrap();
+        let back: Mesh = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, mesh);
+        let mut legacy = serde_json::to_value(&mesh).unwrap();
+        legacy.as_object_mut().unwrap().remove("extra_uvs");
+        let legacy: Mesh = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.uv_set_count(), 1, "old files load as one UV0 set");
+        assert!(legacy.validate().is_ok());
+
+        assert!(mesh.remove_uv_set(1));
+        assert_eq!(mesh.uv_set_count(), 1);
+        assert!(!mesh.remove_uv_set(0));
+    }
+
+    #[test]
+    fn sync_uv_sets_restores_parallel_lengths() {
+        let mut mesh = quad_grid();
+        mesh.uvs = vec![Vec2::ZERO; 4];
+        mesh.extra_uvs.push(vec![Vec2::new(1.0, 1.0)]);
+        assert!(mesh.validate().is_err(), "a short set is invalid");
+        mesh.sync_uv_sets();
+        assert!(mesh.validate().is_ok());
+        assert_eq!(mesh.extra_uvs[0].len(), 4);
+        assert_eq!(mesh.extra_uvs[0][0], Vec2::new(1.0, 1.0));
+        assert_eq!(mesh.extra_uvs[0][3], Vec2::ZERO);
     }
 }

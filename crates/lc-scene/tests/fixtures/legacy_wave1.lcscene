@@ -1,0 +1,66 @@
+{
+  "format": "leopardcraft-scene",
+  "version": 1,
+  "scene": {
+    "nodes": {
+      "1": {
+        "id": 1,
+        "name": "Legacy Animated Null",
+        "kind": {
+          "type": "null"
+        },
+        "animation": {
+          "tracks": [
+            {
+              "property": "translation_x",
+              "curve": {
+                "keys": [
+                  {
+                    "time": 0.0,
+                    "value": 0.0,
+                    "interpolation": "linear"
+                  },
+                  {
+                    "time": 1.0,
+                    "value": 1.0,
+                    "interpolation": "linear"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "id": 2,
+        "name": "Legacy Subdivided Box",
+        "kind": {
+          "type": "mesh",
+          "geometry": {
+            "type": "primitive",
+            "primitive": {
+              "type": "box",
+              "width": 1.0,
+              "height": 1.0,
+              "depth": 1.0
+            }
+          }
+        },
+        "modifiers": [
+          {
+            "type": "subdivision",
+            "levels": 2
+          }
+        ]
+      }
+    },
+    "roots": [
+      1,
+      2
+    ],
+    "next_id": 3
+  },
+  "settings": {
+    "fps": 24.0
+  }
+}

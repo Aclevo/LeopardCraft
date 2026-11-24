@@ -821,7 +821,7 @@ fn toggle_pinned_uv_is_one_undo_and_needs_a_selected_uv_point() {
     let depth = harness.app.history.depth();
     harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
     assert_eq!(harness.app.history.depth(), depth);
-    assert!(harness.app.status.contains("Select a UV point"));
+    assert!(harness.app.status.contains("Select one or more UV points"));
 
     harness.app.selected_uv = Some(2);
     assert!(harness.app.uv_pin_ready());
@@ -1608,6 +1608,101 @@ fn flip_normal_reverses_the_selected_faces_and_one_undo_restores_them() {
         selected_mesh(&harness.app, cube).polygons[2].corners,
         original,
         "undo restores the exact prior winding"
+    );
+}
+
+#[test]
+fn scalpel_cuts_between_two_edges_of_one_polygon_and_undo_restores_the_mesh() {
+    let (mut harness, _root) =
+        InputHarness::new("input-scalpel", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base.clone());
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    let depth = harness.app.history.depth();
+
+    // Polygon mode is refused: no undo entry, and the status names the modes.
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    assert!(!harness.app.mesh_scalpel_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Scalpel);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+    assert!(
+        harness.app.status.contains("point or edge"),
+        "got {:?}",
+        harness.app.status
+    );
+
+    // Two edges of one polygon are enabled and cut that polygon in two.
+    harness.app.mesh_select_mode = MeshSelectMode::Edges;
+    let edges = base.edges();
+    let polygon = base.polygons[0].clone();
+    let polygon_edge = |edge: &lc_geom::MeshEdge| {
+        let count = polygon.corners.len();
+        (0..count).any(|index| {
+            let a = polygon.corners[index].point;
+            let b = polygon.corners[(index + 1) % count].point;
+            (a == edge.a && b == edge.b) || (a == edge.b && b == edge.a)
+        })
+    };
+    let face_edges: Vec<u32> = (0..edges.len() as u32)
+        .filter(|index| polygon_edge(&edges[*index as usize]))
+        .collect();
+    assert!(
+        face_edges.len() >= 2,
+        "the first face has at least two edges"
+    );
+    let picks = vec![face_edges[0], face_edges[1]];
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, picks.clone());
+    harness.app.mesh_selected = picks;
+    harness.open_menu("menu:Tools");
+    assert!(
+        harness.menu_item("Tools:Scalpel").1,
+        "Scalpel must be enabled for two edges of one polygon"
+    );
+    harness.click_menu_item("Tools:Scalpel");
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let cut = selected_mesh(&harness.app, cube);
+    assert_eq!(cut.polygons.len(), base.polygons.len() + 1);
+    assert!(cut.validate().is_ok());
+    assert_eq!(
+        cut.positions.len(),
+        base.positions.len() + 2,
+        "each edge pick adds its own point"
+    );
+    assert!(
+        cut.polygons
+            .iter()
+            .all(|polygon| polygon.corners.len() >= 3),
+        "the cut must not leave a degenerate face"
+    );
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(selected_mesh(&harness.app, cube), base);
+
+    // Two points that share no polygon are refused without an undo entry.
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    // Body-diagonal corners of a box share no face.
+    let corners = [0u32, 6];
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, corners.to_vec());
+    harness.app.mesh_selected = corners.to_vec();
+    assert!(!harness.app.mesh_scalpel_ready());
+    let before = harness.app.doc.signature();
+    harness.app.perform_mesh_action(MeshAction::Scalpel);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(harness.app.doc.signature(), before);
+    assert!(
+        harness.app.status.contains("one polygon"),
+        "got {:?}",
+        harness.app.status
     );
 }
 
@@ -2521,5 +2616,781 @@ fn point_slide_moves_the_selection_and_one_undo_restores_the_mesh() {
     assert_eq!(
         mesh.polygons, before_polygons,
         "undo restores the exact prior faces"
+    );
+}
+
+#[test]
+fn uv_editing_menu_and_seam_authoring_are_undoable() {
+    let (mut harness, _root) =
+        InputHarness::new("input-uv-seams", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+
+    harness.open_menu("menu:Tools");
+    harness.open_submenu("Tools:UV Editing");
+    for item in [
+        "Tools:UV Editing:Toggle Seam",
+        "Tools:UV Editing:Select All Seams",
+        "Tools:UV Editing:Pack Charts",
+        "Tools:UV Editing:Weld UVs",
+        "Tools:UV Editing:Add UV Set",
+    ] {
+        assert!(harness.menu_item(item).1, "{item} is enabled for a UV mesh");
+    }
+
+    let (first, second) = {
+        let mesh = selected_mesh(&harness.app, cube);
+        let poly = &mesh.polygons[0];
+        (poly.corners[0].uv, poly.corners[1].uv)
+    };
+    harness.app.uv_editor.set = 0;
+    harness.app.uv_editor.selection = [first, second].into_iter().collect();
+    harness.app.selected_uv = Some(first as usize);
+    let depth = harness.app.history.depth();
+    harness.open_menu("menu:Tools");
+    harness.open_submenu("Tools:UV Editing");
+    harness.click_menu_item("Tools:UV Editing:Toggle Seam");
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert_eq!(selected_mesh(&harness.app, cube).seams.len(), 1);
+    harness.undo_via_menu();
+    assert!(selected_mesh(&harness.app, cube).seams.is_empty());
+
+    // Selecting all seams needs no document edit; clearing them does.
+    let mut mesh = selected_mesh(&harness.app, cube);
+    assert!(mesh.set_seam(poly_edge(&mesh, 0, 0), poly_edge(&mesh, 0, 1), true));
+    set_editable_geometry(&mut harness.app, cube, mesh);
+    let depth = harness.app.history.depth();
+    harness.app.uv_editor.selection.clear();
+    harness.app.selected_uv = None;
+    harness.app.select_all_uv_seams();
+    assert_eq!(
+        harness.app.history.depth(),
+        depth,
+        "selection is view state"
+    );
+    assert!(!harness.app.uv_editor.selection.is_empty());
+    harness.app.select_uv_seam_loop();
+    assert!(!harness.app.uv_editor.selection.is_empty());
+    harness.app.clear_uv_seams();
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert!(selected_mesh(&harness.app, cube).seams.is_empty());
+    harness.undo_via_menu();
+    assert_eq!(selected_mesh(&harness.app, cube).seams.len(), 1);
+}
+
+fn poly_edge(mesh: &lc_geom::Mesh, face: usize, corner: usize) -> u32 {
+    mesh.polygons[face].corners[corner].point
+}
+
+#[test]
+fn uv_multi_pin_and_set_edits_are_one_undo_each_and_target_the_active_set() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-uv-multiset",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+
+    harness.app.uv_editor.set = 0;
+    harness.app.uv_editor.selection = [0u32, 1].into_iter().collect();
+    harness.app.selected_uv = Some(0);
+    assert!(harness.app.uv_pin_ready());
+    let depth = harness.app.history.depth();
+    harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(
+        mesh.pinned_uvs,
+        vec![0, 1],
+        "every selected point is pinned"
+    );
+    harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
+    assert!(selected_mesh(&harness.app, cube).pinned_uvs.is_empty());
+    assert_eq!(harness.app.history.depth(), depth + 2);
+
+    let uv0_before = selected_mesh(&harness.app, cube).uv_value(0, 0).unwrap();
+    harness.app.add_uv_set();
+    assert_eq!(selected_mesh(&harness.app, cube).uv_set_count(), 2);
+    assert_eq!(harness.app.uv_editor.set, 1, "the new set becomes active");
+    assert_eq!(
+        selected_mesh(&harness.app, cube).uv_value(0, 0),
+        Some(uv0_before)
+    );
+    let depth = harness.app.history.depth();
+    harness.app.uv_editor.selection = [0u32, 1].into_iter().collect();
+    harness.app.selected_uv = Some(0);
+    harness.app.uv_editor.numeric = V2::new(0.9, 0.1);
+    harness.app.run_uv_slot_op(UvSlotOp::Numeric);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.uv_value(1, 0), Some(V2::new(0.9, 0.1)));
+    assert_eq!(mesh.uv_value(1, 1), Some(V2::new(0.9, 0.1)));
+    assert_eq!(mesh.uv_value(0, 0), Some(uv0_before), "UV0 is untouched");
+    harness.undo_via_menu();
+    assert_ne!(
+        selected_mesh(&harness.app, cube).uv_value(1, 0),
+        Some(V2::new(0.9, 0.1))
+    );
+
+    // Split needs a slot shared by several corners; swap in a two-face mesh
+    // whose corners all use slot 0.
+    let mut shared = lc_geom::Mesh::from_polygons(
+        "shared",
+        vec![
+            glam::Vec3::new(0.0, 0.0, 0.0),
+            glam::Vec3::new(0.0, 0.0, 1.0),
+            glam::Vec3::new(1.0, 0.0, 1.0),
+            glam::Vec3::new(1.0, 0.0, 0.0),
+            glam::Vec3::new(2.0, 0.0, 1.0),
+            glam::Vec3::new(2.0, 0.0, 0.0),
+        ],
+        vec![vec![0, 1, 2, 3], vec![3, 2, 4, 5]],
+    );
+    shared.uvs = vec![V2::ZERO];
+    set_editable_geometry(&mut harness.app, cube, shared);
+    harness.app.uv_editor.set = 0;
+    harness.app.uv_editor.selection = [0u32].into_iter().collect();
+    harness.app.selected_uv = Some(0);
+    let before_slots = selected_mesh(&harness.app, cube).uvs.len();
+    let depth = harness.app.history.depth();
+    harness.app.run_uv_slot_op(UvSlotOp::Split);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert!(selected_mesh(&harness.app, cube).uvs.len() > before_slots);
+    harness.undo_via_menu();
+    assert_eq!(selected_mesh(&harness.app, cube).uvs.len(), before_slots);
+}
+
+#[test]
+fn uv_chart_transforms_and_packing_are_undoable_and_skip_pinned_charts() {
+    let (mut harness, _root) =
+        InputHarness::new("input-uv-charts", Surface::Shell, Vec2::new(1400.0, 1000.0));
+    let cube = named(&harness.app, "Cube");
+    set_editable_geometry(&mut harness.app, cube, lc_geom::box_mesh(1.0, 1.0, 1.0));
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.apply_uv_op(UvOp::Unwrap);
+    let charts = lc_geom::uv_charts(&selected_mesh(&harness.app, cube));
+    assert!(charts.len() > 1, "an unwrapped cube has several charts");
+    harness.app.uv_editor.set = 0;
+    harness.app.uv_editor.selection = charts[0].slots.iter().copied().collect();
+    harness.app.selected_uv = charts[0].slots.first().map(|slot| *slot as usize);
+    harness.app.select_uv_island();
+    let island = harness.app.uv_editor.selection.len();
+    assert_eq!(
+        island,
+        charts[0].slots.len(),
+        "island selects the whole chart"
+    );
+
+    let before_uvs = selected_mesh(&harness.app, cube).uvs.clone();
+    harness.app.uv_editor.chart_move = V2::new(0.05, 0.02);
+    harness.app.uv_editor.chart_rotate = 90.0;
+    harness.app.uv_editor.chart_scale = 0.5;
+    let depth = harness.app.history.depth();
+    harness.app.transform_selected_uv_charts();
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert_ne!(selected_mesh(&harness.app, cube).uvs, before_uvs);
+    harness.undo_via_menu();
+    assert_eq!(selected_mesh(&harness.app, cube).uvs, before_uvs);
+
+    // A pinned chart is left exactly where it was, and the report says so.
+    let pinned_slot = charts[1].slots[0];
+    harness.app.uv_editor.selection = charts[1].slots.iter().copied().collect();
+    harness.app.selected_uv = Some(pinned_slot as usize);
+    harness.app.perform_mesh_action(MeshAction::TogglePinnedUv);
+    let pinned_before = selected_mesh(&harness.app, cube).uv_value(0, pinned_slot);
+    harness.app.uv_editor.selection.clear();
+    harness.app.selected_uv = None;
+    harness.app.uv_editor.pack_padding = 0.02;
+    harness.app.uv_editor.pack_rotate = true;
+    harness.app.uv_editor.pack_align = lc_geom::UvPackAlign::Center;
+    let depth = harness.app.history.depth();
+    harness.app.pack_selected_uv_charts();
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert!(harness.app.status.contains("left in place"));
+    assert_eq!(
+        selected_mesh(&harness.app, cube).uv_value(0, pinned_slot),
+        pinned_before,
+        "packing never moves a pinned chart"
+    );
+    harness.undo_via_menu();
+
+    let signature = harness.app.doc.signature();
+    let depth = harness.app.history.depth();
+    harness.app.uv_editor.checker = false;
+    harness.app.uv_editor.distortion = true;
+    assert_eq!(harness.app.doc.signature(), signature);
+    assert_eq!(
+        harness.app.history.depth(),
+        depth,
+        "overlays are view state"
+    );
+    let stats = lc_geom::uv_distortion_stats(&selected_mesh(&harness.app, cube), 0).unwrap();
+    assert!(stats.mean.is_finite() && stats.max >= 1.0);
+}
+
+#[test]
+fn uv_operations_refuse_without_a_usable_selection() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-uv-refusals",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    lc_geom::box_projection(&mut base, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.uv_editor.selection.clear();
+    harness.app.selected_uv = None;
+    let depth = harness.app.history.depth();
+    harness.app.run_uv_slot_op(UvSlotOp::Weld);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(harness.app.status.contains("Select one or more UV points"));
+    harness.app.toggle_selected_uv_seam();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(harness.app.status.contains("adjacent"));
+
+    harness.app.add_uv_set();
+    assert_eq!(harness.app.uv_editor.set, 1);
+    harness.app.uv_editor.selection = [0u32].into_iter().collect();
+    let depth = harness.app.history.depth();
+    harness.app.apply_uv_op(UvOp::Unwrap);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(harness.app.status.contains("switch the set to UV0"));
+}
+
+#[test]
+fn crease_weight_action_stores_fractional_strength_and_undoes_once() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-crease-weight",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Edges;
+    let edges = selected_mesh(&harness.app, cube).edges();
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0, 1]);
+    harness.app.mesh_selected = vec![0, 1];
+    let depth = harness.app.history.depth();
+
+    harness.app.mesh_crease_weight = 0.5;
+    harness.app.perform_mesh_action(MeshAction::SetCreaseWeight);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert!(mesh.creases.is_empty());
+    assert_eq!(mesh.crease_weights.len(), 2);
+    assert!((mesh.crease_weight(edges[0].a, edges[0].b) - 0.5).abs() < 1e-6);
+    assert!((mesh.crease_weight(edges[1].a, edges[1].b) - 0.5).abs() < 1e-6);
+
+    harness.undo_via_menu();
+    assert!(selected_mesh(&harness.app, cube).crease_weights.is_empty());
+
+    harness.app.mesh_selected = vec![0, 1];
+    harness.app.mesh_components.insert(cube, vec![0, 1]);
+    harness.app.mesh_crease_weight = 1.0;
+    harness.app.perform_mesh_action(MeshAction::SetCreaseWeight);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.creases.len(), 2);
+    assert!(mesh.crease_weights.is_empty());
+}
+
+#[test]
+fn subdivide_selection_is_one_undo_and_keeps_the_unselected_region_watertight() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-subdivide-selection",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let base = lc_geom::plane_mesh(3.0, 3.0, 3, 3);
+    let before = base.clone();
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    harness.app.mesh_subdivide_levels = 1;
+    harness.app.mesh_subdivide_scheme = lc_geom::SubdivisionKind::CatmullClark;
+    let depth = harness.app.history.depth();
+
+    harness.app.perform_mesh_action(MeshAction::Subdivide);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.polygons.len(), 12);
+    assert!(mesh.validate().is_ok());
+    assert!(mesh.polygons.iter().any(|poly| poly.corners.len() == 5));
+    let selected_points: std::collections::HashSet<u32> = before.polygons[0]
+        .corners
+        .iter()
+        .map(|corner| corner.point)
+        .collect();
+    let unselected_points: std::collections::HashSet<u32> = before
+        .polygons
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 0)
+        .flat_map(|(_, poly)| poly.corners.iter().map(|corner| corner.point))
+        .filter(|point| !selected_points.contains(point))
+        .collect();
+    for point in unselected_points {
+        assert_eq!(
+            mesh.positions[point as usize],
+            before.positions[point as usize]
+        );
+    }
+    for edge in mesh.edges() {
+        if edge.faces.len() == 1 {
+            let a = mesh.positions[edge.a as usize];
+            let b = mesh.positions[edge.b as usize];
+            assert!(
+                a.x.abs() > 1.5 - 1e-4
+                    || a.z.abs() > 1.5 - 1e-4
+                    || b.x.abs() > 1.5 - 1e-4
+                    || b.z.abs() > 1.5 - 1e-4,
+                "interior crack at {a:?}-{b:?}"
+            );
+        }
+    }
+
+    harness.undo_via_menu();
+    assert_eq!(selected_mesh(&harness.app, cube), before);
+}
+
+#[test]
+fn creased_edges_are_drawn_outside_edge_mode() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-crease-overlay",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    assert!(base.set_crease(0, 1, true));
+    set_editable_geometry(&mut harness.app, cube, base.clone());
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Points;
+    let evaluated = harness.app.evaluate();
+    let world = evaluated.node(cube).expect("cube is evaluated").world;
+    let a = world.transform_point3(base.positions[0]);
+    let b = world.transform_point3(base.positions[1]);
+    let frame = harness.app.build_frame(&evaluated);
+    let drawn = frame.lines.as_chunks::<2>().0.iter().any(|pair| {
+        let p0 = glam::Vec3::from_array(pair[0].position);
+        let p1 = glam::Vec3::from_array(pair[1].position);
+        let blue = pair[0].color[2] > 0.8 && pair[0].color[0] < 0.5;
+        blue && ((p0.distance(a) < 1e-4 && p1.distance(b) < 1e-4)
+            || (p0.distance(b) < 1e-4 && p1.distance(a) < 1e-4))
+    });
+    assert!(drawn, "the crease was not drawn while in point mode");
+}
+
+#[test]
+fn clone_polygon_selection_is_one_undo_and_empty_clones_everything() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-clone-polygons",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    set_editable_geometry(&mut harness.app, cube, base.clone());
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.mesh_components.clear();
+    harness.app.mesh_components.insert(cube, vec![0]);
+    harness.app.mesh_selected = vec![0];
+    harness.app.mesh_clone = lc_geom::CloneOptions {
+        copies: 2,
+        direction: glam::Vec3::X * 2.0,
+        ..Default::default()
+    };
+    let depth = harness.app.history.depth();
+
+    harness.app.perform_mesh_action(MeshAction::Clone);
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.polygons.len(), base.polygons.len() + 2);
+    assert_eq!(mesh.positions.len(), base.positions.len() + 8);
+    assert!(mesh.validate().is_ok());
+
+    harness.undo_via_menu();
+    assert_eq!(selected_mesh(&harness.app, cube), base);
+
+    harness.app.mesh_selected.clear();
+    harness.app.mesh_components.clear();
+    harness.app.mesh_clone.copies = 1;
+    harness.app.perform_mesh_action(MeshAction::Clone);
+    assert_eq!(
+        selected_mesh(&harness.app, cube).polygons.len(),
+        base.polygons.len() * 2
+    );
+}
+
+#[test]
+fn fill_hole_click_tool_fills_the_clicked_border_and_is_one_undo() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-fill-hole-click",
+        Surface::Shell,
+        Vec2::new(720.0, 540.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let mut base = lc_geom::box_mesh(1.0, 1.0, 1.0);
+    let removed = base.polygons.remove(0);
+    let border: Vec<u32> = removed.corners.iter().map(|c| c.point).collect();
+    set_editable_geometry(&mut harness.app, cube, base);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.fill_hole_tool = true;
+    let depth = harness.app.history.depth();
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+
+    let evaluated = harness.app.evaluate();
+    let node = evaluated.node(cube).expect("cube is evaluated");
+    let mesh = selected_mesh(&harness.app, cube);
+    let corner = mesh.positions[border[0] as usize];
+    let rect = harness.app.last_viewport_rect;
+    let (pixel_w, pixel_h) = harness.viewport_dims();
+    let screen = harness
+        .app
+        .project(node.world.transform_point3(corner), rect, pixel_w, pixel_h)
+        .expect("border point is on screen");
+    harness.click(Surface::Viewport, screen, egui::Modifiers::default());
+
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, cube);
+    assert_eq!(mesh.polygons.len(), 6);
+    assert!(mesh.boundary_loops().is_empty());
+    assert!(
+        harness.app.fill_hole_tool,
+        "the tool stays active for another hole"
+    );
+
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(selected_mesh(&harness.app, cube).polygons.len(), 5);
+    harness.app.redo();
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert_eq!(selected_mesh(&harness.app, cube).polygons.len(), 6);
+}
+
+#[test]
+fn scalpel_click_tool_chains_cuts_and_escape_resets_the_start() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-scalpel-chain",
+        Surface::Shell,
+        Vec2::new(900.0, 700.0),
+    );
+    let mesh_id = named(&harness.app, "Cube");
+    // A single hexagonal face keeps every click unambiguous: no back-face point
+    // or edge shares a screen position, so the test drives real viewport clicks.
+    let hexagon = lc_geom::Mesh::from_polygons(
+        "hexagon",
+        (0..6)
+            .map(|i| {
+                let angle = i as f32 * std::f32::consts::TAU / 6.0;
+                glam::Vec3::new(angle.cos() * 1.5, 0.0, angle.sin() * 1.5)
+            })
+            .collect(),
+        vec![vec![0, 1, 2, 3, 4, 5]],
+    );
+    let project = |harness: &InputHarness, point: glam::Vec3| -> egui::Pos2 {
+        let evaluated = harness.app.evaluate();
+        let node = evaluated.node(mesh_id).expect("the mesh is evaluated");
+        let rect = harness.app.last_viewport_rect;
+        let (w, h) = harness.viewport_dims();
+        harness
+            .app
+            .project(node.world.transform_point3(point), rect, w, h)
+            .expect("the point is on screen")
+    };
+    set_editable_geometry(&mut harness.app, mesh_id, hexagon.clone());
+    select_object_rows(&mut harness, &[mesh_id]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.scalpel_tool = true;
+    let depth = harness.app.history.depth();
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+
+    // The first click only starts the cut.
+    let start = project(&harness, hexagon.positions[0]);
+    harness.click(Surface::Viewport, start, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(0))
+    );
+
+    // A second pick of the same polygon splits it and becomes the next start.
+    let second = project(&harness, hexagon.positions[3]);
+    harness.click(Surface::Viewport, second, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, mesh_id);
+    assert_eq!(mesh.polygons.len(), 2);
+    assert_eq!(mesh.polygons[0].corners.len(), 4);
+    assert_eq!(mesh.polygons[1].corners.len(), 4);
+    assert!(mesh.validate().is_ok());
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(3)),
+        "the cut's end point is the next cut's start"
+    );
+    assert!(
+        harness.app.scalpel_tool,
+        "a completed cut keeps the tool on"
+    );
+
+    // Chaining continues from the previous end point on the polygon holding it,
+    // which leaves the hexagon as three faces.
+    let third = project(&harness, hexagon.positions[5]);
+    harness.click(Surface::Viewport, third, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 2);
+    let mesh = selected_mesh(&harness.app, mesh_id);
+    assert_eq!(mesh.polygons.len(), 3);
+    assert_eq!(mesh.polygons[1].corners.len(), 3);
+    assert!(mesh.validate().is_ok());
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(5))
+    );
+
+    // A pick that shares no polygon with the chained start is refused and keeps
+    // the start, so a cut never chains across a polygon boundary.
+    let across = project(&harness, hexagon.positions[1]);
+    harness.click(Surface::Viewport, across, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 2);
+    assert_eq!(selected_mesh(&harness.app, mesh_id).polygons.len(), 3);
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(5))
+    );
+    assert!(harness.app.status.contains("holds the cut start"));
+
+    // ESC resets the pending cut instead of chaining further.
+    harness.press_key(egui::Key::Escape, egui::Modifiers::default());
+    assert_eq!(harness.app.scalpel_start, None);
+    assert!(harness.app.scalpel_tool, "ESC resets the cut, not the tool");
+    assert_eq!(harness.app.history.depth(), depth + 2);
+
+    // Each completed cut is one undo step.
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    harness.undo_via_menu();
+    assert_eq!(selected_mesh(&harness.app, mesh_id).polygons.len(), 2);
+}
+
+#[test]
+fn scalpel_click_tool_cuts_from_an_edge_to_a_point_and_chains_the_new_point() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-scalpel-mixed-picks",
+        Surface::Shell,
+        Vec2::new(900.0, 700.0),
+    );
+    let mesh_id = named(&harness.app, "Cube");
+    let quad = lc_geom::Mesh::from_polygons(
+        "quad",
+        vec![
+            glam::Vec3::new(0.0, 0.0, 0.0),
+            glam::Vec3::new(2.0, 0.0, 0.0),
+            glam::Vec3::new(2.0, 0.0, 2.0),
+            glam::Vec3::new(0.0, 0.0, 2.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    );
+    let midpoint = (quad.positions[0] + quad.positions[1]) * 0.5;
+    let project = |harness: &InputHarness, point: glam::Vec3| -> egui::Pos2 {
+        let evaluated = harness.app.evaluate();
+        let node = evaluated.node(mesh_id).expect("the mesh is evaluated");
+        let rect = harness.app.last_viewport_rect;
+        let (w, h) = harness.viewport_dims();
+        harness
+            .app
+            .project(node.world.transform_point3(point), rect, w, h)
+            .expect("the point is on screen")
+    };
+    set_editable_geometry(&mut harness.app, mesh_id, quad.clone());
+    select_object_rows(&mut harness, &[mesh_id]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.scalpel_tool = true;
+    let depth = harness.app.history.depth();
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+
+    // A point click starts the cut and an edge click completes it: the
+    // documented mixed point/edge pair inside one polygon.
+    let corner = project(&harness, quad.positions[2]);
+    harness.click(Surface::Viewport, corner, egui::Modifiers::default());
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(2))
+    );
+    let edge = project(&harness, midpoint);
+    harness.click(Surface::Viewport, edge, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, mesh_id);
+    assert_eq!(mesh.polygons.len(), 2);
+    assert_eq!(mesh.positions.len(), 5);
+    assert!(
+        mesh.positions[4].distance(midpoint) < 1e-3,
+        "the edge pick inserts the point nearest the pick ray, at the midpoint"
+    );
+    assert!(mesh.validate().is_ok());
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(4)),
+        "the inserted edge point becomes the next start"
+    );
+
+    harness.press_key(egui::Key::Escape, egui::Modifiers::default());
+    assert_eq!(harness.app.scalpel_start, None);
+}
+
+#[test]
+fn scalpel_pending_start_does_not_go_stale_across_undo_or_a_replaced_mesh() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-scalpel-stale-start",
+        Surface::Shell,
+        Vec2::new(900.0, 700.0),
+    );
+    let mesh_id = named(&harness.app, "Cube");
+    let hexagon = lc_geom::Mesh::from_polygons(
+        "hexagon",
+        (0..6)
+            .map(|i| {
+                let angle = i as f32 * std::f32::consts::TAU / 6.0;
+                glam::Vec3::new(angle.cos() * 1.5, 0.0, angle.sin() * 1.5)
+            })
+            .collect(),
+        vec![vec![0, 1, 2, 3, 4, 5]],
+    );
+    let project = |harness: &InputHarness, point: glam::Vec3| -> egui::Pos2 {
+        let evaluated = harness.app.evaluate();
+        let node = evaluated.node(mesh_id).expect("the mesh is evaluated");
+        let rect = harness.app.last_viewport_rect;
+        let (w, h) = harness.viewport_dims();
+        harness
+            .app
+            .project(node.world.transform_point3(point), rect, w, h)
+            .expect("the point is on screen")
+    };
+    set_editable_geometry(&mut harness.app, mesh_id, hexagon.clone());
+    select_object_rows(&mut harness, &[mesh_id]);
+    harness.app.mesh_edit = true;
+    harness.app.mesh_select_mode = MeshSelectMode::Polygons;
+    harness.app.scalpel_tool = true;
+    let depth = harness.app.history.depth();
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+
+    let start = project(&harness, hexagon.positions[0]);
+    harness.click(Surface::Viewport, start, egui::Modifiers::default());
+    let second = project(&harness, hexagon.positions[3]);
+    harness.click(Surface::Viewport, second, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert_eq!(selected_mesh(&harness.app, mesh_id).polygons.len(), 2);
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(3))
+    );
+
+    // Undo restores the pre-cut topology, so the chained start must go with it
+    // instead of pointing at a point the restored mesh does not have.
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    harness.undo_via_menu();
+    assert_eq!(harness.app.history.depth(), depth);
+    assert_eq!(selected_mesh(&harness.app, mesh_id).polygons.len(), 1);
+    assert_eq!(harness.app.scalpel_start, None);
+    assert!(
+        harness.app.scalpel_tool,
+        "undo does not switch the tool off"
+    );
+
+    // Redo re-applies the cut but leaves the cut UI reset.
+    harness.app.redo();
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert_eq!(selected_mesh(&harness.app, mesh_id).polygons.len(), 2);
+    assert_eq!(harness.app.scalpel_start, None);
+
+    // A start that a non-undo edit invalidated is dropped on the next click,
+    // which then begins a fresh cut instead of refusing against the old start.
+    harness.app.scalpel_start = Some(lc_geom::ScalpelPick::Point(99));
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+    let start = project(&harness, hexagon.positions[0]);
+    harness.click(Surface::Viewport, start, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(0))
+    );
+    assert!(harness.app.status.contains("previous start"));
+
+    let chain = project(&harness, hexagon.positions[2]);
+    harness.click(Surface::Viewport, chain, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 2);
+    let mesh = selected_mesh(&harness.app, mesh_id);
+    assert_eq!(mesh.polygons.len(), 3);
+    assert!(mesh.validate().is_ok());
+    assert_eq!(
+        harness.app.scalpel_start,
+        Some(lc_geom::ScalpelPick::Point(2))
+    );
+}
+
+#[test]
+fn fill_hole_tool_refuses_a_hole_that_encloses_an_island() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-fill-hole-island",
+        Surface::Shell,
+        Vec2::new(1400.0, 1000.0),
+    );
+    let cube = named(&harness.app, "Cube");
+    let island = lc_geom::Mesh::from_polygons(
+        "hole with island",
+        vec![
+            glam::Vec3::new(-2.0, 0.0, -2.0),
+            glam::Vec3::new(2.0, 0.0, -2.0),
+            glam::Vec3::new(2.0, 0.0, 2.0),
+            glam::Vec3::new(-2.0, 0.0, 2.0),
+            glam::Vec3::new(-1.0, 0.0, -1.0),
+            glam::Vec3::new(1.0, 0.0, -1.0),
+            glam::Vec3::new(1.0, 0.0, 1.0),
+            glam::Vec3::new(-1.0, 0.0, 1.0),
+            glam::Vec3::new(0.0, 0.0, 0.0),
+            glam::Vec3::new(0.3, 0.0, 0.0),
+            glam::Vec3::new(0.0, 0.3, 0.0),
+        ],
+        vec![
+            vec![0, 1, 5, 4],
+            vec![1, 2, 6, 5],
+            vec![2, 3, 7, 6],
+            vec![3, 0, 4, 7],
+            vec![8, 9, 10],
+        ],
+    );
+    set_editable_geometry(&mut harness.app, cube, island);
+    select_object_rows(&mut harness, &[cube]);
+    harness.app.mesh_edit = true;
+    let depth = harness.app.history.depth();
+    harness.app.fill_hole_at(4);
+    assert_eq!(harness.app.history.depth(), depth);
+    assert!(
+        harness.app.status.contains("island"),
+        "got {:?}",
+        harness.app.status
     );
 }
