@@ -12,13 +12,25 @@ second source of scene truth.
 
 ## Entry points
 
-- `app.rs` — `LeopardApp`, the single UI state hub and action dispatch.
+- `app.rs` — `LeopardApp`, the single UI state hub, shared types and core
+  state/evaluation helpers.
+- `scene_edit.rs` — object creation, selection, grouping, reparenting and
+  deletion workflows.
+- `documents.rs` — new/open/import/save workflows, file dialogs, pending
+  actions and autosave.
+- `render_jobs.rs` — background render queue, polling, start and save.
+- `deform.rs` — modifier stack, skin binding, weight painting and morphs.
+- `mesh_edit.rs` — editable-mesh, component selection, UV and mesh tools.
+- `animation.rs` — timeline targets, F-curve keys, clipboard and retiming.
+- `dialogs.rs` — menu-driven file, guard, recovery and about dialogs.
+- `viewport_ui.rs` — viewport frame, navigation, picking, gizmo and overlays.
 - `panels.rs`, `panels_more.rs` — Properties, Tags, Materials, mesh editing,
   skinning, splines, render settings.
 - `shell.rs` — menu bar, toolbar, keyboard shortcuts.
 - `viewport.rs` — wgpu offscreen viewport and overlays.
 - `selection.rs` — shared selection predicates.
-- `selection_tests.rs` — UI behavior and undo tests.
+- `selection_tests.rs` plus `selection_tests/` — shared UI test harness and the
+  scene-edit, viewport, mesh, deform, animation and document workflow tests.
 - `lifecycle.rs`, `recovery.rs`, `lifecycle_harness.rs` — open/save/close,
   autosave and recovery.
 - `theme.rs`, `icons.rs` — visual chrome.
