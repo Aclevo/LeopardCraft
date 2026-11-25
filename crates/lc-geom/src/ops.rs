@@ -705,6 +705,120 @@ pub fn ring_cut(mesh: &Mesh, axis: usize, offset: f32) -> Mesh {
     out
 }
 
+/// Where one Insert Point click lands on a polygon.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InsertPointPick {
+    /// A local-space position inside the polygon.
+    Inside(Vec3),
+    /// A position on one of the polygon's edges, `t` from 0 at `a` to 1 at `b`.
+    Edge { a: u32, b: u32, t: f32 },
+}
+
+/// Insert one point into a polygon, the way Cheetah3D's Insert Point tool does
+/// (source 49).
+///
+/// An `Inside` pick adds a point at the given local-space position and replaces
+/// the polygon with one triangle per corner, all sharing the new point, so the
+/// surface is unchanged. Every original corner keeps its UV slot, the face keeps
+/// its material slot, and the new point's UV is the average of the face's corner
+/// UVs: the manual does not document a UV rule, so that is the clean-room choice.
+/// A position whose fan would contain a zero-area triangle (a corner, or a
+/// position off the face's plane) is refused instead of producing degenerate
+/// polygons.
+///
+/// An `Edge` pick inserts the point on that edge at `t`, splits the edge in
+/// every polygon that uses it so the mesh stays watertight, and moves a seam or
+/// crease weight onto both halves, exactly like a Scalpel edge pick. `t` must be
+/// strictly between 0 and 1 because a corner already exists there.
+///
+/// Returns the new point's index in the rebuilt mesh.
+pub fn insert_point(mesh: &Mesh, face: u32, pick: InsertPointPick) -> Result<(Mesh, u32), String> {
+    let Some(poly) = mesh.polygons.get(face as usize) else {
+        return Err(format!("face {face} does not exist"));
+    };
+    let count = poly.corners.len();
+    if count < 3 {
+        return Err(format!("face {face} has fewer than three corners"));
+    }
+    let mut out = mesh.clone();
+    match pick {
+        InsertPointPick::Inside(position) => {
+            if !position.is_finite() {
+                return Err("the inserted point must be a finite position".into());
+            }
+            let uv = poly
+                .corners
+                .iter()
+                .map(|corner| out.uv_of(corner))
+                .sum::<Vec2>()
+                / count as f32;
+            let point = out.add_point(position);
+            let slot = out.add_uv(uv);
+            let mut triangles = Vec::with_capacity(count);
+            for index in 0..count {
+                let a = poly.corners[index];
+                let b = poly.corners[(index + 1) % count];
+                let (Some(pa), Some(pb)) = (
+                    mesh.positions.get(a.point as usize),
+                    mesh.positions.get(b.point as usize),
+                ) else {
+                    return Err(format!("face {face} references a missing point"));
+                };
+                if (pa - position).cross(pb - position).length() <= 1e-9 {
+                    return Err("the inserted point would produce a degenerate triangle".into());
+                }
+                triangles.push(Polygon {
+                    corners: vec![a, b, Corner::new(point, slot)],
+                    material_slot: poly.material_slot,
+                });
+            }
+            out.polygons
+                .splice(face as usize..=face as usize, triangles);
+            Ok((out, point))
+        }
+        InsertPointPick::Edge { a, b, t } => {
+            if a == b {
+                return Err("an inserted edge point needs two different points".into());
+            }
+            if !t.is_finite() || t <= 0.0 || t >= 1.0 {
+                return Err("an inserted edge point must sit between the edge ends".into());
+            }
+            let found = (0..count).find_map(|index| {
+                let start = poly.corners[index].point;
+                let end = poly.corners[(index + 1) % count].point;
+                if start == a && end == b {
+                    Some((index, t))
+                } else if start == b && end == a {
+                    Some((index, 1.0 - t))
+                } else {
+                    None
+                }
+            });
+            let Some((index, t)) = found else {
+                return Err(format!("points {a} and {b} are not an edge of face {face}"));
+            };
+            let start = poly.corners[index];
+            let end = poly.corners[(index + 1) % count];
+            let (Some(start_position), Some(end_position)) = (
+                out.positions.get(start.point as usize).copied(),
+                out.positions.get(end.point as usize).copied(),
+            ) else {
+                return Err(format!("face {face} references a missing point"));
+            };
+            let position = start_position.lerp(end_position, t);
+            let uv = out.uv_of(&start).lerp(out.uv_of(&end), t);
+            let point = out.add_point(position);
+            let slot = out.add_uv(uv);
+            out.polygons[face as usize]
+                .corners
+                .insert(index + 1, Corner::new(point, slot));
+            scalpel_split_shared_edge(&mut out, start.point, end.point, point, t);
+            scalpel_split_marks(&mut out, start.point, end.point, point);
+            Ok((out, point))
+        }
+    }
+}
+
 /// Where one end of a Scalpel cut lands on the polygon being cut.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalpelPick {
@@ -4441,6 +4555,104 @@ mod tests {
         assert!(inset.validate().is_ok());
         let bevel = bevel_faces(&cube, &[0], 0.1, 0.05);
         assert!(bevel.validate().is_ok());
+    }
+
+    #[test]
+    fn insert_point_inside_a_polygon_splits_it_into_triangles() {
+        let mut quad = Mesh::from_polygons(
+            "quad",
+            vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        );
+        quad.polygons[0].material_slot = 2;
+        let (out, point) =
+            insert_point(&quad, 0, InsertPointPick::Inside(Vec3::new(0.25, 0.0, 0.0)))
+                .expect("a point inside the quad splits it");
+        assert_eq!(out.polygons.len(), 4);
+        assert_eq!(out.positions.len(), 5);
+        assert_eq!(out.positions[point as usize], Vec3::new(0.25, 0.0, 0.0));
+        for poly in &out.polygons {
+            assert_eq!(poly.corners.len(), 3);
+            assert_eq!(poly.material_slot, 2);
+            assert!(
+                poly.corners.iter().any(|corner| corner.point == point),
+                "every triangle shares the inserted point"
+            );
+        }
+        assert!(out.validate().is_ok());
+        let loops = out.boundary_loops();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].len(), 4, "the quad's silhouette is unchanged");
+    }
+
+    #[test]
+    fn insert_point_on_an_edge_splits_it_in_both_polygons_and_keeps_marks() {
+        let mut pair = Mesh::from_polygons(
+            "pair",
+            vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2, 3], vec![1, 4, 5, 2]],
+        );
+        pair.set_seam(1, 2, true);
+        pair.set_crease_weight(1, 2, 0.5);
+        let (out, point) = insert_point(&pair, 0, InsertPointPick::Edge { a: 1, b: 2, t: 0.5 })
+            .expect("a mid-edge point splits the shared edge");
+        assert_eq!(out.positions.len(), 7);
+        assert_eq!(out.positions[point as usize], Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(out.polygons[0].corners.len(), 5);
+        assert_eq!(out.polygons[1].corners.len(), 5);
+        assert!(
+            out.polygons
+                .iter()
+                .all(|poly| poly.corners.iter().any(|corner| corner.point == point)),
+            "both polygons share the new point, so the edge stays watertight"
+        );
+        assert!(out.is_seam(1, point) && out.is_seam(point, 2));
+        assert!(!out.is_seam(1, 2));
+        assert!((out.crease_weight(1, point) - 0.5).abs() < 1e-6);
+        assert!((out.crease_weight(point, 2) - 0.5).abs() < 1e-6);
+        assert!(out.validate().is_ok());
+    }
+
+    #[test]
+    fn insert_point_refuses_degenerate_positions_and_edges() {
+        let quad = Mesh::from_polygons(
+            "quad",
+            vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+            ],
+            vec![vec![0, 1, 2, 3]],
+        );
+        assert!(insert_point(
+            &quad,
+            0,
+            InsertPointPick::Inside(Vec3::new(-1.0, -1.0, 0.0))
+        )
+        .is_err());
+        assert!(insert_point(&quad, 0, InsertPointPick::Inside(Vec3::splat(f32::NAN))).is_err());
+        assert!(insert_point(&quad, 7, InsertPointPick::Inside(Vec3::ZERO)).is_err());
+        assert!(insert_point(&quad, 0, InsertPointPick::Edge { a: 0, b: 1, t: 0.0 }).is_err());
+        assert!(insert_point(&quad, 0, InsertPointPick::Edge { a: 0, b: 1, t: 1.0 }).is_err());
+        assert!(insert_point(&quad, 0, InsertPointPick::Edge { a: 0, b: 2, t: 0.5 }).is_err());
+        assert_eq!(
+            quad.positions.len(),
+            4,
+            "a refused pick leaves the mesh alone"
+        );
     }
 
     #[test]

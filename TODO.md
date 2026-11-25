@@ -1479,6 +1479,39 @@ is a self-contained geometry operation with its own undo step.
       a box's missing face from a screen click, one undo, and redo-safe depth.
       The selection-driven **Fill Hole** command still works in point, edge and
       polygon mode.
+- [x] Viewport-click invocation for Ring Cut, Weld, Bridge and Insert Point,
+      the four pick-driven tools the manual documents (sources 46-49). Mesh
+      Editing's **Click tool** selector and the `Tools -> <name> Tool` entries
+      switch on one exclusive viewport tool; each click is one undo step and the
+      tool stays active for the next pick. Ring Cut's click uses the axis the
+      picked edge runs along and cuts the plane through its midpoint by reusing
+      `ring_cut` and the existing `mesh_ring_cut_ready` predicate; the manual's
+      drag-to-slide and Shift normal move are not reproduced, so that remains a
+      parity gap. Weld takes two point clicks and gains the documented **To**
+      property (Midpoint or First Point) through the new
+      `Mesh::merge_points_at`, which the selection-driven Weld command uses too.
+      Bridge takes one point on each of two open borders, resolves each point's
+      `boundary_loops` ring, selects both loops and runs the shipped Bridge
+      command. Insert Point is a new `lc_geom::insert_point`: a click inside a
+      polygon replaces it with one triangle per corner around the new point
+      (whose UV is the average of the face's corner UVs, a clean-room choice), a
+      click on an edge splits that edge in every polygon and carries seams and
+      creases onto both halves, and empty-space clicks are refused with a status
+      because the manual's camera-plane point has no representation. ESC drops a
+      pending first click; switching tools, undo, redo and a replaced document
+      clear it; the Scalpel and Fill Hole click tools are mutually exclusive
+      with these four.
+      Tests: `insert_point_inside_a_polygon_splits_it_into_triangles`,
+      `insert_point_on_an_edge_splits_it_in_both_polygons_and_keeps_marks`,
+      `insert_point_refuses_degenerate_positions_and_edges`,
+      `merge_points_at_puts_the_survivor_where_the_caller_asks`,
+      `ring_cut_click_tool_cuts_the_plane_through_the_clicked_edge`,
+      `weld_click_tool_merges_two_points_at_the_midpoint`,
+      `weld_click_tool_can_keep_the_first_point`,
+      `bridge_click_tool_bridges_two_clicked_borders`,
+      `insert_point_click_tool_splits_a_polygon_into_triangles`,
+      `insert_point_click_tool_splits_a_clicked_edge` and
+      `pick_tool_menu_entries_are_exclusive_with_the_other_click_tools`.
 
 ## 7. MCP automation
 

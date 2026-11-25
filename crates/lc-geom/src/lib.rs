@@ -15,16 +15,17 @@ pub mod uv;
 
 pub use bvh::{Bvh, BvhHit, BvhObject};
 pub use csg::{boolean, intersect, subtract, union, BooleanOp};
-pub use mesh::{Corner, Mesh, MeshEdge, Polygon, RenderTriangle, RenderVertex};
+pub use mesh::{Corner, Mesh, MeshEdge, Polygon, RenderTriangle, RenderVertex, WeldTarget};
 pub use ops::{
     array_mesh, bend, bevel_faces, bridge_loops, bulge, can_disconnect, can_optimize,
     can_slide_points, clone_faces, clone_points, collapse_points, cover_faces, coverable_holes,
     create_polygon_faces, disconnect_faces, displace, extract_faces, extrude_faces,
     extrude_profile, faceable_loops, fill_holes, flip_faces, formula, formula_expression_is_valid,
-    inset_faces, laplacian_smooth, lathe, magnet, open_holes, optimize_points, reduce_polygons,
-    ring_cut, scalpel_face, scalpel_face_ends, shear, shell_faces, shell_region, slide_points,
-    spherify, sweep, sweep_spline, symmetry_mesh, taper, transform_points, triangulate_faces,
-    triangulate_faces_with, twist, wrap_mesh, CloneOptions, ScalpelPick, TriangulateMode,
+    insert_point, inset_faces, laplacian_smooth, lathe, magnet, open_holes, optimize_points,
+    reduce_polygons, ring_cut, scalpel_face, scalpel_face_ends, shear, shell_faces, shell_region,
+    slide_points, spherify, sweep, sweep_spline, symmetry_mesh, taper, transform_points,
+    triangulate_faces, triangulate_faces_with, twist, wrap_mesh, CloneOptions, InsertPointPick,
+    ScalpelPick, TriangulateMode,
 };
 pub use primitives::{
     box_mesh, capsule_mesh, capsule_profile, cone_mesh, cylinder_mesh, disc_mesh, disc_profile,

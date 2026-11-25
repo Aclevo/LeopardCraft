@@ -33,6 +33,12 @@ impl LeopardApp {
         {
             self.scalpel_cancel();
         }
+        if self.pick_tool.is_some()
+            && self.pick_start.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::default(), egui::Key::Escape))
+        {
+            self.pick_tool_cancel();
+        }
         let typing = ctx.text_edit_focused();
         let native_copy = ctx.input(|i| i.events.contains(&egui::Event::Copy));
         let native_paste = ctx.input(|i| {
@@ -696,6 +702,116 @@ impl LeopardApp {
         if response.clicked_by(egui::PointerButton::Primary) {
             if let Some(pointer) = pointer {
                 if self.mesh_edit {
+                    if let Some(tool) = self.pick_tool {
+                        let view = PickView {
+                            rect,
+                            pixel_w,
+                            pixel_h,
+                        };
+                        if let Some((id, mesh)) = self.selected_editable_mesh() {
+                            if let Some(node) = evaluated.node(id) {
+                                match tool {
+                                    MeshPickTool::RingCut => {
+                                        if let Some((a, b, _)) = self
+                                            .pick_mesh_edge_under(&mesh, node.world, view, pointer)
+                                        {
+                                            self.ring_cut_click_at(a, b);
+                                        } else {
+                                            self.status =
+                                                "Ring Cut: click an edge to cut the plane through it"
+                                                    .into();
+                                        }
+                                    }
+                                    MeshPickTool::Weld => {
+                                        if let Some(point) = self
+                                            .pick_mesh_point_under(&mesh, node.world, view, pointer)
+                                        {
+                                            self.weld_click_at(point);
+                                        } else {
+                                            self.status =
+                                                "Weld: click a point, then a second point to merge"
+                                                    .into();
+                                        }
+                                    }
+                                    MeshPickTool::Bridge => {
+                                        if let Some(point) = self
+                                            .pick_mesh_point_under(&mesh, node.world, view, pointer)
+                                        {
+                                            self.bridge_click_at(point);
+                                        } else {
+                                            self.status =
+                                                "Bridge: click a point on an open border".into();
+                                        }
+                                    }
+                                    MeshPickTool::InsertPoint => {
+                                        let face = self.pick_mesh_face(
+                                            &mesh, node.world, rect, pixel_w, pixel_h, pointer,
+                                        );
+                                        let pick = match face {
+                                            Some(face) => self
+                                                .pick_face_edge_under(
+                                                    &mesh, face, node.world, view, pointer,
+                                                )
+                                                .map(|(a, b, t)| {
+                                                    (
+                                                        face,
+                                                        lc_geom::InsertPointPick::Edge { a, b, t },
+                                                    )
+                                                })
+                                                .or_else(|| {
+                                                    self.pick_face_surface(
+                                                        &mesh, face, node.world, view, pointer,
+                                                    )
+                                                    .map(|position| {
+                                                        (
+                                                            face,
+                                                            lc_geom::InsertPointPick::Inside(
+                                                                position,
+                                                            ),
+                                                        )
+                                                    })
+                                                }),
+                                            None => self
+                                                .pick_mesh_edge_under(
+                                                    &mesh, node.world, view, pointer,
+                                                )
+                                                .and_then(|(a, b, t)| {
+                                                    mesh.edges()
+                                                        .iter()
+                                                        .find(|edge| {
+                                                            edge.a == a.min(b) && edge.b == a.max(b)
+                                                        })
+                                                        .and_then(|edge| {
+                                                            edge.faces.first().copied()
+                                                        })
+                                                        .map(|face| {
+                                                            (
+                                                                face,
+                                                                lc_geom::InsertPointPick::Edge {
+                                                                    a,
+                                                                    b,
+                                                                    t,
+                                                                },
+                                                            )
+                                                        })
+                                                }),
+                                        };
+                                        match pick {
+                                            Some((face, pick)) => {
+                                                self.insert_point_click_at(face, pick)
+                                            }
+                                            None => {
+                                                self.status = "Insert Point: click a polygon or one of its edges".into();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            self.status = "Select an editable mesh first".into();
+                        }
+                        return;
+                    }
                     if self.scalpel_tool {
                         if let Some((id, mesh)) = self.selected_editable_mesh() {
                             if let Some(node) = evaluated.node(id) {

@@ -32,6 +32,26 @@ impl Corner {
     }
 }
 
+/// Where a Weld puts the merged point, matching Cheetah3D's `To` property
+/// (source 47).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeldTarget {
+    /// The midpoint of the merged points.
+    #[default]
+    Midpoint,
+    /// The first point of the merge, i.e. the first entry of the given list.
+    FirstPoint,
+}
+
+impl WeldTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Midpoint => "Midpoint",
+            Self::FirstPoint => "First Point",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Polygon {
     pub corners: Vec<Corner>,
@@ -783,13 +803,7 @@ impl Mesh {
     /// `None` when fewer than two points were selected or no face survived to
     /// use the merged point.
     pub fn merge_points(&mut self, points: &[u32]) -> Option<u32> {
-        let mut selected: Vec<u32> = points
-            .iter()
-            .copied()
-            .filter(|p| (*p as usize) < self.positions.len())
-            .collect();
-        selected.sort_unstable();
-        selected.dedup();
+        let selected = self.selected_point_indices(points);
         if selected.len() < 2 {
             return None;
         }
@@ -798,8 +812,28 @@ impl Mesh {
             .map(|p| self.positions[*p as usize])
             .sum::<Vec3>()
             / selected.len() as f32;
+        self.merge_points_at(&selected, centroid)
+    }
+
+    /// Merge the given points into one at `position`.
+    ///
+    /// This is [`Self::merge_points`] with the survivor's position chosen by the
+    /// caller instead of the centroid, which is what Cheetah3D's Weld `To`
+    /// property needs (source 47): the midpoint or the first point. Every other
+    /// rule is the same - the lowest index survives, faces are rebuilt around it,
+    /// creases and seams follow the surviving indices, and unused points are
+    /// compacted away. Returns the survivor's rebuilt index, or `None` when the
+    /// position is not finite or fewer than two points were given.
+    pub fn merge_points_at(&mut self, points: &[u32], position: Vec3) -> Option<u32> {
+        if !position.is_finite() {
+            return None;
+        }
+        let selected = self.selected_point_indices(points);
+        if selected.len() < 2 {
+            return None;
+        }
         let target = selected[0];
-        self.positions[target as usize] = centroid;
+        self.positions[target as usize] = position;
         let merged: HashSet<u32> = selected.into_iter().collect();
         for poly in &mut self.polygons {
             for corner in &mut poly.corners {
@@ -813,6 +847,19 @@ impl Mesh {
             .get(target as usize)
             .copied()
             .filter(|index| *index != u32::MAX)
+    }
+
+    /// In-range, sorted, unique point indices: the shared validation of the
+    /// merge operations.
+    fn selected_point_indices(&self, points: &[u32]) -> Vec<u32> {
+        let mut selected: Vec<u32> = points
+            .iter()
+            .copied()
+            .filter(|p| (*p as usize) < self.positions.len())
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        selected
     }
 
     /// Weld the selected points that sit within `epsilon` of each other.
@@ -1404,6 +1451,34 @@ mod tests {
             ],
             vec![vec![0, 3, 2, 1], vec![1, 2, 5, 4]],
         )
+    }
+
+    #[test]
+    fn merge_points_at_puts_the_survivor_where_the_caller_asks() {
+        let mut mesh = quad_grid();
+        let survivor = mesh
+            .merge_points_at(&[0, 1], Vec3::new(0.25, 0.0, 0.25))
+            .expect("two points merge");
+        assert_eq!(
+            mesh.positions[survivor as usize],
+            Vec3::new(0.25, 0.0, 0.25)
+        );
+        assert!(mesh.validate().is_ok());
+
+        // `To: First Point` keeps the first listed point's position instead of
+        // the centroid, while the lowest index still survives.
+        let mut mesh = quad_grid();
+        let first = mesh.positions[1];
+        let survivor = mesh
+            .merge_points_at(&[1, 4], first)
+            .expect("two points merge");
+        assert_eq!(mesh.positions[survivor as usize], first);
+        assert_eq!(mesh.positions.len(), 5);
+        assert!(mesh.validate().is_ok());
+        assert!(mesh.merge_points_at(&[2, 2], Vec3::ZERO).is_none());
+        assert!(mesh
+            .merge_points_at(&[2, 3], Vec3::splat(f32::INFINITY))
+            .is_none());
     }
 
     #[test]

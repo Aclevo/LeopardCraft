@@ -15,12 +15,13 @@ The remaining `TODO.md` backlog is planned as missions G30–G39 in
 [`docs/agents/goals/ROADMAP.md`](docs/agents/goals/ROADMAP.md). G30–G35 are
 complete, as is [`G38.md`](docs/agents/goals/G38.md); G36 and G39 are complete
 too, including the Stam-Loop hybrid and verified live-editor attachment (the MCP
-server attaches to a running editor's document and selection). G37 remains
-partially complete with its remaining items recorded in `TODO.md`, and the
-interactive Claude Code session has been approved by the user and lists the
-LeopardCraft tools. A
-new
-session should read the roadmap before dispatching, and update the mission
+server attaches to a running editor's document and selection). G37 is complete
+too: Ring Cut, Weld, Bridge and Insert Point now take viewport clicks through
+one exclusive pick tool, with Ring Cut's drag-to-slide and Insert Point's
+empty-space placement recorded as parity gaps. The interactive Claude Code
+session has been approved by the user and lists the LeopardCraft tools. This
+index has no next dispatch, so a new session starts from the open rows in
+`docs/cheetah3d-parity.md` or a new `TODO.md` entry, and updates the mission
 status when it lands.
 
 ## Ground rules

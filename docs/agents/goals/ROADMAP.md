@@ -4,8 +4,10 @@ Created 2026-11-24 from an audit of every unchecked box in `TODO.md` plus the
 section-prose gaps that are not boxes. Each `G` file is a startable batch in the
 same format as `G29.md`: lane packets, allowed paths, acceptance checks and a
 definition of done. Missions are ordered by dependency and may run only when
-their prerequisites have landed. `G30`, `G31`, `G32`, `G33` and `G34` are
-complete; `G35` is the next dispatch.
+their prerequisites have landed. `G30`–`G39` are complete, so this index no longer
+has a next dispatch; new work starts from the open rows in
+[`../../cheetah3d-parity.md`](../../cheetah3d-parity.md) or a new `TODO.md`
+entry.
 
 ## Mission index
 
@@ -22,9 +24,10 @@ complete; `G35` is the next dispatch.
 | G38 | Rigging constraints | document, editor | §2b prose: Spline IK, constraint tags, stiffness | G32 |
 | G39 | MCP automation expansion | automation, editor | all three §7 boxes | G38 |
 
-**Status:** G30–G35 and G38 are complete and verified; G36, G37 and G39 are
-partially complete with their remaining items recorded in `TODO.md`. Every other
-mission in this index is planned and blocked only by its listed dependencies.
+**Status:** G30–G39 are complete and verified. G37's last item — viewport-click
+invocation for Ring Cut, Weld, Bridge and Insert Point — landed on 2026-11-25,
+with Ring Cut's drag-to-slide and Insert Point's empty-space placement recorded
+as remaining parity gaps in `TODO.md` and `docs/cheetah3d-parity.md`.
 
 ## Coverage check
 

@@ -60,6 +60,8 @@ mod mesh_edit;
 mod panels;
 #[path = "panels_more.rs"]
 mod panels_more;
+#[path = "pick_tools.rs"]
+mod pick_tools;
 #[path = "recovery.rs"]
 mod recovery;
 #[path = "render_jobs.rs"]
@@ -362,6 +364,44 @@ enum MeshAction {
     Cover,
     CreatePolygon,
     AssignMaterial,
+}
+
+/// Viewport geometry a click tool needs: the drawn rect and its pixel size.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PickView {
+    pub(super) rect: Rect,
+    pub(super) pixel_w: u32,
+    pub(super) pixel_h: u32,
+}
+
+/// The pick-driven polygon tools. Each one takes a viewport click instead of
+/// acting on the component selection (sources 46-49).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MeshPickTool {
+    RingCut,
+    Weld,
+    Bridge,
+    InsertPoint,
+}
+
+impl MeshPickTool {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::RingCut => "Ring Cut",
+            Self::Weld => "Weld",
+            Self::Bridge => "Bridge",
+            Self::InsertPoint => "Insert Point",
+        }
+    }
+
+    pub(super) fn hint(self) -> &'static str {
+        match self {
+            Self::RingCut => "click an edge to cut the plane through it",
+            Self::Weld => "click a point, then a second point to merge",
+            Self::Bridge => "click a point on each of two open borders",
+            Self::InsertPoint => "click inside a polygon or on one of its edges",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -912,6 +952,12 @@ pub struct LeopardApp {
     /// becomes the next start until ESC resets it.
     scalpel_tool: bool,
     scalpel_start: Option<lc_geom::ScalpelPick>,
+    /// Pick-driven polygon tool taking viewport clicks (sources 46-49).
+    pick_tool: Option<MeshPickTool>,
+    /// First clicked point of a two-click pick tool (Weld, Bridge).
+    pick_start: Option<u32>,
+    /// Cheetah3D's Weld `To` property: midpoint or first point.
+    mesh_weld_to: lc_geom::WeldTarget,
     mesh_subdivide_levels: u32,
     mesh_subdivide_scheme: lc_geom::SubdivisionKind,
     mesh_selected: Vec<u32>,
@@ -1053,6 +1099,9 @@ impl LeopardApp {
             fill_hole_tool: false,
             scalpel_tool: false,
             scalpel_start: None,
+            pick_tool: None,
+            pick_start: None,
+            mesh_weld_to: lc_geom::WeldTarget::default(),
             mesh_subdivide_levels: 1,
             mesh_subdivide_scheme: lc_geom::SubdivisionKind::default(),
             mesh_selected: Vec::new(),
@@ -1622,8 +1671,9 @@ impl LeopardApp {
         self.gizmo_drag = None;
         // A pending Scalpel cut names points of the current topology, so undo,
         // redo and a replaced document must drop it rather than leave a start
-        // the mesh no longer has.
+        // the mesh no longer has. A pending pick-tool click names topology too.
         self.scalpel_start = None;
+        self.pick_start = None;
     }
 
     fn commit_pending(&mut self) {
@@ -2184,10 +2234,36 @@ fn ring_cut_would_split(mesh: &Mesh, axis: usize, offset: f32) -> bool {
     })
 }
 
-/// Weld is the editor's Collapse: both merge the selected points into one at
-/// their centroid, so they share the geometry call in `lc-geom`.
-fn weld_selected_points(mesh: &Mesh, selected: &[u32]) -> Mesh {
-    lc_geom::collapse_points(mesh, selected).0
+/// Weld merges the listed points into one, leaving it at their midpoint or at
+/// the first listed point, which is Cheetah3D's `To` property (source 47). The
+/// topology tail is the same `merge_points_at` that Collapse reaches through
+/// `collapse_points`.
+fn weld_selected_points(mesh: &Mesh, selected: &[u32], to: lc_geom::WeldTarget) -> Mesh {
+    let mut points: Vec<u32> = selected
+        .iter()
+        .copied()
+        .filter(|point| (*point as usize) < mesh.positions.len())
+        .collect();
+    points.dedup();
+    if points.len() < 2 {
+        return mesh.clone();
+    }
+    let mut unique = points.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    let position = match to {
+        lc_geom::WeldTarget::Midpoint => {
+            unique
+                .iter()
+                .map(|point| mesh.positions[*point as usize])
+                .sum::<Vec3>()
+                / unique.len() as f32
+        }
+        lc_geom::WeldTarget::FirstPoint => mesh.positions[points[0] as usize],
+    };
+    let mut out = mesh.clone();
+    out.merge_points_at(&points, position);
+    out
 }
 
 /// Orders the selected edges into exactly the two clean closed loops Bridge
@@ -2302,10 +2378,15 @@ mod mesh_edit_tests {
             ],
             vec![vec![0, 1, 2, 3]],
         );
-        let welded = weld_selected_points(&mesh, &[0, 1]);
+        let welded = weld_selected_points(&mesh, &[0, 1], lc_geom::WeldTarget::Midpoint);
         assert!(welded.validate().is_ok());
         assert_eq!(welded.positions.len(), 3);
         assert!((welded.positions[0].x - 0.0).abs() < 1e-6);
+
+        // `To: First Point` leaves the survivor on the first listed point.
+        let welded = weld_selected_points(&mesh, &[0, 1], lc_geom::WeldTarget::FirstPoint);
+        assert_eq!(welded.positions.len(), 3);
+        assert!((welded.positions[0].x + 1.0).abs() < 1e-6);
     }
 
     #[test]

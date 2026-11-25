@@ -264,6 +264,17 @@ matching length. Each handler reuses its menu's predicate before touching
 geometry, and Apply Transform is enabled only when the current mode, axis and
 value would actually move components on every selected mesh.
 
+Four pick-driven tools take viewport clicks instead of acting on the component
+selection: choose a tool from the Mesh Editing **Click tool** selector or
+`Tools -> Ring Cut/Weld/Bridge/Insert Point Tool`. Ring Cut cuts the plane
+perpendicular to the clicked edge through its midpoint. Weld takes two point
+clicks and merges them at the **To** target, the midpoint or the first clicked
+point. Bridge takes one point on each of two open borders and bridges those
+loops. Insert Point splits a clicked polygon into triangles around a new point,
+or splits a clicked edge in both polygons that use it. Each click is one undo
+step, ESC drops a pending first click, and the Scalpel and Fill Hole click tools
+are mutually exclusive with these four.
+
 The panel provides:
 
 - Move, rotate and scale selected components on every selected mesh along world,

@@ -3394,3 +3394,227 @@ fn fill_hole_tool_refuses_a_hole_that_encloses_an_island() {
         harness.app.status
     );
 }
+
+/// One quad in the XZ plane: every click point below is unambiguous on screen.
+fn pick_tool_quad() -> Mesh {
+    Mesh::from_polygons(
+        "quad",
+        vec![
+            glam::Vec3::new(-1.0, 0.0, -1.0),
+            glam::Vec3::new(1.0, 0.0, -1.0),
+            glam::Vec3::new(1.0, 0.0, 1.0),
+            glam::Vec3::new(-1.0, 0.0, 1.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    )
+}
+
+fn pick_tool_harness(label: &str, tool: MeshPickTool) -> (InputHarness, TestRoot, NodeId) {
+    let (mut harness, root) = InputHarness::new(label, Surface::Shell, Vec2::new(900.0, 700.0));
+    let id = named(&harness.app, "Cube");
+    set_editable_geometry(&mut harness.app, id, pick_tool_quad());
+    select_object_rows(&mut harness, &[id]);
+    harness.app.mesh_edit = true;
+    harness.app.pick_tool = Some(tool);
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+    (harness, root, id)
+}
+
+fn pick_tool_project(harness: &InputHarness, id: NodeId, point: glam::Vec3) -> egui::Pos2 {
+    let evaluated = harness.app.evaluate();
+    let node = evaluated.node(id).expect("the mesh is evaluated");
+    let rect = harness.app.last_viewport_rect;
+    let (width, height) = harness.viewport_dims();
+    harness
+        .app
+        .project(node.world.transform_point3(point), rect, width, height)
+        .expect("the point is on screen")
+}
+
+#[test]
+fn ring_cut_click_tool_cuts_the_plane_through_the_clicked_edge() {
+    let (mut harness, _root, id) = pick_tool_harness("input-ring-cut-click", MeshPickTool::RingCut);
+    let depth = harness.app.history.depth();
+    let midpoint = glam::Vec3::new(0.0, 0.0, -1.0);
+    let screen = pick_tool_project(&harness, id, midpoint);
+    harness.click(Surface::Viewport, screen, egui::Modifiers::default());
+
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, id);
+    assert_eq!(mesh.polygons.len(), 2);
+    assert_eq!(
+        harness.app.mesh_axis, 0,
+        "the plane follows the edge's axis"
+    );
+    assert!(mesh.validate().is_ok());
+    assert_eq!(
+        harness.app.pick_tool,
+        Some(MeshPickTool::RingCut),
+        "the tool stays active for another cut"
+    );
+}
+
+#[test]
+fn weld_click_tool_merges_two_points_at_the_midpoint() {
+    let (mut harness, _root, id) = pick_tool_harness("input-weld-click", MeshPickTool::Weld);
+    harness.app.mesh_weld_to = lc_geom::WeldTarget::Midpoint;
+    let depth = harness.app.history.depth();
+    let first = pick_tool_project(&harness, id, glam::Vec3::new(-1.0, 0.0, -1.0));
+    harness.click(Surface::Viewport, first, egui::Modifiers::default());
+    assert_eq!(
+        harness.app.history.depth(),
+        depth,
+        "the first click only starts"
+    );
+    assert_eq!(harness.app.pick_start, Some(0));
+
+    let second = pick_tool_project(&harness, id, glam::Vec3::new(1.0, 0.0, -1.0));
+    harness.click(Surface::Viewport, second, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, id);
+    assert_eq!(mesh.positions.len(), 3);
+    assert_eq!(mesh.polygons.len(), 1);
+    assert_eq!(mesh.polygons[0].corners.len(), 3);
+    assert!(
+        mesh.positions
+            .iter()
+            .any(|position| (*position - glam::Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5),
+        "the merged point sits at the midpoint"
+    );
+    assert_eq!(harness.app.pick_start, None);
+    assert!(mesh.validate().is_ok());
+}
+
+#[test]
+fn weld_click_tool_can_keep_the_first_point() {
+    let (mut harness, _root, id) = pick_tool_harness("input-weld-first-click", MeshPickTool::Weld);
+    harness.app.mesh_weld_to = lc_geom::WeldTarget::FirstPoint;
+    let first_click = glam::Vec3::new(1.0, 0.0, -1.0);
+    let start = pick_tool_project(&harness, id, first_click);
+    harness.click(Surface::Viewport, start, egui::Modifiers::default());
+    let second = pick_tool_project(&harness, id, glam::Vec3::new(-1.0, 0.0, -1.0));
+    harness.click(Surface::Viewport, second, egui::Modifiers::default());
+
+    let mesh = selected_mesh(&harness.app, id);
+    assert!(
+        mesh.positions
+            .iter()
+            .any(|position| (*position - first_click).length() < 1e-5),
+        "To: First Point keeps the first clicked position, got {:?}",
+        mesh.positions
+    );
+    assert!(
+        !mesh
+            .positions
+            .iter()
+            .any(|position| (*position - glam::Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5),
+        "the midpoint is not used"
+    );
+    assert!(mesh.validate().is_ok());
+}
+
+#[test]
+fn bridge_click_tool_bridges_two_clicked_borders() {
+    let (mut harness, _root) = InputHarness::new(
+        "input-bridge-click",
+        Surface::Shell,
+        Vec2::new(900.0, 700.0),
+    );
+    let id = named(&harness.app, "Cube");
+    let borders = Mesh::from_polygons(
+        "borders",
+        vec![
+            glam::Vec3::new(-1.0, 0.0, -2.0),
+            glam::Vec3::new(0.0, 0.0, -2.0),
+            glam::Vec3::new(0.0, 0.0, -1.0),
+            glam::Vec3::new(-1.0, 0.0, -1.0),
+            glam::Vec3::new(-1.0, 0.0, 1.0),
+            glam::Vec3::new(0.0, 0.0, 1.0),
+            glam::Vec3::new(0.0, 0.0, 2.0),
+            glam::Vec3::new(-1.0, 0.0, 2.0),
+        ],
+        vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+    );
+    set_editable_geometry(&mut harness.app, id, borders);
+    select_object_rows(&mut harness, &[id]);
+    harness.app.mesh_edit = true;
+    harness.app.pick_tool = Some(MeshPickTool::Bridge);
+    harness.frame(Surface::Viewport, Vec::new(), egui::Modifiers::default());
+    let depth = harness.app.history.depth();
+
+    let first = pick_tool_project(&harness, id, glam::Vec3::new(-1.0, 0.0, -2.0));
+    harness.click(Surface::Viewport, first, egui::Modifiers::default());
+    assert_eq!(
+        harness.app.history.depth(),
+        depth,
+        "the first click only starts"
+    );
+    assert_eq!(harness.app.pick_start, Some(0));
+
+    let second = pick_tool_project(&harness, id, glam::Vec3::new(-1.0, 0.0, 1.0));
+    harness.click(Surface::Viewport, second, egui::Modifiers::default());
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, id);
+    assert_eq!(mesh.polygons.len(), 6, "the two borders gained four quads");
+    assert_eq!(harness.app.pick_start, None);
+    assert!(mesh.validate().is_ok());
+}
+
+#[test]
+fn insert_point_click_tool_splits_a_polygon_into_triangles() {
+    let (mut harness, _root, id) =
+        pick_tool_harness("input-insert-point-click", MeshPickTool::InsertPoint);
+    let depth = harness.app.history.depth();
+    let center = pick_tool_project(&harness, id, glam::Vec3::ZERO);
+    harness.click(Surface::Viewport, center, egui::Modifiers::default());
+
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, id);
+    assert_eq!(mesh.polygons.len(), 4);
+    assert!(mesh.polygons.iter().all(|poly| poly.corners.len() == 3));
+    assert_eq!(mesh.positions.len(), 5);
+    assert!(mesh.validate().is_ok());
+}
+
+#[test]
+fn insert_point_click_tool_splits_a_clicked_edge() {
+    let (mut harness, _root, id) =
+        pick_tool_harness("input-insert-edge-click", MeshPickTool::InsertPoint);
+    let depth = harness.app.history.depth();
+    let midpoint = pick_tool_project(&harness, id, glam::Vec3::new(1.0, 0.0, 0.0));
+    harness.click(Surface::Viewport, midpoint, egui::Modifiers::default());
+
+    assert_eq!(harness.app.history.depth(), depth + 1);
+    let mesh = selected_mesh(&harness.app, id);
+    assert_eq!(
+        mesh.polygons.len(),
+        1,
+        "an edge insert does not split the face"
+    );
+    assert_eq!(mesh.polygons[0].corners.len(), 5);
+    assert_eq!(mesh.positions.len(), 5);
+    assert!(mesh.validate().is_ok());
+}
+
+#[test]
+fn pick_tool_menu_entries_are_exclusive_with_the_other_click_tools() {
+    let (mut harness, _root, _id) = pick_tool_harness("input-pick-tool-menu", MeshPickTool::Weld);
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    harness.open_menu("menu:Tools");
+    assert!(harness.menu_item("Tools:Insert Point Tool").1);
+    harness.click_menu_item("Tools:Insert Point Tool");
+    assert_eq!(harness.app.pick_tool, Some(MeshPickTool::InsertPoint));
+
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    harness.open_menu("menu:Tools");
+    harness.click_menu_item("Tools:Scalpel Tool");
+    assert!(harness.app.scalpel_tool);
+    assert_eq!(harness.app.pick_tool, None, "the scalpel takes the click");
+
+    harness.frame(Surface::Shell, Vec::new(), egui::Modifiers::default());
+    harness.open_menu("menu:Tools");
+    harness.click_menu_item("Tools:Bridge Tool");
+    assert_eq!(harness.app.pick_tool, Some(MeshPickTool::Bridge));
+    assert!(!harness.app.scalpel_tool);
+    assert!(!harness.app.fill_hole_tool);
+}

@@ -1262,8 +1262,9 @@ impl LeopardApp {
                     };
                     return;
                 }
-                self.apply_mesh_operation("Welded points", |_, mesh, points| {
-                    Ok(weld_selected_points(mesh, points))
+                let to = self.mesh_weld_to;
+                self.apply_mesh_operation("Welded points", move |_, mesh, points| {
+                    Ok(weld_selected_points(mesh, points, to))
                 });
             }
             MeshAction::Collapse => {
@@ -2228,7 +2229,7 @@ impl LeopardApp {
 
     /// The pick ray in the mesh's local space, shared by the Scalpel's edge
     /// parameter and face hit tests.
-    fn pointer_ray(
+    pub(super) fn pointer_ray(
         &self,
         world: Mat4,
         rect: Rect,

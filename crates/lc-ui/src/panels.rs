@@ -2072,6 +2072,16 @@ impl LeopardApp {
             if weld.clicked() {
                 action = Some(MeshAction::Weld);
             }
+            egui::ComboBox::from_id_salt("mesh_weld_to")
+                .selected_text(format!("To: {}", self.mesh_weld_to.label()))
+                .show_ui(ui, |ui| {
+                    for target in [
+                        lc_geom::WeldTarget::Midpoint,
+                        lc_geom::WeldTarget::FirstPoint,
+                    ] {
+                        ui.selectable_value(&mut self.mesh_weld_to, target, target.label());
+                    }
+                });
             let collapse_ready = self.mesh_collapse_ready();
             let collapse = ui.add_enabled(collapse_ready, egui::Button::new("Collapse"));
             record_menu_item_state("panel:Collapse", &collapse, collapse_ready);
@@ -2116,6 +2126,37 @@ impl LeopardApp {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            ui.label("Click tool");
+            egui::ComboBox::from_id_salt("mesh_pick_tool")
+                .selected_text(self.pick_tool.map(|tool| tool.label()).unwrap_or("Off"))
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.pick_tool.is_none(), "Off")
+                        .clicked()
+                    {
+                        self.activate_pick_tool(None);
+                        self.status = "Pick tool off".into();
+                    }
+                    for tool in [
+                        MeshPickTool::RingCut,
+                        MeshPickTool::Weld,
+                        MeshPickTool::Bridge,
+                        MeshPickTool::InsertPoint,
+                    ] {
+                        if ui
+                            .selectable_label(self.pick_tool == Some(tool), tool.label())
+                            .clicked()
+                        {
+                            self.activate_pick_tool(Some(tool));
+                            self.status = format!("{} tool: {}", tool.label(), tool.hint());
+                        }
+                    }
+                });
+            if let Some(tool) = self.pick_tool {
+                ui.label(egui::RichText::new(tool.hint()).small().weak());
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
             let fill_ready = self.mesh_fill_hole_ready();
             let fill = ui.add_enabled(fill_ready, egui::Button::new("Fill Hole"));
             record_menu_item_state("panel:Fill Hole", &fill, fill_ready);
@@ -2128,6 +2169,12 @@ impl LeopardApp {
             );
             record_menu_item_state("panel:Fill Hole Tool", &tool, self.mesh_edit);
             if tool.changed() {
+                if self.fill_hole_tool {
+                    self.pick_tool = None;
+                    self.pick_start = None;
+                    self.scalpel_tool = false;
+                    self.scalpel_start = None;
+                }
                 self.status = if self.fill_hole_tool {
                     "Fill Hole tool: click a point on an open hole border".into()
                 } else {

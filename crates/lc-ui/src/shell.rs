@@ -1012,11 +1012,32 @@ impl LeopardApp {
                 {
                     self.scalpel_tool = !self.scalpel_tool;
                     self.scalpel_start = None;
+                    if self.scalpel_tool {
+                        self.pick_tool = None;
+                        self.pick_start = None;
+                    }
                     self.status = if self.scalpel_tool {
                         "Scalpel tool: click a point or edge to start a cut".into()
                     } else {
                         "Scalpel tool off".into()
                     };
+                }
+                for tool in [
+                    MeshPickTool::RingCut,
+                    MeshPickTool::Weld,
+                    MeshPickTool::Bridge,
+                    MeshPickTool::InsertPoint,
+                ] {
+                    let active = self.pick_tool == Some(tool);
+                    let label = if active {
+                        format!("{} Tool ✓", tool.label())
+                    } else {
+                        format!("{} Tool", tool.label())
+                    };
+                    let key = format!("Tools:{} Tool", tool.label());
+                    if recorded_button_enabled(ui, &key, self.mesh_edit, &label).clicked() {
+                        self.toggle_pick_tool(tool);
+                    }
                 }
                 if recorded_button_enabled(ui, "Tools:Split", self.mesh_split_ready(), "Split")
                     .clicked()
