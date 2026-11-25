@@ -70,6 +70,11 @@ scripts/check.sh
 # Fast per-lane check for one agent lane (see "Multi-agent lanes")
 scripts/check-lane.sh geometry
 
+# Reclaim build-output disk: newest fingerprint per package, old incremental
+# sessions, smoke-run litter and stray gate logs (target/ only)
+scripts/prune-target.sh --dry-run
+scripts/prune-target.sh
+
 # Dispatch one lane task packet: host spawn_agents bridge, else the Codebuff CLI
 # (`--print-packet` composes the prompt for an interactive session instead)
 scripts/spawn-lane.sh geometry "<task packet>"

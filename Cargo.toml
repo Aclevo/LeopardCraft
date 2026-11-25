@@ -29,8 +29,11 @@ pollster = "1"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence"] }
 egui = "0.36"
 
+# Dev artifacts keep line tables only: full debug info was 93% of every test
+# binary. Backtraces still get file:line; gdb variable inspection is lost.
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
