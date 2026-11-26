@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Reclaim disk used by build output under target/.
 #
-# Cargo writes a full copy of every finished artifact to
-# `target/<profile>/build/<package>/<fingerprint>/out` and never deletes the
-# copies belonging to older fingerprints, so a few gate runs add gigabytes.
-# This keeps the newest fingerprint directory of each package, drops old
-# incremental sessions and sweeps smoke-run litter. Only target/ is touched;
-# the next build recompiles whatever was pruned.
+# Cargo 1.100's build-dir layout v2 stores each build unit's artifacts only in
+# `target/<profile>/build/<package>/<unit-hash>/out` (finals are hardlinked
+# into target/<profile>/), but it never deletes a stale unit directory and has
+# no target-dir GC, so a few gate runs still add gigabytes. This keeps the
+# newest unit directory of each package, drops old incremental sessions and
+# sweeps smoke-run litter. Only target/ is touched; the next build recompiles
+# whatever was pruned.
 #
 # Bash 3 compatible (no associative arrays) because the repository's shell
 # tooling must also run under macOS and Git Bash.
@@ -26,7 +27,7 @@ usage: scripts/prune-target.sh [--dry-run] [--incremental-days N]
   --incremental-days N  keep incremental sessions modified within N days
                         (default 3)
 
-Keeps only the newest fingerprint directory of each
+Keeps only the newest build-unit directory of each
 target/<profile>/build/<package>, and removes incremental sessions older than
 N days, target/smoke and stray target/*.log files.
 EOF
@@ -89,7 +90,7 @@ reclaim() {
     fi
 }
 
-# Stale per-fingerprint artifact copies: keep the newest directory per package.
+# Stale build units: keep the newest unit directory per package.
 for package_dir in target/*/build/*; do
     [ -d "$package_dir" ] || continue
     for stale in $(ls -1t "$package_dir" 2>/dev/null | tail -n +2); do

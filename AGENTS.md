@@ -92,6 +92,16 @@ cargo run -p leopardcraft -- --mcp --scene scene.lcscene
 cargo run -p leopardcraft -- --mcp-http --addr 127.0.0.1:8765 --scene scene.lcscene
 ```
 
+Build output on disk: Cargo 1.100's build-dir layout v2 stores each build
+unit's artifacts only in `target/<profile>/build/<package>/<unit-hash>/out/`
+and hardlinks final artifacts into `target/<profile>/`, so no artifact is
+stored twice and `target/debug/deps/` no longer exists. Cargo still never
+deletes a stale unit directory, and target-dir GC does not exist (upstream
+rust-lang/cargo#16804), so `scripts/prune-target.sh` is the only cleanup here:
+one clippy graph added 238 unit directories (~0.3G) that nothing else removes,
+and because the script keeps the newest unit directory per package,
+alternating clippy and test graphs rebuild each other's pruned units.
+
 The `scripts/check.sh` clippy step is stricter than CI (`-D warnings`). CI also
 runs the headless selftest and, through `cargo test --workspace`, the MCP smoke
 test. On Linux the GUI build needs the X11, Wayland,
