@@ -26,8 +26,8 @@ bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr"] }
 rayon = "1"
 pollster = "1"
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence"] }
-egui = "0.36"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence"] }
+egui = "0.37"
 
 # Dev artifacts keep line tables only: full debug info was 93% of every test
 # binary. Backtraces still get file:line; gdb variable inspection is lost.
